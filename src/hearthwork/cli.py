@@ -5,6 +5,7 @@
   hearthwork codex [args...]    Codex with the local model; args go to `codex`
   hearthwork start [--model X]  start the model in the background     hearthwork stop
   hearthwork serve [--model X]  run the model server in this terminal (Ctrl+C stops it)
+  hearthwork alias add <name> claude|codex   short command for it, e.g. ccl  (also: alias list, alias remove <name>)
   hearthwork status             what is running
   hearthwork model <link>       download a GGUF model from Hugging Face
   hearthwork bench              8 graded coding tasks through an agent, with a scoreboard
@@ -117,6 +118,12 @@ def main(argv=None):
         elif command == "setup":
             from . import onboard as setup
             setup.main(rest)
+        elif command == "alias":
+            from . import aliases
+            sys.exit(aliases.main(rest))
+        elif command == "statusline":  # hidden: the status line Claude Code shows, see harnesses.claude_settings
+            line = " · ".join(["local", *rest[:2]])  # utf-8 bytes: Claude Code reads utf-8 whatever the console code page
+            sys.stdout.buffer.write((line + "\n").encode("utf-8"))
         elif command == "update":
             sys.exit(update())
         else:

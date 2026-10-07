@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
 """Benchmark the running model through a real coding agent, and keep a scoreboard.
 
-  hearthwork bench   [--agent claude|codex] [--show]
+  hearthwork bench   [--agent claude|codex] [--all] [--no-warmup] [--show]
   (or menu option "Benchmark the running model")
 
 Eight prompts run as one agent conversation in a fresh folder (bench/runs/...): chat, list files, read a file,
 write and run a script, edit it, fix three planted bugs, write unit tests, summarize. Each step is graded by
 checking the files and running the code, not by trusting the agent's reply. Results go to bench/results.jsonl;
---show prints the scoreboard without running anything.
+--show prints the scoreboard (and the latest --all summary) without running anything.
+
+--all is the release check: every installed agent, one after another, after a warmup (a ~30K-token prompt on the
+Anthropic and OpenAI endpoints, so the first agent does not pay for cold caches). Each agent runs with its own empty
+config folder (CODEX_HOME / CLAUDE_CONFIG_DIR) so benchmark sessions never land in your real agent history. A run that
+fails because of the agent (not a wrong answer) is retried once; both attempts go to results.jsonl. The summary table
+(model, agent, score, time) is printed and saved as summary.md in the run's folder.
 """
 import argparse
 import ast
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +36,9 @@ from .server import served_model
 RESULTS = BENCH / "results.jsonl"
 BOLD, DIM = "\033[1m", "\033[2m"
 TIMEOUT = 20 * 60  # per prompt
+WARMUP_TOKENS = 30000
+CONFIG_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}  # where each agent keeps its history
+REAL_DIRS = {"claude": ".claude", "codex": ".codex"}
 
 DEMO = "The secret phrase is: copper owl builds a bridge.\n"
 BUGGY = '''def average(numbers):
@@ -129,7 +140,7 @@ class AgentError(Exception):
     """The agent itself failed (crashed, refused to start, or reached the wrong model): not a model score."""
 
 
-def ask_agent(agent, config, model, folder, prompt, first, session):
+def ask_agent(agent, config, model, folder, prompt, first, session, env=None):
     """One turn. Returns (reply, session id); raises AgentError when the agent itself fails."""
     port, context = config["server"]["port"], config["server"]["context"]
     if agent == "claude":
@@ -139,7 +150,7 @@ def ask_agent(agent, config, model, folder, prompt, first, session):
                 "--allowedTools", "Read Write Edit Bash Glob Grep"]
         if not first:
             args.append("--continue")
-        result = launch("claude", port, model, context, capture=True, cwd=folder, timeout=TIMEOUT, args=args)
+        result = launch("claude", port, model, context, capture=True, cwd=folder, timeout=TIMEOUT, args=args, extra_env=env)
         try:
             data = json.loads(result.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
@@ -152,7 +163,7 @@ def ask_agent(agent, config, model, folder, prompt, first, session):
     # `codex exec resume` has no -s flag; the sandbox is set as config, which both forms accept.
     common = ["--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-o", str(last)]
     args = ["exec", *common, prompt] if first else ["exec", "resume", *common, session, prompt]
-    result = launch("codex", port, model, context, capture=True, cwd=folder, timeout=TIMEOUT, args=args)
+    result = launch("codex", port, model, context, capture=True, cwd=folder, timeout=TIMEOUT, args=args, extra_env=env)
     output = result.stdout + result.stderr
     provider = re.search(r"^provider:\s*(\S+)", output, re.M)
     if provider and provider.group(1) != "llamacpp":
@@ -168,66 +179,173 @@ def ask_agent(agent, config, model, folder, prompt, first, session):
     return reply, session
 
 
-def scoreboard():
+def isolated_env(agent, folder):
+    """Env that points `agent`'s config/history folder at the empty folder `folder`. Exits if that folder could be
+    the user's real one (~/.codex, ~/.claude, or wherever CODEX_HOME / CLAUDE_CONFIG_DIR already point)."""
+    var = CONFIG_ENV[agent]
+    folder = Path(folder)
+    real = {(Path.home() / REAL_DIRS[agent]).resolve()}
+    if os.environ.get(var):
+        real.add(Path(os.environ[var]).expanduser().resolve())
+    mine = folder.resolve()
+    if mine in real or any(r in mine.parents for r in real):
+        sys.exit(f"Refusing to benchmark: the isolated {var} ({folder}) is inside your real {agent} folder.")
+    folder.mkdir(parents=True, exist_ok=True)
+    if agent == "codex":
+        # An empty CODEX_HOME loses the user's Windows sandbox choice, and Codex then blocks every command.
+        seed = windows_sandbox_config(Path(os.environ.get(var) or Path.home() / ".codex").expanduser() / "config.toml")
+        if seed:
+            (folder / "config.toml").write_text(seed, encoding="utf-8")
+    return {var: str(folder)}
+
+
+def windows_sandbox_config(path):
+    """The `[windows]` table of a Codex config.toml (its sandbox setting), or ""."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    table, inside = [], False
+    for line in lines:
+        if line.strip().startswith("["):
+            inside = line.strip() == "[windows]"
+        if inside:
+            table.append(line)
+    return "\n".join(table).strip() + "\n" if table else ""
+
+
+def warmup(port, model):
+    """Send a ~30K-token prompt through the Anthropic and OpenAI endpoints, so the first timed agent does not pay
+    for cold caches and kernels. Failures only warn: the benchmark itself still tells."""
+    text = "".join(f"Note {i}: the quick brown fox jumps over the lazy dog near the river bank. " for i in range(WARMUP_TOKENS // 17))
+    calls = [("Anthropic /v1/messages", "/v1/messages", {"model": model, "max_tokens": 4, "messages": [{"role": "user", "content": text}]}),
+             ("OpenAI /v1/responses", "/v1/responses", {"model": model, "max_output_tokens": 16, "input": text})]
+    for name, path, body in calls:
+        print(f"  warmup {name:<24}", end=" ", flush=True)
+        t0 = time.time()
+        request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", json.dumps(body).encode(),
+                                         {"content-type": "application/json", "x-api-key": "local", "authorization": "Bearer local"})
+        try:
+            with urllib.request.urlopen(request, timeout=900) as response:
+                response.read()
+            print(f"{time.time() - t0:5.0f} s")
+        except Exception as error:
+            print(f"{YELLOW}skipped ({str(error)[:80]}){RESET}")
+
+
+def run_once(agent, config, model, root, attempt):
+    """One full 8-prompt run of `agent`. Returns the result record; raises AgentError if the agent itself fails."""
+    title = HARNESSES[agent]["title"]
+    name = agent if attempt == 1 else f"{agent}-retry"
+    folder = root / name
+    folder.mkdir(parents=True)
+    (folder / "demo.txt").write_text(DEMO, encoding="utf-8")
+    (folder / "buggy.py").write_text(BUGGY, encoding="utf-8")
+    env = isolated_env(agent, root / f"{name}-config")
+    print(f"\n{BOLD}Benchmark{RESET}: {model} via {title}{'' if attempt == 1 else ' (retry)'}  "
+          f"{DIM}(8 prompts, one conversation; folder {folder}){RESET}\n")
+    steps, session, started = [], None, time.time()
+    for i, (step, prompt) in enumerate(PROMPTS):
+        print(f"  {i + 1}. {step:<12}", end=" ", flush=True)
+        t0 = time.time()
+        try:
+            reply, session = ask_agent(agent, config, model, folder, prompt, i == 0, session, env)
+        except subprocess.TimeoutExpired:
+            reply = ""
+        except AgentError:
+            print()
+            raise
+        seconds = time.time() - t0
+        points, note = grade(i, folder, reply)
+        color = GREEN if points == 1 else YELLOW if points > 0 else RED
+        print(f"{color}{points:>4.2g}{RESET}  {seconds:6.0f} s   {DIM}{note}{RESET}")
+        steps.append({"step": step, "points": points, "seconds": round(seconds, 1), "note": note})
+    return {"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "model": model, "agent": title,
+            "score": round(sum(s["points"] for s in steps), 2), "seconds": round(time.time() - started),
+            "attempt": attempt, "steps": steps, "folder": str(folder)}
+
+
+def save(record):
+    BENCH.mkdir(exist_ok=True)
+    with open(RESULTS, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def run_agent(agent, config, model, root):
+    """Run `agent`, retrying once if the agent itself fails. Every attempt is recorded: a score for a finished run,
+    an error entry (no score, so never on the scoreboard) for a failed one. Returns the record, or None."""
+    title = HARNESSES[agent]["title"]
+    for attempt in (1, 2):
+        try:
+            record = run_once(agent, config, model, root, attempt)
+        except AgentError as error:
+            print(f"\n  {RED}{error}{RESET}\n  Not scored: this is an agent problem, not a model score."
+                  + ("  Retrying once." if attempt == 1 else ""))
+            save({"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "model": model, "agent": title,
+                  "attempt": attempt, "error": str(error)[:400]})
+            continue
+        save(record)
+        print(f"\n  {BOLD}Score {record['score']:.1f}/8{RESET} in {record['seconds'] / 60:.1f} min")
+        return record
+    return None
+
+
+def summary_table(model, results):
+    """Markdown for release notes. `results` is [(agent title, record or None)]."""
+    rows = ["| Model | Agent | Score | Time |", "|---|---|---|---|"]
+    for title, record in results:
+        rows.append(f"| {model} | {title} | " + (f"{record['score']:.1f}/8 | {record['seconds'] / 60:.1f} min |" if record else "failed (agent error, retried) | - |"))
+    return "\n".join(rows)
+
+
+def scoreboard(summary=True):
     if not RESULTS.exists():
         print("No benchmark results yet.")
         return
     runs = [json.loads(line) for line in RESULTS.read_text(encoding="utf-8").splitlines() if line.strip()]
+    runs = [r for r in runs if "score" in r]  # agent-error attempts have no score
     runs.sort(key=lambda r: (-r["score"], r["seconds"]))
     print(f"\n{BOLD}Scoreboard{RESET}  {DIM}({RESULTS}){RESET}")
     print(f"  {'model':<48} {'agent':<12} {'score':>7} {'time':>8}   date")
     for r in runs:
         color = GREEN if r["score"] >= 7 else YELLOW if r["score"] >= 5 else RED
         print(f"  {r['model'][:48]:<48} {r['agent']:<12} {color}{r['score']:>5.1f}/8{RESET} {r['seconds'] / 60:>6.1f} m   {r['date']}")
+    summaries = sorted((BENCH / "runs").glob("*/summary.md"), key=lambda p: p.parent.name)
+    if summary and summaries:
+        print(f"\n{BOLD}Latest summary{RESET}  {DIM}({summaries[-1]}){RESET}\n{summaries[-1].read_text(encoding='utf-8')}")
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="hearthwork bench", description="Benchmark the running model through a coding agent.")
     parser.add_argument("--agent", choices=sorted(HARNESSES), default="claude")
+    parser.add_argument("--all", action="store_true", help="release check: every installed agent, one after another, after a warmup")
+    parser.add_argument("--warmup", action="store_true", help="run the 30K-token warmup even for a single agent (--all always does)")
     parser.add_argument("--show", action="store_true", help="only print the scoreboard")
     args = parser.parse_args(argv)
     if args.show:
         return scoreboard()
     config = load_config()
-    model = served_model(config["server"]["port"])
+    port = config["server"]["port"]
+    model = served_model(port)
     if not model:
         sys.exit("No model is running. Start one first (hearthwork menu: Start / switch model).")
-    if not installed(args.agent):
+    agents = [key for key in sorted(HARNESSES) if installed(key)] if args.all else [args.agent]
+    if not agents:
+        sys.exit("No coding agent is installed.")
+    if not args.all and not installed(args.agent):
         sys.exit(f"{HARNESSES[args.agent]['title']} is not installed.")
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    folder = BENCH / "runs" / f"{stamp}-{args.agent}-{model}"
-    folder.mkdir(parents=True)
-    (folder / "demo.txt").write_text(DEMO, encoding="utf-8")
-    (folder / "buggy.py").write_text(BUGGY, encoding="utf-8")
-    title = HARNESSES[args.agent]["title"]
-    print(f"\n{BOLD}Benchmark{RESET}: {model} via {title}  {DIM}(8 prompts, one conversation; folder {folder}){RESET}\n")
-
-    steps, session, started = [], None, time.time()
-    for i, (name, prompt) in enumerate(PROMPTS):
-        print(f"  {i + 1}. {name:<12}", end=" ", flush=True)
-        t0 = time.time()
-        try:
-            reply, session = ask_agent(args.agent, config, model, folder, prompt, i == 0, session)
-        except subprocess.TimeoutExpired:
-            reply = ""
-        except AgentError as error:
-            print(f"\n\n  {RED}{error}{RESET}\n  Not recorded: this is an agent problem, not a model score.")
-            sys.exit(1)
-        seconds = time.time() - t0
-        points, note = grade(i, folder, reply)
-        color = GREEN if points == 1 else YELLOW if points > 0 else RED
-        print(f"{color}{points:>4.2g}{RESET}  {seconds:6.0f} s   {DIM}{note}{RESET}")
-        steps.append({"step": name, "points": points, "seconds": round(seconds, 1), "note": note})
-
-    total = sum(s["points"] for s in steps)
-    seconds = time.time() - started
-    record = {"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "model": model, "agent": title,
-              "score": round(total, 2), "seconds": round(seconds), "steps": steps, "folder": str(folder)}
-    BENCH.mkdir(exist_ok=True)
-    with open(RESULTS, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
-    print(f"\n  {BOLD}Score {total:.1f}/8{RESET} in {seconds / 60:.1f} min")
-    scoreboard()
+    root = BENCH / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S")
+    root.mkdir(parents=True)
+    if args.all or args.warmup:
+        print(f"\n{BOLD}Warmup{RESET}: {model}  {DIM}(~{WARMUP_TOKENS // 1000}K-token prompt on both APIs, not timed){RESET}")
+        warmup(port, model)
+    results = [(HARNESSES[agent]["title"], run_agent(agent, config, model, root)) for agent in agents]
+    table = summary_table(model, results)
+    (root / "summary.md").write_text(table + "\n", encoding="utf-8")
+    print(f"\n{BOLD}Summary{RESET}  {DIM}({root / 'summary.md'}){RESET}\n{table}")
+    scoreboard(summary=False)
+    if not all(record for _, record in results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

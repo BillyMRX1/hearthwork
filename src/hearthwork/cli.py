@@ -8,7 +8,8 @@
   hearthwork alias add <name> claude|codex   short command for it, e.g. ccl  (also: alias list, alias remove <name>)
   hearthwork status             what is running
   hearthwork model <link>       download a GGUF model from Hugging Face
-  hearthwork bench              8 graded coding tasks through an agent, with a scoreboard
+  hearthwork bench [--agent X]  8 graded coding tasks through an agent, with a scoreboard
+  hearthwork bench --all        release check: every installed agent in turn, after a warmup, with a summary table
   hearthwork check              is this computer suited, and which models fit
   hearthwork runtime            llama.cpp engines: list, install <name>, use <name>, update, rollback
   hearthwork setup              hardware check, llama.cpp download/update, models folder

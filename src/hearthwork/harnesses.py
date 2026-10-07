@@ -376,9 +376,10 @@ def installed(key):
     return shutil.which(HARNESSES[key]["binary"])
 
 
-def launch(key, port, name, context, max_output=4096, args=(), capture=False, cwd=None, timeout=None):
+def launch(key, port, name, context, max_output=4096, args=(), capture=False, cwd=None, timeout=None, extra_env=None):
     """Run harness `key` against the server on `port`: in this terminal, or with `capture` its output is
-    returned as a CompletedProcess (for the benchmark). Returns the exit code otherwise."""
+    returned as a CompletedProcess (for the benchmark). `extra_env` is added to the agent's environment. Returns the
+    exit code otherwise."""
     harness = HARNESSES[key]
     binary = installed(key)
     if not binary:
@@ -386,6 +387,8 @@ def launch(key, port, name, context, max_output=4096, args=(), capture=False, cw
         return 1
     relay = start_relay(port)
     command, env = harness["command"](binary, relay, name, context, max_output, list(args))
+    if extra_env:
+        env = {**(os.environ if env is None else env), **extra_env}
     try:
         if capture:
             return subprocess.run(command, env=env, cwd=cwd, capture_output=True, text=True, encoding="utf-8",

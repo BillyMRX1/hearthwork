@@ -31,11 +31,14 @@ GREEN, YELLOW, RED, CYAN, RESET = "\033[32m", "\033[33m", "\033[31m", "\033[36m"
 if WINDOWS:
     os.system("")  # ANSI colors in the Windows console
 
-# Suggested when the models folder is empty. Only the first one has been tested end to end with this tool;
-# `model.py <repo>` lists every file in a repo with its size and whether it fits this computer.
+# Suggested when the models folder is empty: the best in Hearthwork's benchmark (bench.py) on the reference PC.
+# `model.py <repo>` lists every file in a repo with its size and whether it fits this computer; hearthwork-check
+# ranks a longer list for this machine.
 SUGGESTED = [
-    ("unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", "Qwen3-Coder-30B-A3B: coding agent, MoE (fast even partly in RAM). "
-     "Q4_K_M is 18.6 GB; smaller quantizations exist for smaller machines. Tested with Claude Code here."),
+    ("unsloth/Qwen3.5-35B-A3B-GGUF", "Qwen3.5-35B-A3B: MoE, fast even partly in RAM. Best in the benchmark (8/8 with "
+     "Claude Code and Codex). Q4_K_M is 20.5 GB; smaller quantizations exist."),
+    ("unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", "Qwen3-Coder-30B-A3B: coding agent, MoE. 8/8 in the benchmark. "
+     "Q4_K_M is 17.3 GB, so a better fit for smaller machines."),
 ]
 
 

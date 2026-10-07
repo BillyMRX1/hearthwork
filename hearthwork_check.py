@@ -27,11 +27,14 @@ REPO = "https://github.com/BillyMRX1/hearthwork"
 # per token, so the model stays usable when part of it sits in system RAM. Measured on the reference PC
 # (RTX 5060 Ti 16 GB + 22.6 GB RAM, 64K context): MoE Qwen3-Coder-30B partly in RAM 18-31 tokens/s; dense
 # Qwen3.8-27B partly in RAM ~6 tokens/s.
+# "tested": Hearthwork benchmark (bench.py, 8 graded coding tasks) on the reference PC, Q4_K_M, 2026-10-07.
 MODELS = [
-    {"repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", "name": "Qwen3-Coder-30B-A3B", "moe": True,
-     "note": "coding agent; tested with Hearthwork (Claude Code + Codex)", "tested": True},
-    {"repo": "unsloth/Qwen3.5-35B-A3B-GGUF", "name": "Qwen3.5-35B-A3B", "moe": True, "note": "newer general + coding model"},
-    {"repo": "unsloth/GLM-4.7-Flash-GGUF", "name": "GLM-4.7-Flash (30B MoE)", "moe": True, "note": "popular for Claude Code"},
+    {"repo": "unsloth/Qwen3.5-35B-A3B-GGUF", "name": "Qwen3.5-35B-A3B", "moe": True, "tested": True,
+     "note": "best in the benchmark: 8/8 with Codex (2.6 min) and Claude Code (3.6 min)"},
+    {"repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", "name": "Qwen3-Coder-30B-A3B", "moe": True, "tested": True,
+     "note": "8/8 with Claude Code (3.9 min) and Codex (4.2 min); a bit smaller"},
+    {"repo": "unsloth/GLM-4.7-Flash-GGUF", "name": "GLM-4.7-Flash (30B MoE)", "moe": True, "tested": True,
+     "note": "8/8 with Codex (4.5 min), 7.7/8 with Claude Code (missed one bug)"},
     {"repo": "ggml-org/gpt-oss-20b-GGUF", "name": "gpt-oss-20b", "moe": True, "note": "small and fast; good at tool use"},
     {"repo": "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF", "name": "Devstral-Small-2-24B", "moe": False,
      "note": "coding agent (dense: needs to fit the GPU to be fast)"},

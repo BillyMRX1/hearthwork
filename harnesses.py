@@ -228,6 +228,9 @@ def launch(key, port, name, context, max_output=4096, args=(), capture=False, cw
         return 1
     relay = start_relay(port)
     command, env = harness["command"](binary, relay, name, context, max_output, list(args))
+    if key == "claude" and not capture:
+        print("\033[2mTip: in Claude Code's auto mode, every command is first checked by the local model, which can be "
+              "slow or time out and block it. Shift+Tab switches to another permission mode.\033[0m")
     try:
         if capture:
             return subprocess.run(command, env=env, cwd=cwd, capture_output=True, text=True, encoding="utf-8",

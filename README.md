@@ -142,6 +142,7 @@ model.bat https://huggingface.co/<org>/<repo>/blob/main/<file>.gguf            (
   - 2 slots, so Claude Code's background requests don't evict the conversation's cache.
   - The model's RAM part is loaded into RAM rather than memory-mapped from a possibly slow disk.
 - **Where to change them:** the `server` section of `config.json`. `setup` recalculates them.
+- **Not used: speculative decoding.** Measured with Qwen3-Coder-30B (MoE, experts partly in RAM): n-gram speculation guessed 92% of the tokens when editing a file, but ran only 2–3% faster (within noise); the simple variant ran 14–19% slower. Verifying several guessed tokens at once routes them through many different experts, and part of those sit in RAM, so verifying costs about as much as generating. It may help when a model fits entirely in VRAM.
 
 ## Models
 
@@ -153,10 +154,18 @@ model.bat https://huggingface.co/<org>/<repo>/blob/main/<file>.gguf            (
 
 ## Measured on the setup PC (RTX 5060 Ti 16 GB over PCIe 4.0 x4, 22.6 GB RAM, 2026-10-06/07)
 
-| Model | Generation speed | Notes |
-|---|---|---|
-| Qwen3-Coder-30B-A3B Q4_K_M (MoE, 17.3 GB) | 18–31 tokens/s | First Claude Code message ~20–40 s. Completed the 8-task bench: read, create, run, edit, fix 3 bugs, write tests. |
-| Huihui-Qwen3.8-27B-abliterated Q3_K (dense, 12.6 GB) | ~6 tokens/s | Works through the relay. Dense and partly in RAM at 64K, so slower. |
+Benchmark scoreboard (`bench`: 8 graded coding tasks in one agent conversation; Claude Code in `dontAsk` permission mode):
+
+| Model (Q4_K_M, all MoE) | Size | Codex | Claude Code |
+|---|---|---|---|
+| **Qwen3.5-35B-A3B** | 20.5 GB | **8/8 in 2.6 min** | **8/8 in 3.6 min** |
+| Qwen3-Coder-30B-A3B | 17.3 GB | 8/8 in 4.2 min | 8/8 in 3.9 min |
+| GLM-4.7-Flash | 17.1 GB | 8/8 in 4.5 min | 7.7/8 in 3.9 min (one bug left unfixed) |
+
+- **Generation speed:**
+  - Qwen3-Coder-30B: 18–38 tokens/s, depending on context length.
+  - A dense model partly in RAM (Huihui-Qwen3.8-27B Q3_K) managed only ~6 tokens/s.
+- **Claude Code's auto mode slows local models down.** In auto mode, Claude Code asks the model to check every command first. With a local model those checks are slow and can time out and block the command. One GLM-4.7-Flash run took 48.7 min in auto mode and 3.9 min without it.
 
 For comparison, a disk-streaming engine built on AirLLM ran the same Qwen3-Coder model about 10x slower on this PC.
 

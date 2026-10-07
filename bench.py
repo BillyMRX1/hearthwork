@@ -133,7 +133,10 @@ def ask_agent(agent, config, model, folder, prompt, first, session):
     """One turn. Returns (reply, session id); raises AgentError when the agent itself fails."""
     port, context = config["server"]["port"], config["server"]["context"]
     if agent == "claude":
-        args = ["-p", prompt, "--output-format", "json", "--allowedTools", "Read Write Edit Bash Glob Grep"]
+        # dontAsk: the allowed tools just run. Otherwise a user's default "auto" mode asks the (local, slow) model to
+        # classify every command first; with GLM-4.7-Flash those checks timed out and blocked the commands.
+        args = ["-p", prompt, "--output-format", "json", "--permission-mode", "dontAsk",
+                "--allowedTools", "Read Write Edit Bash Glob Grep"]
         if not first:
             args.append("--continue")
         result = launch("claude", port, model, context, capture=True, cwd=folder, timeout=TIMEOUT, args=args)

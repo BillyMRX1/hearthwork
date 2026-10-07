@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hearthwork"
+version = "0.1.0"
+description = "Check whether a local model for coding agents (Claude Code, Codex) is worth it on this computer."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+hearthwork-check = "hearthwork_check:main"
+
+[tool.setuptools]
+py-modules = ["hearthwork_check", "onboard"]

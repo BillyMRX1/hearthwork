@@ -136,3 +136,13 @@ model.bat https://huggingface.co/<org>/<repo>/blob/main/<file>.gguf            (
 | Huihui-Qwen3.8-27B-abliterated Q3_K (dense, 12.6 GB) | ~6 tokens/s | Works through the relay. Dense and partly in RAM at 64K, so slower. |
 
 For comparison, a disk-streaming engine built on AirLLM ran the same Qwen3-Coder model about 10x slower on this PC.
+
+## Check your PC first
+
+See whether Hearthwork is worth it on a computer, and which model to use, without installing anything:
+
+```
+uvx --from git+https://github.com/BillyMRX1/hearthwork hearthwork-check
+```
+
+It shows the hardware, the verdict, installed agents, and the best version of each suggested coding model that fits (sizes live from Hugging Face). Inside a Hearthwork folder: `check.bat` / `./check.sh`.

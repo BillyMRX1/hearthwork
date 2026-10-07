@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Onboarding: detect this computer, get the right llama.cpp, pick settings, find the models folder.
 
-Runs automatically from start.py when config.json is incomplete. Run it again any time with
-setup.bat / ./setup.sh (or `python onboard.py`); `--update-llama` also replaces llama.cpp with the newest build.
+Runs automatically the first time `hearthwork` is used. Run it again any time with `hearthwork setup`;
+`--update-llama` also replaces llama.cpp with the newest build.
 
 Settings are sized from the hardware. The biggest speed factor is how much of the model sits on the GPU,
 which llama.cpp's --fit maximises at start time on any machine; so the context is kept at what Claude Code
@@ -22,9 +22,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-CONFIG = HERE / "config.json"
-BIN = HERE / "bin"
+from .paths import BIN, CONFIG, HOME
 WINDOWS, MAC = os.name == "nt", sys.platform == "darwin"
 SERVER_NAME = "llama-server.exe" if WINDOWS else "llama-server"
 GREEN, YELLOW, RED, CYAN, RESET = "\033[32m", "\033[33m", "\033[31m", "\033[36m", "\033[0m"
@@ -32,7 +30,7 @@ if WINDOWS:
     os.system("")  # ANSI colors in the Windows console
 
 # Suggested when the models folder is empty: the best in Hearthwork's benchmark (bench.py) on the reference PC.
-# `model.py <repo>` lists every file in a repo with its size and whether it fits this computer; hearthwork-check
+# `hearthwork model <repo>` lists every file in a repo with its size and whether it fits this computer; hearthwork-check
 # ranks a longer list for this machine.
 SUGGESTED = [
     ("unsloth/Qwen3.5-35B-A3B-GGUF", "Qwen3.5-35B-A3B: MoE, fast even partly in RAM. Best in the benchmark (8/8 with "
@@ -362,8 +360,8 @@ def choose_models_folder(config, reset=False):
     if current and not reset and Path(current).is_dir():
         return current
     found = [str(c) for c in lmstudio_folders()]
-    default = current or (found[0] if found else str(HERE / "models"))
-    print(f"\nWhere should models live? This folder is scanned for .gguf files, and model.py downloads into it.")
+    default = current or (found[0] if found else str(HOME / "models"))
+    print(f"\nWhere should models live? This folder is scanned for .gguf files, and `hearthwork model` downloads into it.")
     if found:
         print(f"  Found LM Studio's models folder: {found[0]} (sharing it lets LM Studio and this tool use the same files)")
     while True:
@@ -383,8 +381,8 @@ def suggest_models(hw, settings):
           f"(GPU memory + ~70% of RAM). Suggested:")
     for repo, about in SUGGESTED:
         print(f"  {repo}\n    {about}")
-        print(f"    Download:  {CYAN}{'model.bat' if WINDOWS else './model.sh'} {repo}{RESET}")
-    print("  Any GGUF model with tool-calling support works; paste its Hugging Face link into model.bat / model.sh.")
+        print(f"    Download:  {CYAN}hearthwork model {repo}{RESET}")
+    print("  Any GGUF model with tool-calling support works; pass its Hugging Face link to `hearthwork model`.")
 
 
 def onboard(config, update_llama=False, reset_folder=False):
@@ -443,12 +441,64 @@ def setup_complete(config):
                 and Path(config["modelsDir"]).is_dir() and find_llama(config))
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Set up llama.cpp for Claude Code on this computer.")
+def legacy_folders():
+    """Folders of a pre-0.2 Hearthwork (a git clone with config.json and bin/ next to the scripts)."""
+    here = Path(__file__).resolve()
+    candidates = [here.parents[2], Path.cwd(), *Path.cwd().parents]  # a source checkout, then cwd upwards
+    found = []
+    for folder in candidates:
+        try:
+            old = json.loads((folder / "config.json").read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if "llamaServer" in old and folder.resolve() != HOME.resolve() and folder not in found:
+            found.append(folder)
+    return found
+
+
+def import_legacy(folder, config):
+    """Copy settings, the llama.cpp build, prompt caches and benchmark results from an old Hearthwork folder.
+    Copies, so the old folder keeps working until you delete it."""
+    folder = Path(folder)
+    old = json.loads((folder / "config.json").read_text(encoding="utf-8-sig"))
+    for key in ("modelsDir", "lastModel", "hardware", "server"):
+        if key in old:
+            config[key] = old[key]
+    for name in ("bin", "cache", "bench", "templates"):
+        source = folder / name
+        if source.is_dir():
+            print(f"  copying {source} -> {HOME / name}")
+            shutil.copytree(source, HOME / name, dirs_exist_ok=True)
+    config["llamaServer"] = None
+    server = find_llama(config)
+    if server:
+        config["llamaServer"] = server
+    save_config(config)
+    print(f"{GREEN}Imported your Hearthwork setup from {folder}.{RESET} The old folder was left as it is.")
+    return config
+
+
+def offer_import(config):
+    """First run without a config: offer to import an older clone-style setup if one is found."""
+    if config.get("modelsDir"):
+        return config
+    for folder in legacy_folders():
+        if yes(f"Found an earlier Hearthwork setup in {folder}. Import its settings, llama.cpp and caches?"):
+            return import_legacy(folder, config)
+    return config
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="hearthwork setup", description="Set up llama.cpp for Claude Code on this computer.")
     parser.add_argument("--update-llama", action="store_true", help="download the newest llama.cpp build")
     parser.add_argument("--reset", action="store_true", help="ask for the models folder again")
-    args = parser.parse_args()
-    onboard(load_config(), update_llama=args.update_llama, reset_folder=args.reset)
+    parser.add_argument("--import", dest="import_from", metavar="FOLDER",
+                        help="copy settings, llama.cpp and caches from an older Hearthwork folder (a git clone)")
+    args = parser.parse_args(argv)
+    config = load_config()
+    if args.import_from:
+        config = import_legacy(args.import_from, config)
+    onboard(config, update_llama=args.update_llama, reset_folder=args.reset)
 
 
 if __name__ == "__main__":

@@ -4,14 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hearthwork"
-version = "0.1.0"
-description = "Check whether a local model for coding agents (Claude Code, Codex) is worth it on this computer."
+dynamic = ["version"]
+description = "Run a local llama.cpp model and connect Claude Code or Codex to it from one menu, tuned to your own machine."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
+keywords = ["llama.cpp", "local llm", "claude code", "codex", "coding agent"]
+
+[project.urls]
+Homepage = "https://github.com/BillyMRX1/hearthwork"
 
 [project.scripts]
-hearthwork-check = "hearthwork_check:main"
+hearthwork = "hearthwork.cli:main"
+hearthwork-check = "hearthwork.cli:check_main"
 
-[tool.setuptools]
-py-modules = ["hearthwork_check", "onboard"]
+[tool.setuptools.dynamic]
+version = { attr = "hearthwork.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

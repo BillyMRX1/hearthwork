@@ -240,5 +240,5 @@ def launch(key, port, name, context, max_output=4096, args=(), capture=False, cw
         return 130
     finally:
         if not capture:
-            from server import save_slots  # the session's prompt cache makes the next start's first message quick
+            from .server import save_slots  # the session's prompt cache makes the next start's first message quick
             save_slots(port)

@@ -1,20 +1,15 @@
-#!/usr/bin/env python3
-"""Hearthwork: one menu for everything. Pick a coding agent, and it starts the local model for you.
+"""The `hearthwork` menu: pick a coding agent, and it starts the local model for you.
 
-Run it from the project you want the agent to work on:
-  C:\\path\\to\\hearthwork\\hearthwork.bat  (Windows)
-  /path/to/hearthwork/hearthwork.sh       (macOS/Linux)
-  ... hearthwork.bat claude / codex      (skip the menu and go straight to that agent)
-
-First run: setup (hardware check, verdict, llama.cpp, models folder). The model server runs in the background
-(its own window on Windows) and stays up between agent sessions until you stop it from the menu or on quit.
+Run `hearthwork` from the project you want the agent to work on (`hearthwork claude` / `hearthwork codex` skip the
+menu). The model server runs in the background (its own window on Windows) and stays up between agent sessions
+until you stop it from the menu or on quit.
 """
 import os
-import sys
 
-from harnesses import HARNESSES, installed, launch
-from onboard import CYAN, GREEN, HERE, RED, RESET, YELLOW, ask, find_models, load_config, onboard, setup_complete, yes
-from server import STATE, choose_and_remember, served_model, start_background, stop
+from .harnesses import HARNESSES, installed, launch
+from .onboard import CYAN, GREEN, RED, RESET, YELLOW, ask, find_models, onboard, yes
+from .paths import BENCH, STATE
+from .server import choose_and_remember, served_model, start_background, stop
 
 BOLD, DIM = "\033[1m", "\033[2m"
 
@@ -39,7 +34,8 @@ def ensure_server(config):
     if name:
         return name
     if not find_models(config["modelsDir"]):
-        print(f"{YELLOW}No models yet. Choose 'Download a model' first.{RESET}")
+        print(f"{YELLOW}No models yet. Download one first: menu option 'Download a model', or "
+              f"`hearthwork model <Hugging Face link>`.{RESET}")
         return None
     model = choose_and_remember(config)
     if not model or not start_background(config, model):
@@ -47,13 +43,15 @@ def ensure_server(config):
     return served_model(port)
 
 
-def run_agent(config, key):
+def run_agent(config, key, args=(), back_to_menu=True):
+    """Start agent `key` in this terminal and folder, starting the model first if needed. Returns its exit code."""
     name = ensure_server(config)
     if not name:
-        return
+        return 1
     title = HARNESSES[key]["title"]
-    print(f"\n{CYAN}Starting {title} in {os.getcwd()} with {name}. Exit it to come back to this menu.{RESET}\n")
-    launch(key, config["server"]["port"], name, config["server"]["context"])
+    after = " Exit it to come back to this menu." if back_to_menu else ""
+    print(f"\n{CYAN}Starting {title} in {os.getcwd()} with {name}.{after}{RESET}\n")
+    return launch(key, config["server"]["port"], name, config["server"]["context"], args=args)
 
 
 def switch_model(config):
@@ -63,15 +61,15 @@ def switch_model(config):
 
 
 def download_model():
-    import subprocess
+    from . import model
     link = ask("Hugging Face link or org/repo (Enter to cancel): ")
     if link:
-        subprocess.call([sys.executable, str(HERE / "model.py"), link])
+        model.main([link])
 
 
 def benchmark(config):
-    """Run bench.py (8 graded coding tasks) on the running model, starting one if needed."""
-    import subprocess
+    """8 graded coding tasks on the running model (starting one if needed), through an agent you pick."""
+    from . import bench
     if not ensure_server(config):
         return
     agents = [key for key in HARNESSES if installed(key)]
@@ -84,17 +82,11 @@ def benchmark(config):
         answer = ask(f"Benchmark through which agent? {names} [Enter = 1]: ")
         if answer.isdigit() and 1 <= int(answer) <= len(agents):
             key = agents[int(answer) - 1]
-    print(f"{DIM}About 5-15 minutes; the agent works in its own folder under bench/runs.{RESET}")
-    subprocess.call([sys.executable, str(HERE / "bench.py"), "--agent", key])
+    print(f"{DIM}About 5-15 minutes; the agent works in its own folder under {BENCH / 'runs'}.{RESET}")
+    bench.main(["--agent", key])
 
 
-def main():
-    config = load_config()
-    if not setup_complete(config):
-        config = onboard(config)
-        input("\nPress Enter to continue...")
-    if len(sys.argv) > 1 and sys.argv[1] in HARNESSES:
-        run_agent(config, sys.argv[1])
+def main(config):
     while True:
         running, lines = status_lines(config)
         print(f"\n{BOLD}=== Hearthwork: local models for your coding agents ==={RESET}")
@@ -124,10 +116,3 @@ def main():
             print(f"{RED}Type a number from the list, or q.{RESET}")
     if STATE.exists() and served_model(config["server"]["port"]) and yes("Stop the model server?", default=True):
         stop(config)
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print()

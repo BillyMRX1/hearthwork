@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark the running model through a real coding agent, and keep a scoreboard.
 
-  bench.bat / ./bench.sh / python bench.py   [--agent claude|codex] [--show]
+  hearthwork bench   [--agent claude|codex] [--show]
   (or menu option "Benchmark the running model")
 
 Eight prompts run as one agent conversation in a fresh folder (bench/runs/...): chat, list files, read a file,
@@ -20,11 +20,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from harnesses import HARNESSES, installed, launch
-from onboard import CYAN, GREEN, HERE, RED, RESET, YELLOW, load_config
-from server import served_model
+from .harnesses import HARNESSES, installed, launch
+from .onboard import CYAN, GREEN, RED, RESET, YELLOW, load_config
+from .paths import BENCH
+from .server import served_model
 
-BENCH = HERE / "bench"
 RESULTS = BENCH / "results.jsonl"
 BOLD, DIM = "\033[1m", "\033[2m"
 TIMEOUT = 20 * 60  # per prompt
@@ -181,11 +181,11 @@ def scoreboard():
         print(f"  {r['model'][:48]:<48} {r['agent']:<12} {color}{r['score']:>5.1f}/8{RESET} {r['seconds'] / 60:>6.1f} m   {r['date']}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Benchmark the running model through a coding agent.")
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="hearthwork bench", description="Benchmark the running model through a coding agent.")
     parser.add_argument("--agent", choices=sorted(HARNESSES), default="claude")
     parser.add_argument("--show", action="store_true", help="only print the scoreboard")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.show:
         return scoreboard()
     config = load_config()

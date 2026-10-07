@@ -3,7 +3,7 @@
 
 Run it without installing anything:
   uvx --from git+https://github.com/BillyMRX1/hearthwork hearthwork-check
-or from a Hearthwork folder:  check.bat / ./check.sh / python hearthwork_check.py      (--json for scripts)
+or, once installed:  hearthwork check      (--json for scripts)
 
 Read-only: it checks the hardware and installed agents, gives the same verdict Hearthwork's setup gives, and
 looks up live file sizes on Hugging Face to pick the best version of each suggested model that fits.
@@ -18,7 +18,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-from onboard import CYAN, GREEN, RED, RESET, WINDOWS, YELLOW, detect, judge, lmstudio_folders, memory_gb
+from .onboard import CYAN, GREEN, RED, RESET, WINDOWS, YELLOW, detect, judge, lmstudio_folders, memory_gb
 
 BOLD, DIM = "\033[1m", "\033[2m"
 REPO = "https://github.com/BillyMRX1/hearthwork"
@@ -96,10 +96,10 @@ def place(model, sizes, gpu_room, ram_room):
     return None
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Will Hearthwork (local models for coding agents) be worth it here?")
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="hearthwork check", description="Will Hearthwork (local models for coding agents) be worth it here?")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     hw = detect()
     verdict, reasons, expect = judge(hw)
@@ -175,11 +175,10 @@ def main():
         print("  A local model would be too slow or too weak for coding on this computer. Cloud Claude Code / Codex is the"
               " better choice here.")
     else:
-        dl = "model.bat" if WINDOWS else "./model.sh"
-        start = "hearthwork.bat" if WINDOWS else "./hearthwork.sh"
-        print(f"  1. Get Hearthwork:  git clone {REPO}")
-        print(f"  2. Download a model: {CYAN}{dl} {best['repo']}{RESET}   (pick {best['quant']}, {best['sizeGB']} GB)")
-        print(f"  3. From your project folder, run {CYAN}{start}{RESET}: setup takes a minute, then pick your agent.")
+        print(f"  1. Install Hearthwork:  {CYAN}uv tool install git+{REPO}{RESET}   (or: pipx install git+{REPO})")
+        print(f"  2. Download a model:    {CYAN}hearthwork model {best['repo']}{RESET}   "
+              f"(pick {best['quant']}, {best['sizeGB']} GB)")
+        print(f"  3. From your project folder, run {CYAN}hearthwork{RESET}: setup takes a minute, then pick your agent.")
     print()
 
 

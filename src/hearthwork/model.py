@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Download a GGUF model from Hugging Face into your models folder (the one set during setup).
 
-  model.bat <link>      (Windows)       ./model.sh <link>      (macOS/Linux)       python model.py <link>
+  hearthwork model <link>
 
 <link> can be:
   https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF                 a repository: pick a file
@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from onboard import CYAN, GREEN, RED, RESET, YELLOW, WINDOWS, ask, detect, download, load_config, memory_gb
+from .onboard import CYAN, GREEN, RED, RESET, YELLOW, WINDOWS, ask, detect, download, load_config, memory_gb
 
 SHARD = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
@@ -76,14 +76,14 @@ def fit_note(size_gb, vram, ram_free, server):
     return f"{RED}too big for this computer{RESET}"
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Download a GGUF model from Hugging Face into your models folder.")
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="hearthwork model", description="Download a GGUF model from Hugging Face into your models folder.")
     parser.add_argument("link", nargs="?", help="Hugging Face repo or .gguf file link")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     config = load_config()
     folder = config.get("modelsDir")
     if not folder or not Path(folder).is_dir():
-        sys.exit(f"No models folder set yet. Run setup first ({'setup.bat' if WINDOWS else './setup.sh'}).")
+        sys.exit(f"No models folder set yet. Run `hearthwork setup` first.")
     link = args.link or ask("Hugging Face link (repo or .gguf file): ")
     repo, revision, file = parse(link)
 
@@ -121,7 +121,7 @@ def main():
             continue
         url = f"https://huggingface.co/{repo}/resolve/{urllib.parse.quote(revision)}/{urllib.parse.quote(path)}"
         download(url, target, Path(path).name)
-    print(f"{GREEN}Done.{RESET} Start it with {CYAN}{'start.bat' if WINDOWS else './start.sh'}{RESET} and pick it from the list.")
+    print(f"{GREEN}Done.{RESET} Start it with {CYAN}hearthwork{RESET} (or `hearthwork start`) and pick it from the list.")
 
 
 if __name__ == "__main__":

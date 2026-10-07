@@ -8,13 +8,11 @@ import time
 import urllib.request
 from pathlib import Path
 
-from onboard import GREEN, HERE, RED, RESET, WINDOWS, YELLOW, ask, find_models, memory_gb
+from .onboard import GREEN, RED, RESET, WINDOWS, YELLOW, ask, find_models, memory_gb
+from .paths import LOG, SLOTS, STATE, TEMPLATES
 
 DIM = "\033[2m"
 
-STATE = HERE / "server.json"  # the background server: pid, model, port
-LOG = HERE / "server.log"     # its output on macOS/Linux (Windows shows it in its own window)
-SLOTS = HERE / "cache" / "slots"  # saved prompt caches (see save_slots)
 MIN_SAVE_TOKENS = 2048  # smaller prompts (e.g. an agent's title request) must not overwrite a saved big one
 
 
@@ -68,7 +66,7 @@ def command(config, model, context=None):
            "-b", str(s["batch"]), "-ub", str(s["batch"]), "--host", "127.0.0.1", "--port", str(s["port"]),
            "--slot-save-path", str(slot_dir(config, model, context))]
     # Escape hatch for a chat template broken in a way the relay (harnesses.py) doesn't cover.
-    template = HERE / "templates" / f"{model.stem}.jinja"
+    template = TEMPLATES / f"{model.stem}.jinja"
     if template.is_file():
         cmd += ["--chat-template-file", str(template)]
     return cmd
@@ -176,7 +174,7 @@ def start_background(config, model, context=None):
 
 
 def stop(config, quiet=False):
-    """Stop the server this tool started in the background (not one started by hand with start.py)."""
+    """Stop the server this tool started in the background (not one started with `hearthwork serve`)."""
     try:
         state = json.loads(STATE.read_text())
     except (OSError, ValueError):
@@ -203,7 +201,7 @@ def stop(config, quiet=False):
 
 
 def run_foreground(config, model, context=None):
-    """start.py: run the server in this terminal until Ctrl+C. Saved prompt caches are restored once it is up."""
+    """`hearthwork serve`: run the server in this terminal until Ctrl+C. Saved prompt caches are restored once it is up."""
     import threading
 
     def restore_when_ready():
@@ -225,7 +223,7 @@ def run_foreground(config, model, context=None):
 
 def choose_and_remember(config, model_hint=None):
     """Pick a model (menu, or `model_hint` = part of a file name) and remember it as last used."""
-    from onboard import save_config
+    from .onboard import save_config
     models = find_models(config["modelsDir"])
     if not models:
         print(f"\nNo models in {config['modelsDir']} yet. Download one first.")

@@ -125,7 +125,7 @@ The first run sets things up (see below). After that you get one menu:
 | Agent | How it connects | Notes |
 |---|---|---|
 | Claude Code | Anthropic Messages API (`/v1/messages`) | Told the real context size, so it compacts in time. |
-| Codex | OpenAI Responses API (`/v1/responses`), as a one-off model provider through `-c` overrides | `~/.codex/config.toml` is not changed. Codex prints "Model metadata ... not found" for any non-OpenAI model; that is expected. |
+| Codex | OpenAI Responses API (`/v1/responses`), as a one-off model provider through `-c` overrides | `~/.codex/config.toml` is not changed. Hearthwork also writes a model catalogue entry (`codex-models.json` in its data folder) so Codex knows the model and its context window. |
 
 - **Every agent goes through a small relay** inside Hearthwork (`src/hearthwork/harnesses.py`). It reshapes requests so any model's chat template accepts them.
 - **Why the relay is needed:** strict templates (e.g. Qwen3.5/3.8) reject a second system/developer message, unknown roles, or two user messages in a row, and both agents send these. Without the relay, Claude Code and Codex requests failed on Qwen3.8 with "System message must be at the beginning".

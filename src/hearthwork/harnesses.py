@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import threading
 
+from . import paths
+
 
 # ---------- request normalization ----------
 
@@ -179,11 +181,48 @@ def claude_command(binary, relay, name, context, max_output, args):
     return [binary, "--model", name, *args], env
 
 
+def codex_catalog(binary, name, context):
+    """Write the model catalogue entry that tells Codex about the local model, and return its path.
+
+    Without an entry Codex warns "Model metadata for <model> not found" and uses fallback metadata. The format
+    is Codex's own ModelInfo (see `codex debug models --bundled`); it is the same for every model, so only the
+    name and context window are filled in. Written per launch so a changed model or context is always current."""
+    # Required field: Codex's system prompt. Reuse one Codex ships, so the model gets the normal Codex prompt.
+    instructions = ""
+    try:
+        shipped = subprocess.run([binary, "debug", "models", "--bundled"], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=20)
+        for entry in json.loads(shipped.stdout).get("models", []):
+            instructions = entry.get("base_instructions") or ""
+            if instructions:
+                break
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    entry = {
+        "slug": name, "display_name": name, "description": "Local model served by Hearthwork",
+        # Local models here do not take a reasoning-effort setting; "none" keeps Codex from sending one.
+        "default_reasoning_level": "none",
+        "supported_reasoning_levels": [{"effort": "none", "description": "No separate reasoning step"}],
+        "shell_type": "shell_command", "visibility": "hide", "supported_in_api": True, "priority": 99,
+        "availability_nux": None, "upgrade": None, "support_verbosity": False, "default_verbosity": None,
+        "apply_patch_tool_type": None, "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "context_window": context, "max_context_window": context, "experimental_supported_tools": [],
+        "supports_parallel_tool_calls": True,
+        "base_instructions": instructions or "You are Codex, a coding agent running in the user's terminal.",
+    }
+    path = paths.HOME / "codex-models.json"
+    temporary = path.with_name(f"{path.name}.{os.getpid()}")  # replace, so two launches never read half a file
+    temporary.write_text(json.dumps({"models": [entry]}, indent=1), encoding="utf-8")
+    os.replace(temporary, path)
+    return path
+
+
 def codex_command(binary, relay, name, context, max_output, args):
     # A one-off model provider given with -c overrides: your ~/.codex/config.toml is not changed.
     overrides = [
         "model_provider=llamacpp",
         f'model_providers.llamacpp={{name="llama.cpp (local)", base_url="http://127.0.0.1:{relay}/v1", wire_api="responses"}}',
+        f"model_catalog_json={json.dumps(str(codex_catalog(binary, name, context)))}",  # a TOML string
         f"model_context_window={context}",
         f"model_auto_compact_token_limit={int(context * 0.8)}",
     ]

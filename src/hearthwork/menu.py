@@ -79,7 +79,10 @@ def benchmark(config):
     key = agents[0]
     if len(agents) > 1:
         names = " / ".join(f"{i}) {HARNESSES[k]['title']}" for i, k in enumerate(agents, 1))
-        answer = ask(f"Benchmark through which agent? {names} [Enter = 1]: ")
+        answer = ask(f"Benchmark through which agent? {names} / a) all [Enter = 1]: ")
+        if answer.lower() == "a":
+            print(f"{DIM}Release check: each agent in turn after a warmup; 10-30 minutes.{RESET}")
+            return bench.main(["--all"])
         if answer.isdigit() and 1 <= int(answer) <= len(agents):
             key = agents[int(answer) - 1]
     print(f"{DIM}About 5-15 minutes; the agent works in its own folder under {BENCH / 'runs'}.{RESET}")

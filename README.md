@@ -94,7 +94,7 @@ The first run sets things up (see below). After that you get one menu:
 | `hearthwork serve [--model X]` | Runs the model server in this terminal; Ctrl+C stops it. |
 | `hearthwork status` | Shows what is running. |
 | `hearthwork model <link>` | Downloads a model from Hugging Face. |
-| `hearthwork bench [--agent claude\|codex] [--show]` | Benchmarks the running model through an agent; `--show` prints the scoreboard. |
+| `hearthwork bench [--agent claude\|codex] [--all] [--warmup] [--show]` | Benchmarks the running model through an agent. `--all` is the release check (every installed agent, see Benchmark). `--show` prints the scoreboard and the latest summary. |
 | `hearthwork check [--json]` | Checks whether this PC suits Hearthwork and which models fit (see below). |
 | `hearthwork setup [--update-llama] [--reset] [--import FOLDER]` | Runs setup again. `--update-llama` gets the newest llama.cpp, `--reset` starts setup from scratch, `--import` brings in an old clone-based setup. |
 | `hearthwork update` | Updates Hearthwork itself. |
@@ -118,7 +118,21 @@ The first run sets things up (see below). After that you get one menu:
 | 8 | summary | names all 3 files |
 
 - **Results** are added to `bench/results.jsonl` in the data folder. The scoreboard ranks every model and agent you have tried, by score and then time.
-- **Each run's folder** stays in `bench/runs/` in the data folder, so you can inspect what the agent wrote.
+- **Each run's folder** stays in `bench/runs/<date-time>/<agent>/` in the data folder, so you can inspect what the agent wrote.
+- **Isolated agent history:** each run gives the agent an empty config folder (`CODEX_HOME` for Codex, `CLAUDE_CONFIG_DIR` for Claude Code) next to its work folder, so benchmark sessions never fill your real `~/.codex` or `~/.claude`. The benchmark refuses to start if that folder would be your real one. Codex gets a copy of only the `[windows]` table of your `config.toml` (its sandbox setting); without it Codex on Windows blocks every command. No login is needed: the local provider is passed as `-c` overrides, and Claude Code runs with the dummy token Hearthwork already sets.
+
+### Release check: `hearthwork bench --all`
+
+Runs every installed agent one after another (never in parallel, which would starve the GPU), then prints and saves a table for release notes (`summary.md` in the run's folder; `bench --show` prints the latest one):
+
+1. **Warmup:** a ~30K-token prompt goes through the Anthropic (`/v1/messages`) and OpenAI (`/v1/responses`) endpoints first, so the first agent does not pay for cold caches. Not timed. `--warmup` does the same before a single-agent run.
+2. **Retry:** if the agent itself fails (crashes, does not start, reaches another provider), the run is repeated once in a fresh folder. Both attempts are written to `results.jsonl`; a failed attempt has an `error` and no score, so it never reaches the scoreboard. A wrong answer is a score, not a failure, and is not retried.
+3. **Summary:**
+
+| Model | Agent | Score | Time |
+|---|---|---|---|
+| Qwen3.5-35B-A3B-Q4_K_M | Claude Code | 8.0/8 | 3.0 min |
+| Qwen3.5-35B-A3B-Q4_K_M | Codex | 8.0/8 | 3.3 min |
 
 ## Agents
 

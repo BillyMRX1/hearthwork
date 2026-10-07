@@ -205,6 +205,7 @@ hearthwork model https://huggingface.co/<org>/<repo>/blob/main/<file>.gguf      
   - Prompt batch 4096 on 12 GB+ GPUs: a 20K-token prompt took 84 s at 512 and 26 s at 4096.
   - 2 slots, so Claude Code's background requests don't evict the conversation's cache.
   - The model's RAM part is loaded into RAM rather than memory-mapped from a possibly slow disk.
+- **Stable prompt prefix:** llama.cpp reuses only the part of the prompt before the first difference. Claude Code starts its system prompt with an `x-anthropic-billing-header` line whose hash changes with every new session, and adds a `<total_tokens>` counter after each turn; the relay removes both. Measured on a 17K-token prompt, a new session's first message went from 4.1K to 2.2K freshly processed tokens (6.8 s to 3.5 s). Within a session the cache was already stable. `HEARTHWORK_RELAY_DUMP=<folder>` writes every request the relay sees, before and after cleanup, for debugging.
 - **Where to change them:** the `server` section of `config.json` in the data folder. `hearthwork setup` recalculates them.
 - **Not used: speculative decoding.** Measured with Qwen3-Coder-30B (MoE, experts partly in RAM): n-gram speculation guessed 92% of the tokens when editing a file, but ran only 2–3% faster (within noise); the simple variant ran 14–19% slower. Verifying several guessed tokens at once routes them through many different experts, and part of those sit in RAM, so verifying costs about as much as generating. It may help when a model fits entirely in VRAM.
 

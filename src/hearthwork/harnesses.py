@@ -9,10 +9,12 @@ import http.client
 import http.server
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import time
 
 from . import paths
 from .paths import HOME
@@ -26,10 +28,40 @@ def _reminder(text):
     return f"<system-reminder>\n{text}\n</system-reminder>"
 
 
+BILLING_HEADER = "x-anthropic-billing-header:"  # Claude Code's first system block; its `cc_version=<ver>.<hash>` hash changes with the session's first message
+TOKENS_LEFT = re.compile(r"\s*<total_tokens>[^<]*</total_tokens>\s*")  # "N tokens left", appended after every user turn
+
+
+def _strip_volatile(text):
+    """Remove the parts of Claude Code's text that carry no meaning for a local model but differ between sessions
+    or turns: the billing-header line and the token counter."""
+    kept = [line for line in text.split("\n") if not line.startswith(BILLING_HEADER)]
+    return TOKENS_LEFT.sub("", "\n".join(kept)).strip()
+
+
 def normalize_anthropic(body):
     """Anthropic Messages (Claude Code). Claude Code puts a `system` message *inside* the conversation (its
     environment info, after the user's first message); its text moves into the neighbouring user message, at
-    the same position, so roles still alternate and the server's prompt cache still matches turn to turn."""
+    the same position, so roles still alternate and the server's prompt cache still matches turn to turn.
+
+    Also drops what makes the prompt differ for no reason, since llama.cpp reuses only the part before the first
+    difference. Measured on Claude Code 2.1.292 (captured requests, 17K-token prompt): the billing header is the
+    very first system block and its hash differs per session, so every new session reprocessed the whole prompt;
+    the per-turn `<total_tokens>` messages stay unchanged once sent (they cost no cache within a session) but are
+    noise for a local model (it shows 15,000,000 tokens left), so they are dropped too."""
+    system = body.get("system")
+    if isinstance(system, str):
+        body = dict(body, system=_strip_volatile(system))
+    elif isinstance(system, list):
+        cleaned = []
+        for block in system:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = _strip_volatile(block.get("text", ""))
+                if text:
+                    cleaned.append(dict(block, text=text))
+            else:
+                cleaned.append(block)
+        body = dict(body, system=cleaned)
     messages = body.get("messages")
     if not isinstance(messages, list) or not any(m.get("role") == "system" for m in messages):
         return body
@@ -40,7 +72,9 @@ def normalize_anthropic(body):
     out, pending = [], []  # pending: system blocks waiting for the next user message
     for message in messages:
         if message.get("role") == "system":
-            text = "\n".join(b.get("text", "") for b in blocks(message.get("content")) if b.get("type") == "text")
+            text = _strip_volatile("\n".join(b.get("text", "") for b in blocks(message.get("content")) if b.get("type") == "text"))
+            if not text:
+                continue
             wrapped = {"type": "text", "text": _reminder(text)}
             if out and out[-1]["role"] == "user":
                 out[-1] = dict(out[-1], content=blocks(out[-1]["content"]) + [wrapped])
@@ -96,6 +130,23 @@ def normalize_responses(body):
 
 # ---------- relay ----------
 
+_dump_count = 0
+
+def dump_request(incoming, normalized):
+    """HEARTHWORK_RELAY_DUMP=<dir>: write each request as it arrived and as sent on (NNN-in.json, NNN-out.json),
+    to see what changes between turns."""
+    global _dump_count
+    folder = os.environ.get("HEARTHWORK_RELAY_DUMP")
+    if not folder:
+        return
+    os.makedirs(folder, exist_ok=True)
+    _dump_count += 1
+    stamp = f"{int(time.time() * 1000)}-{_dump_count:03d}"
+    for kind, data in (("in", incoming), ("out", normalized)):
+        with open(os.path.join(folder, f"{stamp}-{kind}.json"), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+
 def start_relay(upstream_port):
     """Local HTTP relay to llama-server on `upstream_port`. Returns the relay's port."""
 
@@ -125,11 +176,13 @@ def start_relay(upstream_port):
             if body and self.command == "POST":
                 try:
                     payload = json.loads(body)
+                    raw = payload
                     if path.endswith("/messages"):
                         payload = normalize_anthropic(payload)
                     elif path.endswith("/responses"):
                         payload = normalize_responses(payload)
                     body = json.dumps(payload).encode()
+                    dump_request(raw, payload)
                 except ValueError:
                     pass
             headers = {k: v for k, v in self.headers.items()

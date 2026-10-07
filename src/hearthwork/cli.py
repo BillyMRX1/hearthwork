@@ -54,7 +54,7 @@ def update():
     if shutil.which("pipx") and "pipx" in sys.executable.replace("\\", "/"):
         return subprocess.call(["pipx", "upgrade", "hearthwork"])
     print(f"Upgrade with the tool you installed Hearthwork with, e.g.\n  uv tool upgrade hearthwork\n"
-          f"  pipx upgrade hearthwork\n  pip install --upgrade {REPO}")
+          f"  pipx upgrade hearthwork\n  pip install --upgrade hearthwork")
     return 0
 
 

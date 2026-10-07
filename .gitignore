@@ -22,3 +22,6 @@ cache/
 
 # Benchmark runs and scoreboard (per machine)
 bench/
+
+# Built packages
+dist/

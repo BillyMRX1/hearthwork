@@ -1,3 +1,12 @@
+Metadata-Version: 2.4
+Name: hearthwork
+Version: 0.2.1
+Summary: Run a local llama.cpp model and connect Claude Code or Codex to it from one menu, tuned to your own machine.
+Project-URL: Homepage, https://github.com/BillyMRX1/hearthwork
+Keywords: llama.cpp,local llm,claude code,codex,coding agent
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+
 <p align="center"><img src="https://raw.githubusercontent.com/BillyMRX1/hearthwork/main/assets/banner.svg" alt="Hearthwork: local models for your coding agents, tuned to your own machine" width="100%"></p>
 
 # Hearthwork

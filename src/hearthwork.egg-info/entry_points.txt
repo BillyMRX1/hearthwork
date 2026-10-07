@@ -1,0 +1,3 @@
+[console_scripts]
+hearthwork = hearthwork.cli:main
+hearthwork-check = hearthwork.cli:check_main

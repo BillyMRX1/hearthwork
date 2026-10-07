@@ -175,7 +175,7 @@ def main(argv=None):
         print("  A local model would be too slow or too weak for coding on this computer. Cloud Claude Code / Codex is the"
               " better choice here.")
     else:
-        print(f"  1. Install Hearthwork:  {CYAN}uv tool install git+{REPO}{RESET}   (or: pipx install git+{REPO})")
+        print(f"  1. Install Hearthwork:  {CYAN}uv tool install hearthwork{RESET}   (or: pipx install hearthwork)")
         print(f"  2. Download a model:    {CYAN}hearthwork model {best['repo']}{RESET}   "
               f"(pick {best['quant']}, {best['sizeGB']} GB)")
         print(f"  3. From your project folder, run {CYAN}hearthwork{RESET}: setup takes a minute, then pick your agent.")

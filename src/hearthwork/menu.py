@@ -10,12 +10,24 @@ from . import runtime
 from .harnesses import HARNESSES, installed, launch
 from .onboard import CYAN, GREEN, RED, RESET, YELLOW, ask, find_models, onboard, yes
 from .paths import BENCH, STATE
+from .remote import disconnect_main
 from .server import choose_and_remember, served_model, start_background, stop
 
 BOLD, DIM = "\033[1m", "\033[2m"
 
 
 def status_lines(config):
+    if config.get("remote"):
+        remote = config["remote"]
+        try:
+            from .remote import session
+            model = f"{GREEN}shared{RESET}  {session(config)[0]}"
+        except Exception as error:
+            model = f"{RED}unavailable{RESET}  {str(error).splitlines()[0]}"
+        return True, [f"  Project:  {os.getcwd()}",
+                      f"  Model:    {model}",
+                      f"  Host:     {remote.get('hostName') or remote['host']}  ({remote['host']}:{remote['port']})  "
+                      f"{DIM}`hearthwork disconnect` goes back to local models{RESET}"]
     hw, port = config.get("hardware", {}), config["server"]["port"]
     running = served_model(port)
     gpu = ", ".join(hw.get("gpus") or []) or "CPU only"
@@ -49,6 +61,14 @@ def ensure_server(config):
 
 def run_agent(config, key, args=(), back_to_menu=True):
     """Start agent `key` in this terminal and folder, starting the model first if needed. Returns its exit code."""
+    if config.get("remote"):  # the model runs on another computer (hearthwork connect)
+        from .remote import require
+        got = require(config)
+        if not got:
+            return 1
+        print(f"\n{CYAN}Starting {HARNESSES[key]['title']} in {os.getcwd()} with {got[0]} from "
+              f"{config['remote'].get('hostName') or config['remote']['host']}.{RESET}\n")
+        return launch(key, None, got[0], got[1], args=args, remote=config["remote"])
     name = ensure_server(config)
     if not name:
         return 1
@@ -74,7 +94,7 @@ def download_model():
 def benchmark(config):
     """8 graded coding tasks on the running model (starting one if needed), through an agent you pick."""
     from . import bench
-    if not ensure_server(config):
+    if not config.get("remote") and not ensure_server(config):
         return
     agents = [key for key in HARNESSES if installed(key)]
     if not agents:
@@ -103,11 +123,15 @@ def main(config):
         for key, harness in HARNESSES.items():
             note = "" if installed(key) else f"  {DIM}(not installed: {harness['install']}){RESET}"
             options.append((harness["title"] + note, lambda k=key: run_agent(config, k)))
-        options += [("Start / switch model", lambda: switch_model(config)),
-                    ("Download a model", download_model),
-                    ("Stop the model server" + ("" if running else f"  {DIM}(not running){RESET}"), lambda: stop(config)),
-                    ("Benchmark the model: 8 graded coding tasks + scoreboard", lambda: benchmark(config)),
-                    ("Setup: hardware check, llama.cpp update, models folder", lambda: config.update(onboard(config)))]
+        if config.get("remote"):
+            options += [("Benchmark the model: 8 graded coding tasks + scoreboard", lambda: benchmark(config)),
+                        ("Disconnect from the other computer", lambda: (disconnect_main(), config.pop("remote", None)))]
+        else:
+            options += [("Start / switch model", lambda: switch_model(config)),
+                        ("Download a model", download_model),
+                        ("Stop the model server" + ("" if running else f"  {DIM}(not running){RESET}"), lambda: stop(config)),
+                        ("Benchmark the model: 8 graded coding tasks + scoreboard", lambda: benchmark(config)),
+                        ("Setup: hardware check, llama.cpp update, models folder", lambda: config.update(onboard(config)))]
         print()
         for i, (label, _) in enumerate(options, 1):
             print(f"  {i}) {label}")
@@ -122,5 +146,5 @@ def main(config):
                 pass
         else:
             print(f"{RED}Type a number from the list, or q.{RESET}")
-    if STATE.exists() and served_model(config["server"]["port"]) and yes("Stop the model server?", default=True):
+    if not config.get("remote") and STATE.exists() and served_model(config["server"]["port"]) and yes("Stop the model server?", default=True):
         stop(config)

@@ -142,7 +142,9 @@ class AgentError(Exception):
 
 def ask_agent(agent, config, model, folder, prompt, first, session, env=None):
     """One turn. Returns (reply, session id); raises AgentError when the agent itself fails."""
-    port, context = config["server"]["port"], config["server"]["context"]
+    remote = config.get("remote")
+    port, context = ((None, remote.get("context", 32768)) if remote else  # context: set by main() from the host
+                     (config["server"]["port"], config["server"]["context"]))
     if agent == "claude":
         # dontAsk: the allowed tools just run. Otherwise a user's default "auto" mode asks the (local, slow) model to
         # classify every command first; with GLM-4.7-Flash those checks timed out and blocked the commands.
@@ -150,7 +152,7 @@ def ask_agent(agent, config, model, folder, prompt, first, session, env=None):
                 "--allowedTools", "Read Write Edit Bash Glob Grep"]
         if not first:
             args.append("--continue")
-        result = launch("claude", port, model, context, capture=True, cwd=folder, timeout=TIMEOUT, args=args, extra_env=env)
+        result = launch("claude", port, model, context, remote=remote, capture=True, cwd=folder, timeout=TIMEOUT, args=args, extra_env=env)
         try:
             data = json.loads(result.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
@@ -163,7 +165,7 @@ def ask_agent(agent, config, model, folder, prompt, first, session, env=None):
     # `codex exec resume` has no -s flag; the sandbox is set as config, which both forms accept.
     common = ["--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-o", str(last)]
     args = ["exec", *common, prompt] if first else ["exec", "resume", *common, session, prompt]
-    result = launch("codex", port, model, context, capture=True, cwd=folder, timeout=TIMEOUT, args=args, extra_env=env)
+    result = launch("codex", port, model, context, remote=remote, capture=True, cwd=folder, timeout=TIMEOUT, args=args, extra_env=env)
     output = result.stdout + result.stderr
     provider = re.search(r"^provider:\s*(\S+)", output, re.M)
     if provider and provider.group(1) != "llamacpp":
@@ -214,7 +216,7 @@ def windows_sandbox_config(path):
     return "\n".join(table).strip() + "\n" if table else ""
 
 
-def warmup(port, model):
+def warmup(port, model, remote=None):
     """Send a ~30K-token prompt through the Anthropic and OpenAI endpoints, so the first timed agent does not pay
     for cold caches and kernels. Failures only warn: the benchmark itself still tells."""
     text = "".join(f"Note {i}: the quick brown fox jumps over the lazy dog near the river bank. " for i in range(WARMUP_TOKENS // 17))
@@ -223,8 +225,9 @@ def warmup(port, model):
     for name, path, body in calls:
         print(f"  warmup {name:<24}", end=" ", flush=True)
         t0 = time.time()
-        request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", json.dumps(body).encode(),
-                                         {"content-type": "application/json", "x-api-key": "local", "authorization": "Bearer local"})
+        base, key = (f"http://{remote['host']}:{remote['port']}", remote["key"]) if remote else (f"http://127.0.0.1:{port}", "local")
+        request = urllib.request.Request(f"{base}{path}", json.dumps(body).encode(),
+                                         {"content-type": "application/json", "x-api-key": key, "authorization": f"Bearer {key}"})
         try:
             with urllib.request.urlopen(request, timeout=900) as response:
                 response.read()
@@ -325,8 +328,16 @@ def main(argv=None):
     if args.show:
         return scoreboard()
     config = load_config()
-    port = config["server"]["port"]
-    model = served_model(port)
+    if config.get("remote"):  # the host's model; the warmup goes to it over the network too
+        from .remote import require
+        got = require(config)
+        if not got:
+            sys.exit(1)
+        model, port = got[0], None
+        config["remote"]["context"] = got[1]  # in memory only: ask_agent reads it
+    else:
+        port = config["server"]["port"]
+        model = served_model(port)
     if not model:
         sys.exit("No model is running. Start one first (hearthwork menu: Start / switch model).")
     agents = [key for key in sorted(HARNESSES) if installed(key)] if args.all else [args.agent]
@@ -338,7 +349,7 @@ def main(argv=None):
     root.mkdir(parents=True)
     if args.all or args.warmup:
         print(f"\n{BOLD}Warmup{RESET}: {model}  {DIM}(~{WARMUP_TOKENS // 1000}K-token prompt on both APIs, not timed){RESET}")
-        warmup(port, model)
+        warmup(port, model, config.get("remote"))
     results = [(HARNESSES[agent]["title"], run_agent(agent, config, model, root)) for agent in agents]
     table = summary_table(model, results)
     (root / "summary.md").write_text(table + "\n", encoding="utf-8")

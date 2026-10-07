@@ -93,6 +93,10 @@ The first run sets things up (see below). After that you get one menu:
 | `hearthwork stop` | Stops the background model server. |
 | `hearthwork serve [--model X]` | Runs the model server in this terminal; Ctrl+C stops it. |
 | `hearthwork status` | Shows what is running. |
+| `hearthwork share [--port 8484] [--allow-public]` | Shares the running model on your home network (starts one if needed); Ctrl+C stops. A PIN shows here when another computer asks to connect. |
+| `hearthwork devices [remove <name>]` | Lists the computers allowed to use your model; `remove` revokes one at once. |
+| `hearthwork connect [host[:port]]` | Uses the model of a computer that is sharing: finds it on the network (or give its address), pairs with the PIN. |
+| `hearthwork disconnect` | Goes back to local models. |
 | `hearthwork model <link>` | Downloads a model from Hugging Face. |
 | `hearthwork bench [--agent claude\|codex] [--all] [--warmup] [--show]` | Benchmarks the running model through an agent. `--all` is the release check (every installed agent, see Benchmark). `--show` prints the scoreboard and the latest summary. |
 | `hearthwork check [--json]` | Checks whether this PC suits Hearthwork and which models fit (see below). |
@@ -102,6 +106,25 @@ The first run sets things up (see below). After that you get one menu:
 | `hearthwork --version` | Prints the version and data folder. |
 
 - **Faster first messages:** each agent's processed system prompt is saved to `cache/slots/` in the data folder when a session ends or the server stops, and restored when the server starts. Measured: the first message after a restart went from 28 s to 13 s (Claude Code) and from 25 s to 17 s (Codex).
+
+## Use the model from another computer
+
+Run the model on one computer (say, a PC with a GPU) and use Claude Code or Codex from another one on the same home network. Both need Hearthwork; the second one needs no model, llama.cpp or setup.
+
+```
+hearthwork share           # on the computer with the model; leave it running
+hearthwork connect         # on the other computer: finds it, then asks for the PIN shown on the first
+hearthwork claude          # now uses the other computer's model (same for codex, the menu, bench)
+hearthwork disconnect      # back to local models
+```
+
+- **Pairing:** `connect` asks to pair and the host shows a 6-digit PIN, which you type on the other computer. The PIN works for 2 minutes, 3 wrong tries end the request, and too many wrong PINs lock pairing for 10 minutes. The host then gives the computer a long random key (it keeps only a hash) and later connections need no PIN.
+- **Trusted devices:** `hearthwork devices` lists them, `hearthwork devices remove <name>` revokes one immediately.
+- **Requests are cleaned up on the host**, so the other computer needs no model-specific setup. It uses whatever model the host runs and cannot start, stop or switch it.
+- **Windows host:** the firewall may ask to allow Python; allow it on private networks. Sharing is refused while a network is marked Public (mark it Private, or pass `--allow-public`).
+- **Discovery** uses UDP port 8485; if it does not find the host, run `hearthwork connect <ip>[:8484]`.
+
+**Limits:** traffic is plain HTTP (not encrypted), so use it on home networks you trust only. Anyone on the network can see the traffic. To use a model from outside your home network, put both computers on a VPN such as Tailscale and run `hearthwork connect <tailscale ip>`.
 
 ## Benchmark
 

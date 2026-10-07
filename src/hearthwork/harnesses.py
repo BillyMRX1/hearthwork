@@ -147,8 +147,10 @@ def dump_request(incoming, normalized):
             json.dump(data, f)
 
 
-def start_relay(upstream_port):
-    """Local HTTP relay to llama-server on `upstream_port`. Returns the relay's port."""
+def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None):
+    """HTTP relay to llama-server on `upstream_port`, bound to `address` (not yet serving). `intercept(handler)`, when
+    given, runs first for every request and returns True once it has answered it itself: `hearthwork share` uses it
+    for the device check and the pairing endpoints, and everything else goes through the same normalization."""
 
     class Relay(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"  # the body ends when the connection closes: simple, works for streams
@@ -161,7 +163,13 @@ def start_relay(upstream_port):
             self.end_headers()
             self.wfile.write(data)
 
+        def read_body(self, limit=None):
+            length = int(self.headers.get("content-length") or 0)
+            return self.rfile.read(min(length, limit) if limit else length)
+
         def _relay(self):
+            if intercept and intercept(self):
+                return
             body = self.rfile.read(int(self.headers.get("content-length") or 0)) or None
             path = self.path.split("?")[0]
             if self.command == "GET" and path.rstrip("/").endswith("/models"):
@@ -211,8 +219,14 @@ def start_relay(upstream_port):
         def log_message(self, *args):
             pass
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Relay)
+    server = http.server.ThreadingHTTPServer(address, Relay)
     server.daemon_threads = True
+    return server
+
+
+def start_relay(upstream_port):
+    """Local HTTP relay to llama-server on `upstream_port`. Returns the relay's port."""
+    server = make_relay(upstream_port)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server.server_address[1]
 
@@ -279,7 +293,7 @@ def claude_settings(name, context):
 
 # ---------- harnesses ----------
 
-def claude_command(binary, relay, name, context, max_output, args):
+def claude_command(binary, base_url, token, name, context, max_output, args):
     # The connection stays in process env vars, not the settings file: the relay port changes every session, and
     # env vars are what already works. The settings file only holds what is the same for every session.
     settings, auto = claude_settings(name, context)
@@ -292,7 +306,7 @@ def claude_command(binary, relay, name, context, max_output, args):
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)
     env.update({
-        "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{relay}", "ANTHROPIC_AUTH_TOKEN": "local-model",
+        "ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_AUTH_TOKEN": token or "local-model",
         "ANTHROPIC_MODEL": name, "ANTHROPIC_DEFAULT_OPUS_MODEL": name, "ANTHROPIC_DEFAULT_SONNET_MODEL": name,
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": name, "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max_output),
         "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(context), "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
@@ -336,11 +350,13 @@ def codex_catalog(binary, name, context):
     return path
 
 
-def codex_command(binary, relay, name, context, max_output, args):
-    # A one-off model provider given with -c overrides: your ~/.codex/config.toml is not changed.
+def codex_command(binary, base_url, token, name, context, max_output, args):
+    # A one-off model provider given with -c overrides: your ~/.codex/config.toml is not changed. With a shared
+    # model (token is not None) Codex reads the device key from the HEARTHWORK_KEY variable and sends it as Bearer.
+    key = ', env_key="HEARTHWORK_KEY"' if token else ""
     overrides = [
         "model_provider=llamacpp",
-        f'model_providers.llamacpp={{name="llama.cpp (local)", base_url="http://127.0.0.1:{relay}/v1", wire_api="responses"}}',
+        f'model_providers.llamacpp={{name="llama.cpp (local)", base_url="{base_url}/v1", wire_api="responses"{key}}}',
         f"model_catalog_json={json.dumps(str(codex_catalog(binary, name, context)))}",  # a TOML string
         f"model_context_window={context}",
         f"model_auto_compact_token_limit={int(context * 0.8)}",
@@ -361,7 +377,7 @@ def codex_command(binary, relay, name, context, max_output, args):
     command = [binary]
     for override in overrides:
         command += ["-c", override]
-    return [*command, "-m", name, *rest], None
+    return [*command, "-m", name, *rest], ({**os.environ, "HEARTHWORK_KEY": token} if token else None)
 
 
 HARNESSES = {
@@ -376,17 +392,22 @@ def installed(key):
     return shutil.which(HARNESSES[key]["binary"])
 
 
-def launch(key, port, name, context, max_output=4096, args=(), capture=False, cwd=None, timeout=None, extra_env=None):
+def launch(key, port, name, context, max_output=4096, args=(), capture=False, cwd=None, timeout=None, extra_env=None,
+           remote=None):
     """Run harness `key` against the server on `port`: in this terminal, or with `capture` its output is
     returned as a CompletedProcess (for the benchmark). `extra_env` is added to the agent's environment. Returns the
-    exit code otherwise."""
+    exit code otherwise. With `remote` (config["remote"]: a model shared by another computer) the agent talks to that
+    computer directly: no local relay (the host normalizes), no local prompt-cache saves."""
     harness = HARNESSES[key]
     binary = installed(key)
     if not binary:
         print(f"{harness['title']} is not installed. Get it from {harness['install']}")
         return 1
-    relay = start_relay(port)
-    command, env = harness["command"](binary, relay, name, context, max_output, list(args))
+    if remote:
+        base_url, token = f"http://{remote['host']}:{remote['port']}", remote["key"]
+    else:
+        base_url, token = f"http://127.0.0.1:{start_relay(port)}", None
+    command, env = harness["command"](binary, base_url, token, name, context, max_output, list(args))
     if extra_env:
         env = {**(os.environ if env is None else env), **extra_env}
     try:
@@ -397,6 +418,6 @@ def launch(key, port, name, context, max_output=4096, args=(), capture=False, cw
     except KeyboardInterrupt:
         return 130
     finally:
-        if not capture:
+        if not capture and not remote:
             from .server import save_slots  # the session's prompt cache makes the next start's first message quick
             save_slots(port)

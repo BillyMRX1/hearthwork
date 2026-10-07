@@ -7,6 +7,10 @@
   hearthwork serve [--model X]  run the model server in this terminal (Ctrl+C stops it)
   hearthwork alias add <name> claude|codex   short command for it, e.g. ccl  (also: alias list, alias remove <name>)
   hearthwork status             what is running
+  hearthwork share [--port N]   share the running model on your home network (Ctrl+C stops); a PIN pairs each computer
+  hearthwork devices            trusted devices (devices remove <name> revokes one)
+  hearthwork connect [host]     use the model of a computer that is sharing (finds it, or give host[:port]); pair with the PIN
+  hearthwork disconnect         back to local models
   hearthwork model <link>       download a GGUF model from Hugging Face
   hearthwork bench [--agent X]  8 graded coding tasks through an agent, with a scoreboard
   hearthwork bench --all        release check: every installed agent in turn, after a warmup, with a summary table
@@ -28,9 +32,12 @@ REPO = "git+https://github.com/BillyMRX1/hearthwork"
 USAGE = __doc__.split("\n", 2)[2]
 
 
-def configured(interactive=True):
-    """config, running first-time setup (or importing an older setup) when needed."""
+def configured(interactive=True, remote_ok=False):
+    """config, running first-time setup (or importing an older setup) when needed. With `remote_ok`, a computer
+    that only uses another computer's model (hearthwork connect) needs no setup."""
     config = load_config()
+    if remote_ok and config.get("remote"):
+        return config
     if setup_complete(config):
         runtime.migrate(config)
         return config
@@ -73,10 +80,10 @@ def main(argv=None):
             print(f"hearthwork {__version__}  (data: {HOME})")
         elif command == "menu":
             from . import menu
-            menu.main(configured())
+            menu.main(configured(remote_ok=True))
         elif command in HARNESSES:  # every following argument belongs to the agent (e.g. -p "...")
             from .menu import run_agent
-            sys.exit(run_agent(configured(), command, rest, back_to_menu=False))
+            sys.exit(run_agent(configured(remote_ok=True), command, rest, back_to_menu=False))
         elif command in ("start", "serve"):
             from .server import choose_and_remember, run_foreground, start_background
             args = model_args(rest, command)
@@ -101,8 +108,15 @@ def main(argv=None):
             from .server import served_model
             config = load_config()
             port = config.get("server", {}).get("port", 8001)
-            running = served_model(port)
             print(f"hearthwork {__version__}   data: {HOME}")
+            if config.get("remote"):
+                from .remote import require
+                remote = config["remote"]
+                print(f"connected to: {remote.get('hostName') or remote['host']} ({remote['host']}:{remote['port']}) as {remote['name']}")
+                got = require(config)
+                print(f"model: {GREEN + got[0] + RESET + '  (shared, context ' + str(got[1]) + ')' if got else 'unavailable'}")
+                sys.exit(0 if got else 1)
+            running = served_model(port)
             print(f"model: {GREEN + running + RESET if running else 'not running'}" + (f"  (port {port})" if running else ""))
             print(f"models folder: {config.get('modelsDir', '-')}")
             chosen = runtime.selected(config)
@@ -115,11 +129,23 @@ def main(argv=None):
             model.main(rest)
         elif command == "bench":
             from . import bench
-            if "--show" not in rest:
+            if "--show" not in rest and not load_config().get("remote"):
                 from .menu import ensure_server
                 if not ensure_server(configured()):
                     sys.exit(1)
             bench.main(rest)
+        elif command == "share":
+            from . import share
+            sys.exit(share.share_main(rest))
+        elif command == "devices":
+            from . import share
+            sys.exit(share.devices_main(rest))
+        elif command == "connect":
+            from . import remote
+            sys.exit(remote.connect_main(rest))
+        elif command == "disconnect":
+            from . import remote
+            sys.exit(remote.disconnect_main())
         elif command == "check":
             from . import check
             check.main(rest)

@@ -18,6 +18,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
+from .runtime import recommend
 from .onboard import CYAN, GREEN, RED, RESET, WINDOWS, YELLOW, detect, judge, lmstudio_folders, memory_gb
 
 BOLD, DIM = "\033[1m", "\033[2m"
@@ -103,6 +104,7 @@ def main(argv=None):
 
     hw = detect()
     verdict, reasons, expect = judge(hw)
+    runtime, runtime_why = recommend(hw)
     ram_total, ram_free = memory_gb()
     home_disk = shutil.disk_usage(Path.home()).free / 2**30
     agents = {"Claude Code": version("claude"), "Codex": version("codex")}
@@ -128,7 +130,7 @@ def main(argv=None):
 
     if args.json:
         print(json.dumps({"hardware": hw, "ramFreeGB": round(ram_free, 1), "diskFreeGB": round(home_disk, 1),
-                          "verdict": verdict, "reasons": reasons, "expect": expect, "agents": agents,
+                          "runtime": runtime, "runtimeReason": runtime_why, "verdict": verdict, "reasons": reasons, "expect": expect, "agents": agents,
                           "models": picks, "offline": offline}, indent=2))
         return
 
@@ -140,6 +142,7 @@ def main(argv=None):
     gpus = ", ".join(hw["gpus"]) or "no usable GPU"
     print(f"  GPU      {gpus}" + (f"  ({vram:.1f} GB)" if hw["backend"] == "vulkan" and vram else "")
           + f"   ->  llama.cpp {hw['backend']}" + (f", driver CUDA {hw['cudaDriver']}" if hw.get("cudaDriver") else ""))
+    print(f"  Runtime  {runtime}: {runtime_why}")
     print(f"  Disk     {home_disk:.0f} GB free in your home drive"
           + (f"; LM Studio models: {lmstudio_folders()[0]}" if lmstudio_folders() else ""))
 

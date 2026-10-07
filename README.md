@@ -96,6 +96,7 @@ The first run sets things up (see below). After that you get one menu:
 | `hearthwork model <link>` | Downloads a model from Hugging Face. |
 | `hearthwork bench [--agent claude\|codex] [--show]` | Benchmarks the running model through an agent; `--show` prints the scoreboard. |
 | `hearthwork check [--json]` | Checks whether this PC suits Hearthwork and which models fit (see below). |
+| `hearthwork runtime [install <name> \| use <name> \| update \| rollback]` | Lists the llama.cpp engines (CUDA 13/12, ROCm, Vulkan, SYCL, Metal, CPU) installed side by side, the one recommended for this PC and why. `install` downloads another next to the others, `use` switches (applies at the next model start), `update` gets the newest build, `rollback` goes back to the previous one. |
 | `hearthwork setup [--update-llama] [--reset] [--import FOLDER]` | Runs setup again. `--update-llama` gets the newest llama.cpp, `--reset` starts setup from scratch, `--import` brings in an old clone-based setup. |
 | `hearthwork update` | Updates Hearthwork itself. |
 | `hearthwork --version` | Prints the version and data folder. |
@@ -164,9 +165,10 @@ A launcher (`ccl.cmd` on Windows, a shell script on macOS/Linux) is created next
    - The reference point is measured: RTX 5060 Ti 16 GB + 22.6 GB RAM ran Qwen3-Coder-30B at 18–31 tokens/s. The thresholds for other hardware are estimates from that.
 3. **Gets llama.cpp.** It uses one already in `bin/` (in the data folder) or on PATH. Otherwise it downloads the newest official build that matches the hardware:
    - CUDA for NVIDIA. The CUDA 13 or 12 build is chosen from the driver.
-   - Vulkan for AMD and Intel.
+   - ROCm for AMD cards of the RDNA2 generation or newer (RX 6000 and up), otherwise Vulkan; Vulkan for Intel (SYCL for Arc).
    - Metal on macOS.
    - CPU if there is no GPU.
+   Every build lives in its own folder (`bin/<runtime>-b<build>/`), so several can sit side by side; see `hearthwork runtime`. A new build is smoke-tested (it starts and accepts every option Hearthwork passes) before it is used, and the previous build is kept for `hearthwork runtime rollback`. The menu and `hearthwork status` mention a newer llama.cpp build at most once a day.
 4. **Asks for the models folder.** It finds LM Studio's folder and offers it, so both tools share the same files.
 5. **Picks settings for this hardware:** context 64K (32K below ~24 GB GPU memory + RAM), prompt batch size, VRAM headroom, and an 8-bit KV cache.
 6. **Saves everything to `config.json`** in the data folder. If there are no models yet, it suggests one, with the command to download it.

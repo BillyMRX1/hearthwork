@@ -2,7 +2,7 @@
 """Onboarding: detect this computer, get the right llama.cpp, pick settings, find the models folder.
 
 Runs automatically the first time `hearthwork` is used. Run it again any time with `hearthwork setup`;
-`--update-llama` also replaces llama.cpp with the newest build.
+`--update-llama` also updates llama.cpp to the newest build (see runtime.py).
 
 Settings are sized from the hardware. The biggest speed factor is how much of the model sits on the GPU,
 which llama.cpp's --fit maximises at start time on any machine; so the context is kept at what Claude Code
@@ -215,20 +215,9 @@ def server_version(path):
 
 
 def wanted_assets(hw):
-    """Release asset name patterns (main, extra runtime) for this computer."""
-    arch, backend = hw["arch"], hw["backend"]
-    if hw["os"] == "macos":
-        return [rf"llama-b\d+-bin-macos-{arch}\.tar\.gz$"], []
-    plat = "win" if hw["os"] == "windows" else "ubuntu"
-    ext = r"\.zip$" if plat == "win" else r"\.tar\.gz$"
-    if backend == "cuda":
-        major = int((hw.get("cudaDriver") or "12.0").split(".")[0])
-        cuda = r"13\.\d+" if major >= 13 else r"12\.\d+"
-        return [rf"llama-b\d+-bin-{plat}-cuda-{cuda}-{arch}{ext}"], [rf"cudart-llama-(b\d+-)?bin-{plat}-cuda-{cuda}-{arch}{ext}"]
-    if backend == "vulkan":
-        return [rf"llama-b\d+-bin-{plat}-vulkan-{arch}{ext}"], []
-    cpu = f"cpu-{arch}" if plat == "win" else ("x64" if arch == "x64" else "arm64")
-    return [rf"llama-b\d+-bin-{plat}-{cpu}{ext}"], []
+    """Release asset name patterns (main, extra runtime) for the runtime recommended for this computer."""
+    from .runtime import assets_for, recommend
+    return assets_for(recommend(hw)[0], hw["os"], hw["arch"])
 
 
 def github_json(url):
@@ -259,43 +248,6 @@ def download(url, target, label):
                 print(f"\r  {label}: {done / 2**30:6.2f} / {total / 2**30:.2f} GB {pct}", end="", flush=True)
     print()
     part.replace(target)
-
-
-def install_llama(hw, config):
-    """Download the newest official llama.cpp build for this computer into bin/."""
-    main_patterns, extra_patterns = wanted_assets(hw)
-    print(f"Looking up the newest llama.cpp build for {hw['os']} {hw['arch']} ({hw['backend']})...")
-    for release in github_json("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10"):
-        names = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
-        main = [n for p in main_patterns for n in names if re.match(p, n)]
-        extra = [n for p in extra_patterns for n in names if re.match(p, n)]
-        if main and len(extra) >= len(extra_patterns):
-            break
-    else:
-        sys.exit(f"{RED}No matching llama.cpp build found. Get one from https://github.com/ggml-org/llama.cpp/releases "
-                 f"and run setup again.{RESET}")
-    files = sorted(main)[-1:] + sorted(extra)[-1:]
-    print(f"  release {release['tag_name']}: {', '.join(files)}")
-    if BIN.exists():
-        shutil.rmtree(BIN)
-    BIN.mkdir(parents=True)
-    archives = []
-    for name in files:
-        target = BIN / name
-        download(names[name], target, name)
-        archives.append(target)
-    extract(archives[0], BIN)
-    server = next((p for p in BIN.rglob(SERVER_NAME) if p.is_file()), None)
-    if not server:
-        sys.exit(f"{RED}{SERVER_NAME} not found in {archives[0].name}.{RESET}")
-    for archive in archives[1:]:  # runtime libraries go next to llama-server
-        extract(archive, server.parent, flatten=True)
-    for archive in archives:
-        archive.unlink()
-    if not WINDOWS:
-        server.chmod(server.stat().st_mode | 0o111)
-    config["llamaServer"] = str(server)
-    print(f"{GREEN}  llama.cpp installed: {server} ({server_version(server)}){RESET}")
 
 
 def extract(archive, target, flatten=False):

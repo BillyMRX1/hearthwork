@@ -58,13 +58,14 @@ def slot_dir(config, model, context=None):
     return path
 
 
-def command(config, model, context=None):
+def command(config, model, context=None, slot_path=None):
+    from .runtime import selected_server
     s = config["server"]
-    cmd = [config["llamaServer"], "-m", str(model), "-c", str(context or s["context"]), "-fa", "on", "--jinja",
+    cmd = [selected_server(config) or config["llamaServer"], "-m", str(model), "-c", str(context or s["context"]), "-fa", "on", "--jinja",
            "--fit", "on", "--fit-target", str(s["fitTargetMiB"]), "--load-mode", "none",
            "-ctk", s["kvCacheType"], "-ctv", s["kvCacheType"], "-np", str(s["slots"]), "-kvu",
            "-b", str(s["batch"]), "-ub", str(s["batch"]), "--host", "127.0.0.1", "--port", str(s["port"]),
-           "--slot-save-path", str(slot_dir(config, model, context))]
+           "--slot-save-path", str(slot_path or slot_dir(config, model, context))]
     # Escape hatch for a chat template broken in a way the relay (harnesses.py) doesn't cover.
     template = TEMPLATES / f"{model.stem}.jinja"
     if template.is_file():

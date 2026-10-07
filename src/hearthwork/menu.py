@@ -6,6 +6,7 @@ until you stop it from the menu or on quit.
 """
 import os
 
+from . import runtime
 from .harnesses import HARNESSES, installed, launch
 from .onboard import CYAN, GREEN, RED, RESET, YELLOW, ask, find_models, onboard, yes
 from .paths import BENCH, STATE
@@ -20,10 +21,13 @@ def status_lines(config):
     gpu = ", ".join(hw.get("gpus") or []) or "CPU only"
     verdict = hw.get("verdict", "")
     color = {"recommended": GREEN, "limited": YELLOW}.get(verdict, RED)
+    chosen = runtime.selected(config)
     lines = [f"  Project:  {os.getcwd()}",
              f"  Model:    " + (f"{GREEN}running{RESET}  {running}  (port {port})" if running
                                else f"{DIM}not running{RESET}  (last used: {os.path.basename(config.get('lastModel') or '-')})"),
              f"  Computer: {gpu}, {hw.get('ramGB', '?')} GB RAM" + (f"  {color}{verdict}{RESET}" if verdict else "")]
+    if chosen:
+        lines.append(f"  Runtime:  llama.cpp {chosen[0]} b{chosen[1]}")
     return running, lines
 
 
@@ -87,6 +91,7 @@ def benchmark(config):
 
 
 def main(config):
+    runtime.print_notice(config)
     while True:
         running, lines = status_lines(config)
         print(f"\n{BOLD}=== Hearthwork: local models for your coding agents ==={RESET}")

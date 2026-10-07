@@ -10,6 +10,7 @@
   hearthwork model <link>       download a GGUF model from Hugging Face
   hearthwork bench              8 graded coding tasks through an agent, with a scoreboard
   hearthwork check              is this computer suited, and which models fit
+  hearthwork runtime            llama.cpp engines: list, install <name>, use <name>, update, rollback
   hearthwork setup              hardware check, llama.cpp download/update, models folder
   hearthwork update             update Hearthwork itself
 """
@@ -17,7 +18,7 @@ import shutil
 import subprocess
 import sys
 
-from . import __version__
+from . import __version__, runtime
 from .harnesses import HARNESSES
 from .onboard import CYAN, GREEN, RESET, load_config, offer_import, onboard, setup_complete
 from .paths import HOME
@@ -30,9 +31,11 @@ def configured(interactive=True):
     """config, running first-time setup (or importing an older setup) when needed."""
     config = load_config()
     if setup_complete(config):
+        runtime.migrate(config)
         return config
     config = offer_import(config)
     if setup_complete(config):
+        runtime.migrate(config)
         return config
     config = onboard(config)
     if interactive:
@@ -101,6 +104,10 @@ def main(argv=None):
             print(f"hearthwork {__version__}   data: {HOME}")
             print(f"model: {GREEN + running + RESET if running else 'not running'}" + (f"  (port {port})" if running else ""))
             print(f"models folder: {config.get('modelsDir', '-')}")
+            chosen = runtime.selected(config)
+            if chosen:
+                print(f"runtime: {chosen[0]} b{chosen[1]}")
+            runtime.print_notice(config)
         elif command == "model":
             from . import model
             configured()
@@ -118,6 +125,8 @@ def main(argv=None):
         elif command == "setup":
             from . import onboard as setup
             setup.main(rest)
+        elif command == "runtime":
+            sys.exit(runtime.main(rest))
         elif command == "alias":
             from . import aliases
             sys.exit(aliases.main(rest))

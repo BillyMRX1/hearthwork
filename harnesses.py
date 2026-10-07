@@ -211,3 +211,6 @@ def launch(key, port, name, context, max_output=4096, args=()):
         return harness["launch"](binary, relay, name, context, max_output, list(args))
     except KeyboardInterrupt:
         return 130
+    finally:
+        from server import save_slots  # the session's prompt cache makes the next start's first message quick
+        save_slots(port)

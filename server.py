@@ -10,8 +10,12 @@ from pathlib import Path
 
 from onboard import GREEN, HERE, RED, RESET, WINDOWS, YELLOW, ask, find_models, memory_gb
 
+DIM = "\033[2m"
+
 STATE = HERE / "server.json"  # the background server: pid, model, port
 LOG = HERE / "server.log"     # its output on macOS/Linux (Windows shows it in its own window)
+SLOTS = HERE / "cache" / "slots"  # saved prompt caches (see save_slots)
+MIN_SAVE_TOKENS = 2048  # smaller prompts (e.g. an agent's title request) must not overwrite a saved big one
 
 
 def pick_model(models, folder, last):
@@ -47,12 +51,22 @@ def warn_if_too_big(config, model):
               f"are available. It may fail to load or be very slow. Close other programs or pick a smaller model.{RESET}")
 
 
+def slot_dir(config, model, context=None):
+    """Where this model's processed prompts are saved. Per model, context and KV type: a saved cache only
+    restores into a server set up the same way."""
+    s = config["server"]
+    path = SLOTS / f"{model.stem}-c{context or s['context']}-{s['kvCacheType']}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def command(config, model, context=None):
     s = config["server"]
     cmd = [config["llamaServer"], "-m", str(model), "-c", str(context or s["context"]), "-fa", "on", "--jinja",
            "--fit", "on", "--fit-target", str(s["fitTargetMiB"]), "--load-mode", "none",
            "-ctk", s["kvCacheType"], "-ctv", s["kvCacheType"], "-np", str(s["slots"]), "-kvu",
-           "-b", str(s["batch"]), "-ub", str(s["batch"]), "--host", "127.0.0.1", "--port", str(s["port"])]
+           "-b", str(s["batch"]), "-ub", str(s["batch"]), "--host", "127.0.0.1", "--port", str(s["port"]),
+           "--slot-save-path", str(slot_dir(config, model, context))]
     # Escape hatch for a chat template broken in a way the relay (harnesses.py) doesn't cover.
     template = HERE / "templates" / f"{model.stem}.jinja"
     if template.is_file():
@@ -68,6 +82,49 @@ def served_model(port, timeout=2):
         return Path(served.replace("\\", "/")).stem
     except Exception:
         return None
+
+
+def _slot_request(port, slot, action, timeout=60):
+    body = json.dumps({"filename": f"slot{slot}.bin"}).encode()
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/slots/{slot}?action={action}", data=body,
+                                     headers={"content-type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def save_slots(port, quiet=False):
+    """Save the server's processed prompts to disk, so the next start skips re-reading them.
+
+    An agent's first message makes the model read its whole system prompt (Claude Code: ~17-20K tokens,
+    20-40 s); restored from disk that takes under a second. Only idle slots holding a substantial prompt
+    are saved. Returns the number of tokens saved."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/slots", timeout=5) as response:
+            slots = json.load(response)
+    except Exception:
+        return 0
+    saved = 0
+    for slot in slots:
+        if slot.get("is_processing") or slot.get("n_prompt_tokens", 0) < MIN_SAVE_TOKENS:
+            continue
+        try:
+            saved += _slot_request(port, slot["id"], "save").get("n_saved", 0)
+        except Exception:
+            pass
+    if saved and not quiet:
+        print(f"{DIM}Saved the model's prompt cache ({saved:,} tokens) for a faster next start.{RESET}")
+    return saved
+
+
+def restore_slots(port, slots):
+    """Load prompt caches saved by save_slots (if any) into the freshly started server."""
+    restored = 0
+    for slot in range(slots):
+        try:
+            restored += _slot_request(port, slot, "restore").get("n_restored", 0)
+        except Exception:
+            pass  # nothing saved for this slot yet
+    return restored
 
 
 def ready(port):
@@ -112,7 +169,9 @@ def start_background(config, model, context=None):
             return False
         time.sleep(1)
         print(".", end="", flush=True)
-    print(f" {GREEN}ready in {time.time() - started:.0f} s{RESET}")
+    restored = restore_slots(config["server"]["port"], config["server"]["slots"])
+    note = f" (restored {restored:,} cached prompt tokens: the first message will be quick)" if restored else ""
+    print(f" {GREEN}ready in {time.time() - started:.0f} s{RESET}{note}")
     return True
 
 
@@ -126,6 +185,7 @@ def stop(config, quiet=False):
         return
     pid = state["pid"]
     if _alive(pid):
+        save_slots(state["port"], quiet=quiet)
         if WINDOWS:
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
         else:
@@ -143,7 +203,20 @@ def stop(config, quiet=False):
 
 
 def run_foreground(config, model, context=None):
-    """start.py: run the server in this terminal until Ctrl+C."""
+    """start.py: run the server in this terminal until Ctrl+C. Saved prompt caches are restored once it is up."""
+    import threading
+
+    def restore_when_ready():
+        for _ in range(600):
+            if ready(config["server"]["port"]):
+                restored = restore_slots(config["server"]["port"], config["server"]["slots"])
+                if restored:
+                    print(f"\n{GREEN}Restored {restored:,} cached prompt tokens: the first message will be quick.{RESET}\n",
+                          flush=True)
+                return
+            time.sleep(1)
+
+    threading.Thread(target=restore_when_ready, daemon=True).start()
     try:
         sys.exit(subprocess.call(command(config, model, context)))
     except KeyboardInterrupt:

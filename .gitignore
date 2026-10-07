@@ -16,3 +16,6 @@ __pycache__/
 
 # Downloads in progress
 *.part
+
+# Saved prompt caches (large, per machine)
+cache/

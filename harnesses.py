@@ -3,7 +3,7 @@
 Each harness is one entry in HARNESSES: how to find it and how to launch it against the local server. Both
 launch through a relay (a small HTTP server in this process) that cleans up requests on their way to llama.cpp:
 strict chat templates (e.g. Qwen3.5/3.8-style) reject a second system/developer message, unknown roles, or two
-user messages in a row, all of which these agents send. To add another harness, add a launch function here.
+user messages in a row, all of which these agents send. To add another harness, add a command function to HARNESSES.
 """
 import http.client
 import http.server
@@ -161,7 +161,7 @@ def urllib_open(port, path):
 
 # ---------- harnesses ----------
 
-def launch_claude(binary, relay, name, context, max_output, args):
+def claude_command(binary, relay, name, context, max_output, args):
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)
     env.update({
@@ -170,10 +170,10 @@ def launch_claude(binary, relay, name, context, max_output, args):
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": name, "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max_output),
         "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(context), "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     })
-    return subprocess.call([binary, "--model", name, *args], env=env)
+    return [binary, "--model", name, *args], env
 
 
-def launch_codex(binary, relay, name, context, max_output, args):
+def codex_command(binary, relay, name, context, max_output, args):
     # A one-off model provider given with -c overrides: your ~/.codex/config.toml is not changed.
     overrides = [
         "model_provider=llamacpp",
@@ -181,16 +181,29 @@ def launch_codex(binary, relay, name, context, max_output, args):
         f"model_context_window={context}",
         f"model_auto_compact_token_limit={int(context * 0.8)}",
     ]
+    # Codex drops every root-level -c when a subcommand (e.g. `exec`) gets its own -c, and would then send the
+    # request to OpenAI instead of the local model. So -c settings in `args` are moved up next to ours.
+    rest, i = [], 0
+    while i < len(args):
+        if args[i] in ("-c", "--config") and i + 1 < len(args):
+            overrides.append(args[i + 1])
+            i += 2
+        elif args[i].startswith("--config="):
+            overrides.append(args[i].split("=", 1)[1])
+            i += 1
+        else:
+            rest.append(args[i])
+            i += 1
     command = [binary]
     for override in overrides:
         command += ["-c", override]
-    return subprocess.call([*command, "-m", name, *args])
+    return [*command, "-m", name, *rest], None
 
 
 HARNESSES = {
-    "claude": {"title": "Claude Code", "binary": "claude", "launch": launch_claude,
+    "claude": {"title": "Claude Code", "binary": "claude", "command": claude_command,
                "install": "https://code.claude.com"},
-    "codex": {"title": "Codex", "binary": "codex", "launch": launch_codex,
+    "codex": {"title": "Codex", "binary": "codex", "command": codex_command,
               "install": "https://developers.openai.com/codex (or: npm install -g @openai/codex)"},
 }
 
@@ -199,18 +212,24 @@ def installed(key):
     return shutil.which(HARNESSES[key]["binary"])
 
 
-def launch(key, port, name, context, max_output=4096, args=()):
-    """Run harness `key` in this terminal against the server on `port`; returns its exit code."""
+def launch(key, port, name, context, max_output=4096, args=(), capture=False, cwd=None, timeout=None):
+    """Run harness `key` against the server on `port`: in this terminal, or with `capture` its output is
+    returned as a CompletedProcess (for the benchmark). Returns the exit code otherwise."""
     harness = HARNESSES[key]
     binary = installed(key)
     if not binary:
         print(f"{harness['title']} is not installed. Get it from {harness['install']}")
         return 1
     relay = start_relay(port)
+    command, env = harness["command"](binary, relay, name, context, max_output, list(args))
     try:
-        return harness["launch"](binary, relay, name, context, max_output, list(args))
+        if capture:
+            return subprocess.run(command, env=env, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", stdin=subprocess.DEVNULL, timeout=timeout)
+        return subprocess.call(command, env=env, cwd=cwd)
     except KeyboardInterrupt:
         return 130
     finally:
-        from server import save_slots  # the session's prompt cache makes the next start's first message quick
-        save_slots(port)
+        if not capture:
+            from server import save_slots  # the session's prompt cache makes the next start's first message quick
+            save_slots(port)

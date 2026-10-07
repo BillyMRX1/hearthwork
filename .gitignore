@@ -25,3 +25,5 @@ bench/
 
 # Built packages
 dist/
+*.egg-info/
+build/

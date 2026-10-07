@@ -17,7 +17,7 @@ import time
 from . import __version__
 from .harnesses import make_relay
 from .onboard import CYAN, GREEN, RED, RESET, WINDOWS, YELLOW, load_config, save_config
-from .server import served_model
+from .server import agent_context, served_model
 
 DEFAULT_PORT = 8484
 DISCOVERY_PORT = 8485
@@ -211,7 +211,7 @@ class Share:
 
     def info(self):
         return {"hearthwork": __version__, "host": socket.gethostname(), "model": served_model(self.model_port),
-                "context": self.config["server"]["context"], "pairing": not self.pairing.locked()}
+                "context": agent_context(self.config), "pairing": not self.pairing.locked()}
 
     def authenticate(self, handler):
         config = load_config()  # fresh each time: `hearthwork devices remove` takes effect at once

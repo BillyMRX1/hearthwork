@@ -6,6 +6,7 @@
   hearthwork start [--model X]  start the model in the background     hearthwork stop
   hearthwork serve [--model X]  run the model server in this terminal (Ctrl+C stops it)
   hearthwork alias add <name> claude|codex   short command for it, e.g. ccl  (also: alias list, alias remove <name>)
+  hearthwork context [model] [N|auto]   context per model: range for this computer; save N for a model
   hearthwork status             what is running
   hearthwork share [--port N]   share the running model on your home network (Ctrl+C stops); a PIN pairs each computer
   hearthwork devices            trusted devices (devices remove <name> revokes one)
@@ -23,9 +24,9 @@ import shutil
 import subprocess
 import sys
 
-from . import __version__, runtime
+from . import __version__, context as ctx, runtime
 from .harnesses import HARNESSES
-from .onboard import CYAN, GREEN, RESET, load_config, offer_import, onboard, setup_complete
+from .onboard import CYAN, GREEN, RESET, load_config, offer_import, onboard, save_config, setup_complete
 from .paths import HOME
 
 REPO = "git+https://github.com/BillyMRX1/hearthwork"
@@ -39,11 +40,11 @@ def configured(interactive=True, remote_ok=False):
     if remote_ok and config.get("remote"):
         return config
     if setup_complete(config):
-        runtime.migrate(config)
+        migrate(config)
         return config
     config = offer_import(config)
     if setup_complete(config):
-        runtime.migrate(config)
+        migrate(config)
         return config
     config = onboard(config)
     if interactive:
@@ -51,11 +52,17 @@ def configured(interactive=True, remote_ok=False):
     return config
 
 
+def migrate(config):
+    """Adopt settings of older versions (runtime.migrate, context.migrate); saved if anything changed."""
+    if any([runtime.migrate(config), ctx.migrate(config)]):
+        save_config(config)
+
+
 def model_args(argv, name):
     import argparse
     parser = argparse.ArgumentParser(prog=f"hearthwork {name}")
     parser.add_argument("--model", help="part of a model file name; skips the model menu")
-    parser.add_argument("--context", type=int, help="context size (default: chosen by setup)")
+    parser.add_argument("--context", type=ctx.parse_k, help="context for this start, e.g. 98304 or 96K (default: auto, see `hearthwork context`)")
     return parser.parse_args(argv)
 
 
@@ -96,8 +103,7 @@ def main(argv=None):
                 if ok:
                     print(f"{CYAN}Now run `hearthwork claude` or `hearthwork codex` from your project.{RESET}")
                 sys.exit(0 if ok else 1)
-            print(f"\nStarting {model.name}   context: {args.context or config['server']['context']}   "
-                  f"port: {config['server']['port']}")
+            print(f"\nStarting {model.name}   port: {config['server']['port']}")
             print(f"{CYAN}When it says 'listening on', run `hearthwork claude` or `hearthwork codex` "
                   f"from your project.{RESET}\n", flush=True)
             run_foreground(config, model, args.context)
@@ -105,7 +111,7 @@ def main(argv=None):
             from .server import stop
             stop(load_config())
         elif command == "status":
-            from .server import served_model
+            from .server import running_context, served_model
             config = load_config()
             port = config.get("server", {}).get("port", 8001)
             print(f"hearthwork {__version__}   data: {HOME}")
@@ -117,12 +123,16 @@ def main(argv=None):
                 print(f"model: {GREEN + got[0] + RESET + '  (shared, context ' + str(got[1]) + ')' if got else 'unavailable'}")
                 sys.exit(0 if got else 1)
             running = served_model(port)
-            print(f"model: {GREEN + running + RESET if running else 'not running'}" + (f"  (port {port})" if running else ""))
+            n_ctx = running_context(port) if running else None
+            print(f"model: {GREEN + running + RESET if running else 'not running'}"
+                  + (f"  (port {port}, context {n_ctx:,} = {ctx.format_k(n_ctx)})" if n_ctx else f"  (port {port})" if running else ""))
             print(f"models folder: {config.get('modelsDir', '-')}")
             chosen = runtime.selected(config)
             if chosen:
                 print(f"runtime: {chosen[0]} b{chosen[1]}")
             runtime.print_notice(config)
+        elif command == "context":
+            sys.exit(ctx.main(rest, configured()))
         elif command == "model":
             from . import model
             configured()

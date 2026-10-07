@@ -92,7 +92,8 @@ The first run sets things up (see below). After that you get one menu:
 | `hearthwork start [--model X]` | Starts the model server in the background. |
 | `hearthwork stop` | Stops the background model server. |
 | `hearthwork serve [--model X]` | Runs the model server in this terminal; Ctrl+C stops it. |
-| `hearthwork status` | Shows what is running. |
+| `hearthwork context [model] [N\|auto]` | Shows the context range for each model on this computer; with `N` (e.g. `96K`) saves it for that model, `auto` clears it. |
+| `hearthwork status` | Shows what is running, with the context the server really runs with. |
 | `hearthwork share [--port 8484] [--allow-public]` | Shares the running model on your home network (starts one if needed); Ctrl+C stops. A PIN shows here when another computer asks to connect. |
 | `hearthwork devices [remove <name>]` | Lists the computers allowed to use your model; `remove` revokes one at once. |
 | `hearthwork connect [host[:port]]` | Uses the model of a computer that is sharing: finds it on the network (or give its address), pairs with the PIN. |
@@ -207,7 +208,7 @@ A launcher (`ccl.cmd` on Windows, a shell script on macOS/Linux) is created next
    - CPU if there is no GPU.
    Every build lives in its own folder (`bin/<runtime>-b<build>/`), so several can sit side by side; see `hearthwork runtime`. A new build is smoke-tested (it starts and accepts every option Hearthwork passes) before it is used, and the previous build is kept for `hearthwork runtime rollback`. The menu and `hearthwork status` mention a newer llama.cpp build at most once a day.
 4. **Asks for the models folder.** It finds LM Studio's folder and offers it, so both tools share the same files.
-5. **Picks settings for this hardware:** context 64K (32K below ~24 GB GPU memory + RAM), prompt batch size, VRAM headroom, and an 8-bit KV cache.
+5. **Picks settings for this hardware:** context `auto` (see below), prompt batch size, VRAM headroom, and an 8-bit KV cache.
 6. **Saves everything to `config.json`** in the data folder. If there are no models yet, it suggests one, with the command to download it.
 
 To set up from scratch, for example on another computer, run `hearthwork setup --reset` (or delete `config.json` and `bin/` in the data folder).
@@ -215,7 +216,7 @@ To set up from scratch, for example on another computer, run `hearthwork setup -
 ## Options
 
 - `hearthwork start --model <part of a file name>` skips the model menu (also for `serve`).
-- `hearthwork start --context N` overrides the context for that run.
+- `hearthwork start --context N` (`98304` or `96K`) overrides the context for that run. Agents and `hearthwork share` read the context from the running server, so they follow it.
 - `hearthwork claude --max-output N` caps the length of each Claude Code reply (default 4096 tokens). Codex has no such setting.
 - **Agent settings stay local:** `hearthwork claude` and `hearthwork codex` only change settings for that agent process, never your terminal or the agent's own config files.
 
@@ -239,7 +240,11 @@ hearthwork model https://huggingface.co/<org>/<repo>/blob/main/<file>.gguf      
 ## How resources are used
 
 - **GPU first.** llama.cpp's `--fit` puts as much of the model on the GPU as fits, keeping `fitTargetMiB` free for the desktop, and runs the rest from RAM. It does this on every start, so it adapts to each model and machine.
-- **Context:** it stays at what Claude Code needs, not as large as possible. Claude Code's own prompt is ~20K tokens, so 32K makes it compact after one message. A bigger context than needed only pushes model layers off the GPU and makes it slower.
+- **Context: `auto`, per model and per computer.** Hearthwork reads the model file (trained context, layers, KV heads, attention layout) to work out how much memory each token of context needs: Qwen3.5-35B-A3B ~11 KB (attention in 1 of 4 layers), Qwen3-Coder-30B ~52 KB, at an 8-bit KV cache. From that and your GPU memory and RAM it gives a range, e.g. `context: 128K (auto; range 64K-256K, model max 256K)`:
+  - **minimum 64K**: Claude Code's own prompt is ~20K tokens, so less compacts constantly;
+  - **recommended** (what `auto` starts with): the largest that keeps the model's share of the GPU (a model that does not fit in VRAM keeps ~2 GB or 12% of VRAM for context), at most 128K because longer prompts take minutes to read on a consumer GPU;
+  - **maximum**: what fits GPU memory + RAM, capped at the model's own limit (more context than recommended pushes model layers into RAM and slows it down).
+  The model menu shows the recommended context per model. A model with an unreadable header gets 64K (32K with under 24 GB). Precedence: `start --context` > saved for the model (`hearthwork context <model> N`, `contexts` in `config.json`) > a number in `server.context` > `auto`. Older setups with 32768 or 65536 in `server.context` are switched to `auto` once.
 - **Other settings:**
   - Prompt batch 4096 on 12 GB+ GPUs: a 20K-token prompt took 84 s at 512 and 26 s at 4096.
   - 2 slots, so Claude Code's background requests don't evict the conversation's cache.

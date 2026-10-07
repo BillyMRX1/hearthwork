@@ -8,6 +8,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+from . import context as ctx
 from .onboard import GREEN, RED, RESET, WINDOWS, YELLOW, ask, find_models, memory_gb
 from .paths import LOG, SLOTS, STATE, TEMPLATES
 
@@ -16,13 +17,14 @@ DIM = "\033[2m"
 MIN_SAVE_TOKENS = 2048  # smaller prompts (e.g. an agent's title request) must not overwrite a saved big one
 
 
-def pick_model(models, folder, last):
+def pick_model(config, models, folder, last):
     names = [str(m) for m in models]
     default = names.index(last) if last in names else 0
     print(f"\nModels in {folder}:")
     for i, model in enumerate(models):
         line = f"  {i + 1:2}) {model_size_gb(model):6.1f} GB  {model.name}"
-        print(f"{GREEN}{line}   <- last used{RESET}" if str(model) == last else line)
+        print(f"{GREEN}{line}   <- last used{RESET}{recommended_note(config, model)}" if str(model) == last
+              else line + recommended_note(config, model))
     while True:
         answer = ask(f"\nWhich model? [Enter = {default + 1}, c = cancel] ")
         if not answer:
@@ -34,11 +36,13 @@ def pick_model(models, folder, last):
         print(f"{RED}Type a number from 1 to {len(models)}.{RESET}")
 
 
+def recommended_note(config, model):
+    rng = ctx.range_for(config, model)
+    return f"   {DIM}context {ctx.format_k(rng['recommended'])} (up to {ctx.format_k(rng['max'])}){RESET}" if rng else ""
+
+
 def model_size_gb(model):
-    """All parts of a multi-part model count."""
-    if "-00001-of-" in model.name:
-        return sum(p.stat().st_size for p in model.parent.glob(model.name.replace("-00001-of-", "-*-of-"))) / 2**30
-    return model.stat().st_size / 2**30
+    return ctx.model_bytes(model) / 2**30
 
 
 def warn_if_too_big(config, model):
@@ -53,7 +57,7 @@ def slot_dir(config, model, context=None):
     """Where this model's processed prompts are saved. Per model, context and KV type: a saved cache only
     restores into a server set up the same way."""
     s = config["server"]
-    path = SLOTS / f"{model.stem}-c{context or s['context']}-{s['kvCacheType']}"
+    path = SLOTS / f"{model.stem}-c{context or ctx.choose(config, model)[0]}-{s['kvCacheType']}"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -61,7 +65,8 @@ def slot_dir(config, model, context=None):
 def command(config, model, context=None, slot_path=None):
     from .runtime import selected_server
     s = config["server"]
-    cmd = [selected_server(config) or config["llamaServer"], "-m", str(model), "-c", str(context or s["context"]), "-fa", "on", "--jinja",
+    context = context or ctx.choose(config, model)[0]
+    cmd = [selected_server(config) or config["llamaServer"], "-m", str(model), "-c", str(context), "-fa", "on", "--jinja",
            "--fit", "on", "--fit-target", str(s["fitTargetMiB"]), "--load-mode", "none",
            "-ctk", s["kvCacheType"], "-ctv", s["kvCacheType"], "-np", str(s["slots"]), "-kvu",
            "-b", str(s["batch"]), "-ub", str(s["batch"]), "--host", "127.0.0.1", "--port", str(s["port"]),
@@ -81,6 +86,24 @@ def served_model(port, timeout=2):
         return Path(served.replace("\\", "/")).stem
     except Exception:
         return None
+
+
+def running_context(port, timeout=2):
+    """The context size (n_ctx) the server on `port` is running with, or None. This, not config.json, is what
+    agents and `hearthwork share` must use: `start --context N` or a per-model value changes it."""
+    for path, find in (("/props", lambda d: d["default_generation_settings"]["n_ctx"]), ("/slots", lambda d: d[0]["n_ctx"])):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as response:
+                return int(find(json.load(response)))
+        except Exception:
+            pass
+    return None
+
+
+def agent_context(config):
+    """Context size to configure agents with: the running server's, else what the last model would get."""
+    port = config["server"]["port"]
+    return running_context(port) or ctx.choose(config, Path(config.get("lastModel") or "model.gguf"))[0]
 
 
 def _slot_request(port, slot, action, timeout=60):
@@ -148,6 +171,8 @@ def _alive(pid):
 def start_background(config, model, context=None):
     """Start the server in its own window (Windows) or in the background with a log file; wait until ready."""
     stop(config, quiet=True)
+    context, source, rng = ctx.choose(config, model, context)
+    print(f"{DIM}{ctx.describe(context, source, rng)}{RESET}")
     cmd = command(config, model, context)
     if WINDOWS:  # its own console window shows the server log; closing that window stops the server
         process = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
@@ -204,6 +229,8 @@ def stop(config, quiet=False):
 def run_foreground(config, model, context=None):
     """`hearthwork serve`: run the server in this terminal until Ctrl+C. Saved prompt caches are restored once it is up."""
     import threading
+    context, source, rng = ctx.choose(config, model, context)
+    print(f"{DIM}{ctx.describe(context, source, rng)}{RESET}")
 
     def restore_when_ready():
         for _ in range(600):
@@ -236,7 +263,7 @@ def choose_and_remember(config, model_hint=None):
             return None
         model = matches[0]
     else:
-        model = pick_model(models, config["modelsDir"], config.get("lastModel"))
+        model = pick_model(config, models, config["modelsDir"], config.get("lastModel"))
     if model:
         config["lastModel"] = str(model)
         save_config(config)

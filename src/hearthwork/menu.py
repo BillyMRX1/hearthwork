@@ -7,11 +7,12 @@ until you stop it from the menu or on quit.
 import os
 
 from . import runtime
+from .context import format_k
 from .harnesses import HARNESSES, installed, launch
 from .onboard import CYAN, GREEN, RED, RESET, YELLOW, ask, find_models, onboard, yes
 from .paths import BENCH, STATE
 from .remote import disconnect_main
-from .server import choose_and_remember, served_model, start_background, stop
+from .server import agent_context, choose_and_remember, running_context, served_model, start_background, stop
 
 BOLD, DIM = "\033[1m", "\033[2m"
 
@@ -35,7 +36,7 @@ def status_lines(config):
     color = {"recommended": GREEN, "limited": YELLOW}.get(verdict, RED)
     chosen = runtime.selected(config)
     lines = [f"  Project:  {os.getcwd()}",
-             f"  Model:    " + (f"{GREEN}running{RESET}  {running}  (port {port})" if running
+             f"  Model:    " + (f"{GREEN}running{RESET}  {running}  (port {port}, context {format_k(running_context(port) or 0)})" if running
                                else f"{DIM}not running{RESET}  (last used: {os.path.basename(config.get('lastModel') or '-')})"),
              f"  Computer: {gpu}, {hw.get('ramGB', '?')} GB RAM" + (f"  {color}{verdict}{RESET}" if verdict else "")]
     if chosen:
@@ -75,7 +76,7 @@ def run_agent(config, key, args=(), back_to_menu=True):
     title = HARNESSES[key]["title"]
     after = " Exit it to come back to this menu." if back_to_menu else ""
     print(f"\n{CYAN}Starting {title} in {os.getcwd()} with {name}.{after}{RESET}\n")
-    return launch(key, config["server"]["port"], name, config["server"]["context"], args=args)
+    return launch(key, config["server"]["port"], name, agent_context(config), args=args)
 
 
 def switch_model(config):

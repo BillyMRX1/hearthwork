@@ -5,8 +5,9 @@ Runs automatically the first time `hearthwork` is used. Run it again any time wi
 `--update-llama` also updates llama.cpp to the newest build (see runtime.py).
 
 Settings are sized from the hardware. The biggest speed factor is how much of the model sits on the GPU,
-which llama.cpp's --fit maximises at start time on any machine; so the context is kept at what Claude Code
-needs (its own prompt is ~20K tokens) instead of growing it, which would push model layers off the GPU.
+which llama.cpp's --fit maximises at start time on any machine; so the context is kept small (at least what
+Claude Code needs: its own prompt is ~20K tokens) instead of growing it, which would push model layers off the GPU.
+How large exactly depends on the model and the computer: see context.py.
 """
 import argparse
 import ctypes
@@ -192,10 +193,9 @@ def judge(hw):
 def settings_for(hw):
     """Server settings for this hardware (all overridable in config.json -> "server")."""
     vram = hw.get("vramGB") or 0
-    total = vram + hw.get("ramGB", 0) if hw.get("backend") != "metal" else hw.get("ramGB", 0)
     return {
-        # Claude Code's own prompt is ~20K tokens; 32K makes it compact after the first message.
-        "context": 65536 if total >= 24 else 32768,
+        # "auto": from each model's own file and this computer's memory (context.py). A number fixes it for all models.
+        "context": "auto",
         # Bigger prompt batches are much faster (20K-token prompt: 84 s at 512, 26 s at 4096) but need VRAM.
         "batch": 4096 if vram >= 12 else 2048 if vram >= 6 else 512,
         # VRAM left free for the desktop and other programs; --fit fills the rest.
@@ -374,11 +374,11 @@ def onboard(config, update_llama=False, reset_folder=False):
     folder = choose_models_folder(config, reset_folder)
     config["server"] = dict(settings_for(hw), **{k: v for k, v in config.get("server", {}).items() if k == "port"})
     s = config["server"]
-    print(f"\nSettings for this computer: context {s['context']} tokens, prompt batch {s['batch']}, "
+    print(f"\nSettings for this computer: context auto (from each model, at least 64K), prompt batch {s['batch']}, "
           f"KV cache {s['kvCacheType']}, {s['fitTargetMiB']} MiB VRAM kept free, {s['slots']} slots, port {s['port']}")
-    if s["context"] < 65536:
-        print(f"{YELLOW}  Less than ~24 GB of GPU memory + RAM: 32K context. Claude Code's own prompt is ~20K tokens, "
-              f"so expect it to compact long conversations often.{RESET}")
+    if (hw.get("vramGB") or 0) + hw.get("ramGB", 0) < 24:
+        print(f"{YELLOW}  Less than ~24 GB of GPU memory + RAM: only a small model fits, and Claude Code's own prompt is "
+              f"~20K tokens, so expect it to compact long conversations often.{RESET}")
     if not shutil.which("claude"):
         print(f"{YELLOW}  Claude Code ('claude') is not installed; get it from https://code.claude.com{RESET}")
     save_config(config)

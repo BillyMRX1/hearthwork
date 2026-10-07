@@ -68,7 +68,8 @@ def gguf_choices(repo, revision):
 def fit_note(size_gb, vram, ram_free, server):
     # GPU room for weights: VRAM minus what stays free and the KV cache (~3 GB per 64K context at q8_0;
     # it varies by model, so this is an estimate).
-    gpu_room = vram - server.get("fitTargetMiB", 1536) / 1024 - 3 * server.get("context", 65536) / 65536
+    context = server.get("context")
+    gpu_room = vram - server.get("fitTargetMiB", 1536) / 1024 - 3 * (context if isinstance(context, int) else 65536) / 65536
     if vram and size_gb <= gpu_room:
         return f"{GREEN}fits in GPU memory (fastest){RESET}"
     if size_gb <= max(gpu_room, 0) + ram_free * 0.8:

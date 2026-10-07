@@ -31,7 +31,7 @@ from pathlib import Path
 from .harnesses import HARNESSES, installed, launch
 from .onboard import CYAN, GREEN, RED, RESET, YELLOW, load_config
 from .paths import BENCH
-from .server import served_model
+from .server import agent_context, served_model
 
 RESULTS = BENCH / "results.jsonl"
 BOLD, DIM = "\033[1m", "\033[2m"
@@ -144,7 +144,7 @@ def ask_agent(agent, config, model, folder, prompt, first, session, env=None):
     """One turn. Returns (reply, session id); raises AgentError when the agent itself fails."""
     remote = config.get("remote")
     port, context = ((None, remote.get("context", 32768)) if remote else  # context: set by main() from the host
-                     (config["server"]["port"], config["server"]["context"]))
+                     (config["server"]["port"], agent_context(config)))
     if agent == "claude":
         # dontAsk: the allowed tools just run. Otherwise a user's default "auto" mode asks the (local, slow) model to
         # classify every command first; with GLM-4.7-Flash those checks timed out and blocked the commands.

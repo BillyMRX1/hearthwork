@@ -131,6 +131,26 @@ The first run sets things up (see below). After that you get one menu:
 - **Why the relay is needed:** strict templates (e.g. Qwen3.5/3.8) reject a second system/developer message, unknown roles, or two user messages in a row, and both agents send these. Without the relay, Claude Code and Codex requests failed on Qwen3.8 with "System message must be at the beginning".
 - **Adding another agent** means adding one launch function to `HARNESSES` in `src/hearthwork/harnesses.py`.
 
+### Claude Code settings Hearthwork adds
+
+`hearthwork claude` writes `claude-settings-<model>.json` in the data folder (one per model) and starts Claude Code with `--settings` pointing at it. These settings sit on top of your own; `~/.claude/settings.json` is not changed, and plain `claude` stays your normal cloud Claude.
+
+- **`permissions.defaultMode: "default"`**: Claude Code's ask-before-risky-actions mode ("manual" in its UI). Newer Claude Code versions start in auto mode, where the local model checks every command first; see the measurement below. Shift+Tab still switches modes.
+- **A status line** such as `local · Qwen3.5-35B-A3B-Q4_K_M · 64K`, so a local session is never mistaken for cloud Claude. It runs the hidden command `hearthwork statusline <model> <context>` with the same Python that runs Hearthwork.
+- **Your overrides:** if `~/.claude/settings-hearthwork.json` exists it is merged on top (nested objects are merged, other values replace). Use it for your own permissions, hooks, status line, or even `"defaultMode": "auto"` (Hearthwork then reminds you about the slow checks). A file with invalid JSON is ignored with a warning. `HEARTHWORK_CLAUDE_OVERRIDES` points to a different file.
+- The connection (relay address, model names, token limits) stays in environment variables of the Claude Code process, not in the file: the relay port is new each session.
+
+### Short commands: `hearthwork alias`
+
+```
+hearthwork alias add ccl claude     # `ccl` now runs `hearthwork claude`
+hearthwork alias add cxl codex
+hearthwork alias list
+hearthwork alias remove ccl
+```
+
+A launcher (`ccl.cmd` on Windows, a shell script on macOS/Linux) is created next to the `hearthwork` command, so it is already on PATH. Arguments are passed on (`ccl -p "..."`). Hearthwork refuses a name that is already a command (e.g. `claude`) and only lists or removes launchers it created.
+
 ## First run: setup (onboarding)
 
 `hearthwork` (or `hearthwork start`) runs setup automatically when nothing is configured yet. It:
@@ -209,7 +229,7 @@ Benchmark scoreboard (`hearthwork bench`: 8 graded coding tasks in one agent con
 - **Generation speed:**
   - Qwen3-Coder-30B: 18–38 tokens/s, depending on context length.
   - A dense model partly in RAM (Huihui-Qwen3.8-27B Q3_K) managed only ~6 tokens/s.
-- **Claude Code's auto mode slows local models down.** In auto mode, Claude Code asks the model to check every command first. With a local model those checks are slow and can time out and block the command. One GLM-4.7-Flash run took 48.7 min in auto mode and 3.9 min without it.
+- **Claude Code's auto mode slows local models down.** In auto mode, Claude Code asks the model to check every command first. With a local model those checks are slow and can time out and block the command. One GLM-4.7-Flash run took 48.7 min in auto mode and 3.9 min without it. Hearthwork therefore starts Claude Code in the normal ask mode (see above).
 
 For comparison, a disk-streaming engine built on AirLLM ran the same Qwen3-Coder model about 10x slower on this PC.
 

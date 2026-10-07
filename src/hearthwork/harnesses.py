@@ -11,9 +11,11 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 
 from . import paths
+from .paths import HOME
 
 
 # ---------- request normalization ----------
@@ -167,9 +169,73 @@ def urllib_open(port, path):
     return urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5)
 
 
+# ---------- Claude Code settings ----------
+
+USER_OVERRIDES = os.path.join("~", ".claude", "settings-hearthwork.json")  # optional, yours
+
+
+def overrides_path():
+    # HEARTHWORK_CLAUDE_OVERRIDES points elsewhere (used by tests)
+    return os.path.expanduser(os.environ.get("HEARTHWORK_CLAUDE_OVERRIDES") or USER_OVERRIDES)
+
+
+def context_label(tokens):
+    return f"{round(tokens / 1024)}K"
+
+
+def statusline_command(name, context):
+    """Shell command for Claude Code's status line. Claude runs it through Git Bash, PowerShell or sh depending on
+    the machine, so it must parse the same in all three: forward slashes, and no quotes around the program (a
+    PowerShell command can't start with a quoted path). If the Python path needs quotes, use the `hearthwork`
+    launcher on PATH instead."""
+    exe = sys.executable.replace("\\", "/")
+    base = f"{exe} -m hearthwork statusline"
+    if any(c in exe for c in " ()&'"):
+        launcher = shutil.which("hearthwork")
+        base = f"{launcher.replace(chr(92), '/')} statusline" if launcher and " " not in launcher else f'"{exe}" -m hearthwork statusline'
+    return f'{base} "{name}" {context_label(context)}'
+
+
+def deep_merge(base, extra):
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def claude_settings(name, context):
+    """The settings passed with `claude --settings`; they layer on top of yours, which stay untouched. Returns
+    (settings, auto): auto says the user's overrides ask for auto mode."""
+    settings = {
+        # "default" is Claude Code's ask-before-risky-actions mode ("manual" in its UI). Newer versions start in
+        # auto, where the (slow, local) model reviews every command first and those checks time out.
+        "permissions": {"defaultMode": "default"},
+        "statusLine": {"type": "command", "command": statusline_command(name, context)},
+    }
+    path = overrides_path()
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                deep_merge(settings, json.load(f))
+        except (OSError, ValueError, AttributeError) as error:
+            print(f"\033[33mIgnoring {path}: {error}\033[0m")
+    return settings, settings.get("permissions", {}).get("defaultMode") == "auto"
+
+
 # ---------- harnesses ----------
 
 def claude_command(binary, relay, name, context, max_output, args):
+    # The connection stays in process env vars, not the settings file: the relay port changes every session, and
+    # env vars are what already works. The settings file only holds what is the same for every session.
+    settings, auto = claude_settings(name, context)
+    # One file per model: two sessions on different models must not share (and overwrite) a status line.
+    settings_file = HOME / f"claude-settings-{name}.json"
+    settings_file.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    if auto:
+        print("\033[2mYour settings-hearthwork.json starts Claude Code in auto mode: every command is first checked "
+              "by the local model, which can be slow or time out and block it.\033[0m")
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)
     env.update({
@@ -178,7 +244,7 @@ def claude_command(binary, relay, name, context, max_output, args):
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": name, "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max_output),
         "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(context), "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     })
-    return [binary, "--model", name, *args], env
+    return [binary, "--settings", str(settings_file), "--model", name, *args], env
 
 
 def codex_catalog(binary, name, context):
@@ -267,9 +333,6 @@ def launch(key, port, name, context, max_output=4096, args=(), capture=False, cw
         return 1
     relay = start_relay(port)
     command, env = harness["command"](binary, relay, name, context, max_output, list(args))
-    if key == "claude" and not capture:
-        print("\033[2mTip: in Claude Code's auto mode, every command is first checked by the local model, which can be "
-              "slow or time out and block it. Shift+Tab switches to another permission mode.\033[0m")
     try:
         if capture:
             return subprocess.run(command, env=env, cwd=cwd, capture_output=True, text=True, encoding="utf-8",

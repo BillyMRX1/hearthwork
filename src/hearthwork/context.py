@@ -189,7 +189,7 @@ def context_range(info, model_bytes, hw, settings):
         if size <= usable:
             budget, reason = max(2.0, usable - size) * gb, "the model fits in GPU memory; the rest holds the context"
         else:
-            budget, reason = max(2.0, 0.12 * vram) * gb, "model partly in RAM; the context is kept small so it keeps its GPU share"
+            budget, reason = max(2.0, 0.12 * vram) * gb, "model partly in RAM; the context gets a small share of GPU memory so the model keeps the rest"
     recommended = _fits(budget, per_token, smallest, cap)
     room = (vram + ram - size - OS_RESERVE_GB - fit_gb) * gb if not unified else (ram * 0.75 - size) * gb
     maximum = max(recommended, _fits(room, per_token, smallest, model_max)) if room > 0 else recommended

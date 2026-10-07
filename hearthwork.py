@@ -69,6 +69,25 @@ def download_model():
         subprocess.call([sys.executable, str(HERE / "model.py"), link])
 
 
+def benchmark(config):
+    """Run bench.py (8 graded coding tasks) on the running model, starting one if needed."""
+    import subprocess
+    if not ensure_server(config):
+        return
+    agents = [key for key in HARNESSES if installed(key)]
+    if not agents:
+        print(f"{YELLOW}No coding agent is installed.{RESET}")
+        return
+    key = agents[0]
+    if len(agents) > 1:
+        names = " / ".join(f"{i}) {HARNESSES[k]['title']}" for i, k in enumerate(agents, 1))
+        answer = ask(f"Benchmark through which agent? {names} [Enter = 1]: ")
+        if answer.isdigit() and 1 <= int(answer) <= len(agents):
+            key = agents[int(answer) - 1]
+    print(f"{DIM}About 5-15 minutes; the agent works in its own folder under bench/runs.{RESET}")
+    subprocess.call([sys.executable, str(HERE / "bench.py"), "--agent", key])
+
+
 def main():
     config = load_config()
     if not setup_complete(config):
@@ -87,6 +106,7 @@ def main():
         options += [("Start / switch model", lambda: switch_model(config)),
                     ("Download a model", download_model),
                     ("Stop the model server" + ("" if running else f"  {DIM}(not running){RESET}"), lambda: stop(config)),
+                    ("Benchmark the model: 8 graded coding tasks + scoreboard", lambda: benchmark(config)),
                     ("Setup: hardware check, llama.cpp update, models folder", lambda: config.update(onboard(config)))]
         print()
         for i, (label, _) in enumerate(options, 1):

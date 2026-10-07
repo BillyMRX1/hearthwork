@@ -35,7 +35,8 @@ The first run sets things up (see below). After that you get one menu:
   3) Start / switch model
   4) Download a model
   5) Stop the model server
-  6) Setup: hardware check, llama.cpp update, models folder
+  6) Benchmark the model: 8 graded coding tasks + scoreboard
+  7) Setup: hardware check, llama.cpp update, models folder
   q) Quit
 ```
 
@@ -52,6 +53,28 @@ The first run sets things up (see below). After that you get one menu:
 | `codex.bat` · `./codex.sh` | Codex with the running server. Extra arguments go to `codex`, e.g. `codex.bat exec "..."`. |
 | `model.bat <link>` · `./model.sh <link>` | Downloads a model from Hugging Face. |
 | `setup.bat` · `./setup.sh` | Runs setup again. `--update-llama` gets the newest llama.cpp. |
+| `bench.bat` · `./bench.sh` | Benchmarks the running model through an agent (`--agent claude\|codex`); `--show` prints the scoreboard. |
+| `check.bat` · `./check.sh` | Checks whether this PC suits Hearthwork and which models fit (see below). |
+
+- **Faster first messages:** each agent's processed system prompt is saved to `cache/slots/` when a session ends or the server stops, and restored when the server starts. Measured: the first message after a restart went from 28 s to 13 s (Claude Code) and from 25 s to 17 s (Codex).
+
+## Benchmark
+
+`bench` (or menu option 6) drives the running model through Claude Code or Codex in a fresh folder, with 8 prompts in one conversation. It grades each step by checking the files and running the code, not by trusting the agent's reply:
+
+| # | Task | Graded by |
+|---|---|---|
+| 1 | chat | a reply came back |
+| 2 | list files | both files named |
+| 3 | read a file | the secret phrase is in the reply |
+| 4 | write + run `fizzbuzz.py` | running it gives the exact FizzBuzz output |
+| 5 | add `is_prime` + run | function and docstring exist, FizzBuzz still right, the primes below 30 are printed |
+| 6 | fix 3 planted bugs | `buggy.py` prints `20.0`, `[9, 5]`, `0` |
+| 7 | write unit tests | `test_buggy.py` passes. Half points if it copies the functions instead of importing `buggy.py` |
+| 8 | summary | names all 3 files |
+
+- **Results** are added to `bench/results.jsonl`. The scoreboard ranks every model and agent you have tried, by score and then time.
+- **Each run's folder** stays in `bench/runs/`, so you can inspect what the agent wrote.
 
 ## Agents
 

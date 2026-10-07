@@ -16,6 +16,8 @@ import threading
 
 # ---------- request normalization ----------
 
+CODEX_MAX_OUTPUT = 8192  # tokens per reply; ends a runaway generation instead of letting it run forever
+
 def _reminder(text):
     return f"<system-reminder>\n{text}\n</system-reminder>"
 
@@ -54,6 +56,10 @@ def normalize_responses(body):
     """OpenAI Responses (Codex). Codex sends `instructions` plus a `developer` message, and two user messages
     in a row. Leading system/developer messages join `instructions` (one system prompt); later ones become
     user text; consecutive user messages merge into one."""
+    # Codex sets no reply limit, and a local model can get stuck generating forever (seen: 20+ minutes on one
+    # turn). Claude Code caps its replies itself (CLAUDE_CODE_MAX_OUTPUT_TOKENS).
+    if not body.get("max_output_tokens"):
+        body = dict(body, max_output_tokens=CODEX_MAX_OUTPUT)
     items = body.get("input")
     if not isinstance(items, list):
         return body

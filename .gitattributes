@@ -1,0 +1,7 @@
+# Shell scripts must keep LF for macOS/Linux; batch files keep CRLF for Windows.
+*.sh  text eol=lf
+*.bat text eol=crlf
+*.py  text eol=lf
+*.md  text eol=lf
+*.svg text eol=lf
+*.gif binary

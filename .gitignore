@@ -1,0 +1,18 @@
+# llama.cpp binaries: setup downloads the right build for each machine
+bin/
+
+# Per-machine settings and runtime state (created by setup / the menu)
+config.json
+server.json
+server.log
+
+# Local-only folders
+docs/
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+
+# Downloads in progress
+*.part

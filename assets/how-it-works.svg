@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a6a4a"/>
+    </marker>
+    <linearGradient id="flame" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#e2531f"/>
+      <stop offset="1" stop-color="#f6b042"/>
+    </linearGradient>
+    <style>
+      .box { fill: #ffffff; stroke: #e2cba8; stroke-width: 2; }
+      .core { fill: #fff6ea; stroke: #e8742a; stroke-width: 2.5; }
+      .h { font-size: 19px; font-weight: 700; fill: #3b2a1a; }
+      .t { font-size: 14.5px; fill: #5c4632; }
+      .s { font-size: 13px; fill: #8a7058; }
+      .chip { fill: #fbe9d3; stroke: #efc79a; stroke-width: 1.5; }
+      .chiptext { font-size: 13.5px; fill: #7a4a1c; font-weight: 600; }
+      .line { stroke: #8a6a4a; stroke-width: 2; fill: none; }
+      .label { font-size: 13px; fill: #8a6a4a; font-style: italic; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="760" rx="18" fill="#fffaf3"/>
+
+  <!-- title -->
+  <path d="M52,50 C40,38 50,26 46,14 C58,22 64,34 60,42 C64,38 66,32 64,26 C74,36 74,52 62,58 C56,61 50,58 52,50 z" fill="url(#flame)"/>
+  <text x="84" y="46" font-size="30" font-weight="800" fill="#3b2a1a">How Hearthwork works</text>
+  <text x="84" y="70" class="t">One menu runs a local model on your own GPU + RAM and connects Claude Code or Codex to it.</text>
+
+  <!-- 1: you -->
+  <rect x="40" y="110" width="250" height="120" rx="14" class="box"/>
+  <text x="62" y="142" class="h">You, in your project</text>
+  <rect x="62" y="160" width="206" height="34" rx="8" fill="#2b2b31"/>
+  <text x="74" y="182" font-family="Consolas, monospace" font-size="14" fill="#e8e8e8">&gt; hearthwork.bat</text>
+  <text x="62" y="214" class="s">(./hearthwork.sh on macOS/Linux)</text>
+
+  <!-- 2: menu -->
+  <rect x="350" y="110" width="270" height="120" rx="14" class="core"/>
+  <text x="372" y="142" class="h">Hearthwork menu</text>
+  <text x="372" y="166" class="t">1 Claude Code · 2 Codex</text>
+  <text x="372" y="188" class="t">3 Start/switch model · 4 Download</text>
+  <text x="372" y="210" class="t">5 Stop · 6 Setup</text>
+
+  <!-- 3: setup -->
+  <rect x="680" y="100" width="480" height="140" rx="14" class="box"/>
+  <text x="702" y="132" class="h">First run: setup</text>
+  <rect x="702" y="148" width="98" height="30" rx="15" class="chip"/><text x="716" y="168" class="chiptext">check PC</text>
+  <rect x="812" y="148" width="86" height="30" rx="15" class="chip"/><text x="826" y="168" class="chiptext">verdict</text>
+  <rect x="910" y="148" width="126" height="30" rx="15" class="chip"/><text x="922" y="168" class="chiptext">get llama.cpp</text>
+  <rect x="1048" y="148" width="92" height="30" rx="15" class="chip"/><text x="1060" y="168" class="chiptext">settings</text>
+  <text x="702" y="202" class="s">GPU / VRAM / RAM  →  recommended · limited · not recommended</text>
+  <text x="702" y="222" class="s">CUDA · Vulkan · Metal · CPU build  →  context, batch, VRAM headroom</text>
+
+  <!-- 4: hugging face -->
+  <rect x="40" y="300" width="250" height="130" rx="14" class="box"/>
+  <text x="62" y="332" class="h">Hugging Face</text>
+  <text x="62" y="356" class="t">model.bat &lt;link&gt;</text>
+  <text x="62" y="378" class="s">lists files by size, marks which</text>
+  <text x="62" y="396" class="s">fit your PC, resumes downloads</text>
+
+  <!-- 5: models folder -->
+  <rect x="350" y="300" width="270" height="130" rx="14" class="box"/>
+  <text x="372" y="332" class="h">Models folder</text>
+  <text x="372" y="356" class="t">~/.lmstudio/models or your own</text>
+  <text x="372" y="378" class="s">shared with LM Studio;</text>
+  <text x="372" y="396" class="s">last used model highlighted</text>
+
+  <!-- 6: llama-server -->
+  <rect x="680" y="290" width="480" height="300" rx="14" class="core"/>
+  <text x="702" y="322" class="h">llama-server (llama.cpp)</text>
+  <text x="702" y="344" class="s">starts in the background, stays up between agent sessions</text>
+  <text x="702" y="380" class="t" font-weight="600">GPU memory (16 GB)</text>
+  <rect x="702" y="390" width="436" height="34" rx="6" fill="#f3e2cc"/>
+  <rect x="702" y="390" width="300" height="34" rx="6" fill="#e8742a"/>
+  <rect x="1002" y="390" width="96" height="34" fill="#f2a65a"/>
+  <text x="714" y="412" font-size="13.5" fill="#ffffff" font-weight="600">model layers (as many as fit)</text>
+  <text x="1010" y="412" font-size="13" fill="#5a2f08" font-weight="600">KV cache</text>
+  <text x="1104" y="412" font-size="12" fill="#8a7058">free</text>
+  <text x="702" y="458" class="t" font-weight="600">System RAM</text>
+  <rect x="702" y="468" width="436" height="34" rx="6" fill="#f3e2cc"/>
+  <rect x="702" y="468" width="170" height="34" rx="6" fill="#c9a26b"/>
+  <text x="714" y="490" font-size="13.5" fill="#ffffff" font-weight="600">rest of the model</text>
+  <text x="884" y="490" font-size="12.5" fill="#8a7058">Windows, apps, file cache</text>
+  <text x="702" y="532" class="s">--fit fills the GPU first · 64K context · 8-bit KV cache</text>
+  <text x="702" y="552" class="s">2 slots: background requests don't evict your conversation</text>
+  <text x="702" y="572" class="s">MoE models (e.g. Qwen3-Coder-30B) stay fast with experts in RAM</text>
+
+  <!-- 7: agents -->
+  <rect x="40" y="500" width="250" height="160" rx="14" class="box"/>
+  <text x="62" y="532" class="h">Coding agents</text>
+  <rect x="62" y="550" width="206" height="38" rx="10" fill="#f6e3d8" stroke="#e8a27a"/>
+  <text x="80" y="575" font-size="15" font-weight="700" fill="#a3471d">Claude Code</text>
+  <text x="182" y="575" font-size="12" fill="#a3471d">/v1/messages</text>
+  <rect x="62" y="600" width="206" height="38" rx="10" fill="#e3ecf8" stroke="#8fb0de"/>
+  <text x="80" y="625" font-size="15" font-weight="700" fill="#2f5a94">Codex</text>
+  <text x="182" y="625" font-size="12" fill="#2f5a94">/v1/responses</text>
+
+  <!-- 8: relay -->
+  <rect x="350" y="500" width="270" height="160" rx="14" class="core"/>
+  <text x="372" y="532" class="h">Relay</text>
+  <text x="372" y="556" class="t">reshapes each request so any</text>
+  <text x="372" y="576" class="t">model's chat template accepts it</text>
+  <text x="372" y="602" class="s">one system prompt · no mid-chat system</text>
+  <text x="372" y="620" class="s">or developer messages · roles alternate</text>
+  <text x="372" y="642" class="s">(e.g. fixes Qwen3.8's template error)</text>
+
+  <!-- arrows -->
+  <path class="line" marker-end="url(#arrow)" d="M290,170 L346,170"/>
+  <text x="296" y="160" class="label">runs</text>
+  <path class="line" marker-end="url(#arrow)" d="M620,170 L676,170"/>
+  <text x="624" y="160" class="label">1st run</text>
+  <path class="line" marker-end="url(#arrow)" d="M485,230 L485,296"/>
+  <text x="494" y="268" class="label">pick a model</text>
+  <path class="line" marker-end="url(#arrow)" d="M290,365 L346,365"/>
+  <text x="296" y="355" class="label">download</text>
+  <path class="line" marker-end="url(#arrow)" d="M620,365 L676,365"/>
+  <text x="628" y="355" class="label">load</text>
+  <path class="line" marker-end="url(#arrow)" d="M290,580 L346,580"/>
+  <text x="294" y="570" class="label">requests</text>
+  <path class="line" marker-end="url(#arrow)" d="M620,580 L676,540"/>
+  <text x="626" y="548" class="label">clean</text>
+
+  <!-- footer -->
+  <rect x="40" y="690" width="1120" height="44" rx="10" fill="#fbe9d3"/>
+  <text x="60" y="718" class="t">Measured on the setup PC (RTX 5060 Ti 16 GB + 22.6 GB RAM): Qwen3-Coder-30B-A3B at 18–31 tokens/s with Claude Code and Codex.</text>
+</svg>

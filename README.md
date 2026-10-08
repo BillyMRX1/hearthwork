@@ -127,6 +127,23 @@ hearthwork disconnect      # back to local models
 
 **Limits:** traffic is plain HTTP (not encrypted), so use it on home networks you trust only. Anyone on the network can see the traffic. To use a model from outside your home network, put both computers on a VPN such as Tailscale and run `hearthwork connect <tailscale ip>`.
 
+## Use the model from any tool: `hearthwork api`
+
+One local endpoint that speaks both the OpenAI and the Anthropic API, for tools Hearthwork has no launcher for (the official SDKs, Aider, OpenCode, Continue, your own scripts). It uses the same request cleanup as the agent launchers, so strict chat templates (Qwen3.5 and similar) work.
+
+```
+hearthwork api                      # leave it running; Ctrl+C stops it
+hearthwork api --show               # copy-paste setup for each tool
+```
+
+- **OpenAI:** base URL `http://127.0.0.1:8080/v1` (`chat/completions`, `responses`, `completions`, `models`, and `embeddings` if the model supports it). **Anthropic:** base URL `http://127.0.0.1:8080` (`v1/messages`, `v1/messages/count_tokens`). Streaming works.
+- **This computer only.** It listens on 127.0.0.1. For other devices use `hearthwork share`.
+- `--port N` (default 8080). `--api-key KEY` requires the key (`Authorization: Bearer` or `x-api-key`); without it any program on this computer can use the model.
+- **Model:** if none is running, `hearthwork api` starts the last-used one when it starts (it never restarts a running or busy server). `/v1/models` lists the running model first, then every local model (name = file name without `.gguf`), so tools can show a dropdown. Any model name in a request uses the running model.
+- `--allow-switch`: a request whose `"model"` is part of another local model file name restarts the server with that model (30-60 s) and then answers. This interrupts everything else using the model (a connected laptop, agent sessions), so it is off by default.
+- Replies sent to `/v1/responses` without `max_output_tokens` are capped at 8192 tokens (a stuck generation ends); on the other endpoints your own values are used unchanged.
+- `hearthwork api --show` prints setup for the OpenAI and Anthropic Python SDKs, curl, environment variables, Aider, OpenCode, Continue and Cursor (Cursor may not work with localhost: some of its features run from its own servers).
+
 ## Use Hearthwork as a subagent from any agent
 
 Any agent harness (cloud Claude Code, Codex, Cursor, OpenCode, ...) can hand a coding task to "our Claude" or "our Codex" running on the local model (or on the computer you `hearthwork connect` to) and get the result back. Two ways:

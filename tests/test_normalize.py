@@ -39,3 +39,23 @@ class NormalizeAnthropic(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChatTests(unittest.TestCase):
+    def test_late_system_moves_into_user(self):
+        from hearthwork.harnesses import normalize_chat
+        body = {"model": "m", "messages": [
+            {"role": "system", "content": "a"}, {"role": "developer", "content": "b"},
+            {"role": "user", "content": "hi"}, {"role": "system", "content": "late"},
+            {"role": "assistant", "content": "ok"}, {"role": "system", "content": "later"},
+            {"role": "user", "content": "next"}]}
+        out = normalize_chat(body)["messages"]
+        self.assertEqual([m["role"] for m in out], ["system", "user", "assistant", "user"])
+        self.assertEqual(out[0]["content"], "a\n\nb")
+        self.assertIn("late", out[1]["content"])
+        self.assertTrue(out[3]["content"].startswith("<system-reminder>\nlater"))
+
+    def test_no_system_unchanged(self):
+        from hearthwork.harnesses import normalize_chat
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        self.assertIs(normalize_chat(body), body)

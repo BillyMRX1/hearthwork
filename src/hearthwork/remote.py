@@ -186,7 +186,37 @@ def session(config):
                           "Run `hearthwork connect` to pair again, or `hearthwork disconnect` to go back to local models.")
     if not info.get("model"):
         raise RemoteError(f"{remote.get('hostName') or remote['host']} is sharing, but no model is running on it.")
+    slots = info.get("slots")
+    remote["slots"] = slots if isinstance(slots, int) and slots > 0 else None   # in memory only, like "via"
     return info["model"], int(info.get("context") or 32768)
+
+
+def remote_slots(config, default=2):
+    """How many sessions the host's model server runs in parallel (from /hearthwork/info "slots", read by the last
+    session()/require() call). `default` when not connected, not asked yet, or the host is older and does not say."""
+    slots = (config.get("remote") or {}).get("slots")
+    return slots if isinstance(slots, int) and slots > 0 else default
+
+
+def status_lines(config, got):
+    """The `hearthwork status` block in remote mode; `got` is the (model, context) of session()/require(), or None."""
+    remote = config["remote"]
+    name = remote.get("hostName") or remote["host"]
+    lines = [f"connected to: {name} as {remote['name']}"]
+    if remote.get("via"):
+        lines.append(f"address: {remote['host']}:{remote['port']} (via {route_label(remote['host'])})")
+        others = [a for a in ordered_addresses(remote) if a != remote["host"]]
+        if others:
+            lines.append(f"other addresses: {', '.join(others)}")
+    else:  # nothing answered: show what was tried
+        lines.append(f"address: {', '.join(ordered_addresses(remote))}:{remote['port']} (not reachable)")
+    if got:
+        slots = remote_slots(config, None)
+        lines.append(f"model: {GREEN}{got[0]}{RESET}  (shared, context {got[1]:,} = {got[1] // 1024}K"
+                     + (f", {slots} parallel session{'s' if slots != 1 else ''}" if slots else "") + ")")
+    else:
+        lines.append("model: unavailable")
+    return lines
 
 
 def require(config):

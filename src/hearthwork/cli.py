@@ -154,13 +154,10 @@ def main(argv=None):
             print(f"hearthwork {__version__}   data: {HOME}")
             if config.get("remote"):
                 from .remote import require
-                remote = config["remote"]
-                print(f"connected to: {remote.get('hostName') or remote['host']} ({remote['host']}:{remote['port']}) as {remote['name']}")
+                from .remote import status_lines
                 got = require(config)
-                if remote.get("via"):
-                    print(f"route: via {remote['via']}" + (f"   (other addresses: {', '.join(a for a in remote['addresses'] if a != remote['host'])})"
-                                                           if len(remote.get("addresses") or []) > 1 else ""))
-                print(f"model: {GREEN + got[0] + RESET + '  (shared, context ' + str(got[1]) + ')' if got else 'unavailable'}")
+                for line in status_lines(config, got):
+                    print(line)
                 sys.exit(0 if got else 1)
             running = served_model(port)
             n_ctx = running_context(port) if running else None
@@ -211,7 +208,8 @@ def main(argv=None):
             from . import aliases
             sys.exit(aliases.main(rest))
         elif command == "statusline":  # hidden: the status line Claude Code shows, see harnesses.claude_settings
-            line = " · ".join(["local", *rest[:2]])  # utf-8 bytes: Claude Code reads utf-8 whatever the console code page
+            from .harnesses import statusline_text
+            line = statusline_text(rest)  # utf-8 bytes: Claude Code reads utf-8 whatever the console code page
             sys.stdout.buffer.write((line + "\n").encode("utf-8"))
         elif command == "update":
             sys.exit(update())

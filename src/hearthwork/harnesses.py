@@ -297,7 +297,17 @@ def context_label(tokens):
     return f"{round(tokens / 1024)}K"
 
 
-def statusline_command(name, context):
+_remote = None  # config["remote"] while prepare()/preview() build a command for a shared model (read by claude_command)
+
+
+def host_parts(remote):
+    """(host name, route like "LAN"/"Tailscale" or "") of a shared model, for the status line."""
+    if not remote:
+        return "", ""
+    return str(remote.get("hostName") or remote.get("host") or ""), str((remote.get("via") or "").split(" ")[0])
+
+
+def statusline_command(name, context, host="", via=""):
     """Shell command for Claude Code's status line. Claude runs it through Git Bash, PowerShell or sh depending on
     the machine, so it must parse the same in all three: forward slashes, and no quotes around the program (a
     PowerShell command can't start with a quoted path). If the Python path needs quotes, use the `hearthwork`
@@ -307,7 +317,18 @@ def statusline_command(name, context):
     if any(c in exe for c in " ()&'"):
         launcher = shutil.which("hearthwork")
         base = f"{launcher.replace(chr(92), '/')} statusline" if launcher and " " not in launcher else f'"{exe}" -m hearthwork statusline'
-    return f'{base} "{name}" {context_label(context)}'
+    extra = f' "{host}"' + (f' "{via}"' if via else "") if host else ""
+    return f'{base} "{name}" {context_label(context)}{extra}'
+
+
+def statusline_text(args):
+    """The status line for `hearthwork statusline <model> <context> [host [route]]`: "host · model · context", with
+    "local" when the model runs on this computer and "host (LAN)" when a route is given."""
+    args = list(args)
+    where = "local"
+    if len(args) > 2 and args[2]:
+        where = args[2] + (f" ({args[3]})" if len(args) > 3 and args[3] else "")
+    return " · ".join([where, *args[:2]])
 
 
 def deep_merge(base, extra):
@@ -319,14 +340,14 @@ def deep_merge(base, extra):
     return base
 
 
-def claude_settings(name, context):
+def claude_settings(name, context, host="", via=""):
     """The settings passed with `claude --settings`; they layer on top of yours, which stay untouched. Returns
     (settings, auto): auto says the user's overrides ask for auto mode."""
     settings = {
         # "default" is Claude Code's ask-before-risky-actions mode ("manual" in its UI). Newer versions start in
         # auto, where the (slow, local) model reviews every command first and those checks time out.
         "permissions": {"defaultMode": "default"},
-        "statusLine": {"type": "command", "command": statusline_command(name, context)},
+        "statusLine": {"type": "command", "command": statusline_command(name, context, host, via)},
     }
     path = overrides_path()
     if os.path.isfile(path):
@@ -364,9 +385,10 @@ def safe_name(name):
 def claude_command(binary, base_url, token, name, context, max_output, args):
     # The connection stays in process env vars, not the settings file: the relay port changes every session, and
     # env vars are what already works. The settings file only holds what is the same for every session.
-    settings, auto = claude_settings(name, context)
-    # One file per model: two sessions on different models must not share (and overwrite) a status line.
-    settings_file = write_file(HOME / f"claude-settings-{name}.json", json.dumps(settings, indent=2))
+    host, via = host_parts(_remote)
+    settings, auto = claude_settings(name, context, host, via)
+    # One file per model (and host): two sessions on different models or hosts must not share a status line.
+    settings_file = write_file(HOME / f"claude-settings-{name}{'@' + safe_name(host) if host else ''}.json", json.dumps(settings, indent=2))
     if auto and _preview is None:
         print("\033[2mYour settings-hearthwork.json starts Claude Code in auto mode: every command is first checked "
               "by the local model, which can be slow or time out and block it.\033[0m")
@@ -672,7 +694,12 @@ def prepare(key, port, name, context, max_output=4096, args=(), extra_env=None, 
         base_url, token = f"http://{remote['host']}:{remote['port']}", remote["key"]
     else:
         base_url, token = f"http://127.0.0.1:{start_relay(port)}", None
-    command, env = harness["command"](binary, base_url, token, name, context, max_output, list(args))
+    global _remote
+    _remote = remote
+    try:
+        command, env = harness["command"](binary, base_url, token, name, context, max_output, list(args))
+    finally:
+        _remote = None
     if extra_env:
         env = {**(os.environ if env is None else env), **extra_env}
     if clean:
@@ -693,17 +720,17 @@ def preview(key, name, context, max_output=4096, args=(), extra_env=None, remote
     """Print what launching `key` would run, without starting the model, the relay or the agent: the command, the
     environment variables Hearthwork sets (secrets masked), and the files it generates (path and content). The relay
     port is a placeholder; nothing is written."""
-    global _preview
+    global _preview, _remote
     harness = HARNESSES[key]
     base_url, token = ((f"http://{remote['host']}:{remote['port']}", remote["key"]) if remote
                        else ("http://127.0.0.1:<relay-port>", None))
     binary = installed(key) or harness["binary"]
-    _preview = []
+    _preview, _remote = [], remote
     try:
         command, env = harness["command"](binary, base_url, token, name, context, max_output, list(args))
         files = _preview
     finally:
-        _preview = None
+        _preview, _remote = None, None
     changed = {k: v for k, v in {**(os.environ if env is None else env), **(extra_env or {})}.items() if os.environ.get(k) != v}
     removed = [k for k in os.environ if env is not None and k not in env]
     print(f"{harness['title']}: {'installed' if installed(key) else 'NOT installed (' + harness['install'] + ')'}   "

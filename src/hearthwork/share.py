@@ -16,6 +16,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.request
 
 from . import __version__
 from .harnesses import make_relay
@@ -325,8 +326,20 @@ class Share:
 
     def info(self):
         return {"hearthwork": __version__, "host": socket.gethostname(), "model": served_model(self.model_port),
-                "context": agent_context(self.config), "pairing": not self.pairing.locked(),
+                "context": agent_context(self.config), "slots": self.slots(), "pairing": not self.pairing.locked(),
                 "addresses": host_addresses(self.tailscale)}
+
+    def slots(self):
+        """Parallel sessions of the model server: what llama-server reports (/props total_slots), else the config."""
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.model_port}/props", timeout=1.5) as response:
+                total = json.load(response).get("total_slots")
+            if isinstance(total, int) and total > 0:
+                return total
+        except (OSError, ValueError, AttributeError):
+            pass
+        slots = self.config.get("server", {}).get("slots")
+        return slots if isinstance(slots, int) and slots > 0 else None
 
     def authenticate(self, handler):
         config = load_config()  # fresh each time: `hearthwork devices remove` takes effect at once

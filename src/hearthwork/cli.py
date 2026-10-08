@@ -3,6 +3,8 @@
   hearthwork                    menu (run it from the project you want the agent to work on)
   hearthwork claude [args...]   Claude Code with the local model (starts one if needed); args go to `claude`
   hearthwork codex [args...]    Codex with the local model; args go to `codex`
+  hearthwork task "TASK"        one coding task for another agent to delegate (no terminal needed); see --help
+  hearthwork mcp [install ...]  MCP server so any agent can use the local model as a subagent
   hearthwork start [--model X]  start the model in the background     hearthwork stop
   hearthwork serve [--model X]  run the model server in this terminal (Ctrl+C stops it)
   hearthwork alias add <name> claude|codex   short command for it, e.g. ccl  (also: alias list, alias remove <name>)
@@ -66,6 +68,17 @@ def model_args(argv, name):
     return parser.parse_args(argv)
 
 
+def has_terminal():
+    """Is stdin a real terminal? (On Windows NUL also claims to be one, so ask the console API.)"""
+    if not sys.stdin or not sys.stdin.isatty():
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        mode = ctypes.c_uint32()
+        return bool(ctypes.windll.kernel32.GetConsoleMode(ctypes.windll.kernel32.GetStdHandle(-10), ctypes.byref(mode)))
+    return True
+
+
 def update():
     """Upgrade with whichever tool installed Hearthwork."""
     if shutil.which("uv") and "uv" in sys.executable.replace("\\", "/").split("/"):
@@ -88,7 +101,19 @@ def main(argv=None):
         elif command == "menu":
             from . import menu
             menu.main(configured(remote_ok=True))
+        elif command == "task":
+            from . import task
+            sys.exit(task.main(rest))
+        elif command == "mcp":
+            from . import mcp
+            sys.exit(mcp.main(rest))
         elif command in HARNESSES:  # every following argument belongs to the agent (e.g. -p "...")
+            if not rest and not has_terminal():
+                print(f"{command} needs a terminal to talk to you. Running inside another agent? Use:\n"
+                      f'  hearthwork task --agent {command} "what to do"      (or "-" to read the task from stdin)\n'
+                      f"or add the MCP server once: hearthwork mcp install claude|codex|print\n"
+                      f'To pass your own flags: hearthwork {command} ' + ('-p "prompt"' if command == "claude" else 'exec "prompt"'), file=sys.stderr)
+                sys.exit(2)
             from .menu import run_agent
             sys.exit(run_agent(configured(remote_ok=True), command, rest, back_to_menu=False))
         elif command in ("start", "serve"):

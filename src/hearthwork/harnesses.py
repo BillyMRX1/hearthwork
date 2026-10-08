@@ -392,17 +392,16 @@ def installed(key):
     return shutil.which(HARNESSES[key]["binary"])
 
 
-def launch(key, port, name, context, max_output=4096, args=(), capture=False, cwd=None, timeout=None, extra_env=None,
-           remote=None):
-    """Run harness `key` against the server on `port`: in this terminal, or with `capture` its output is
-    returned as a CompletedProcess (for the benchmark). `extra_env` is added to the agent's environment. Returns the
-    exit code otherwise. With `remote` (config["remote"]: a model shared by another computer) the agent talks to that
-    computer directly: no local relay (the host normalizes), no local prompt-cache saves."""
+def prepare(key, port, name, context, max_output=4096, args=(), extra_env=None, remote=None, clean=False):
+    """(command, env) to run harness `key` against the server on `port` (starts the local relay), or None when the
+    agent is not installed. With `remote` (config["remote"]: a model shared by another computer) the agent talks to that
+    computer directly: no local relay (the host normalizes). With `clean`, the environment of a parent Claude Code /
+    Codex session is dropped (see clean_env)."""
     harness = HARNESSES[key]
     binary = installed(key)
     if not binary:
-        print(f"{harness['title']} is not installed. Get it from {harness['install']}")
-        return 1
+        print(f"{harness['title']} is not installed. Get it from {harness['install']}", file=sys.stderr if clean else sys.stdout)
+        return None
     if remote:
         base_url, token = f"http://{remote['host']}:{remote['port']}", remote["key"]
     else:
@@ -410,6 +409,34 @@ def launch(key, port, name, context, max_output=4096, args=(), capture=False, cw
     command, env = harness["command"](binary, base_url, token, name, context, max_output, list(args))
     if extra_env:
         env = {**(os.environ if env is None else env), **extra_env}
+    if clean:
+        env = clean_env(os.environ if env is None else env)
+    return command, env
+
+
+# Set by a running Claude Code / Codex for its own session; a child started inside one must not inherit them (it
+# would think it is nested, or reuse the parent's session, socket or sandbox). Hearthwork's own are kept.
+KEEP_ENV = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS", "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"}
+DROP_ENV = ("CLAUDECODE", "AI_AGENT", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_CODE_", "CODEX_SANDBOX", "CODEX_THREAD_ID",
+            "CODEX_CI", "CODEX_SESSION", "CODEX_INTERNAL")
+
+
+def clean_env(env):
+    """Copy of `env` without the markers of a parent Claude Code / Codex session. Config locations
+    (CLAUDE_CONFIG_DIR, CODEX_HOME) stay."""
+    return {k: v for k, v in env.items()
+            if k in KEEP_ENV or not (k == "CLAUDECODE" or k.startswith(DROP_ENV))}
+
+
+def launch(key, port, name, context, max_output=4096, args=(), capture=False, cwd=None, timeout=None, extra_env=None,
+           remote=None):
+    """Run harness `key` against the server on `port`: in this terminal, or with `capture` its output is
+    returned as a CompletedProcess (for the benchmark). `extra_env` is added to the agent's environment. Returns the
+    exit code otherwise. With `remote` the agent talks to the shared model directly, with no local prompt-cache saves."""
+    prepared = prepare(key, port, name, context, max_output, args, extra_env, remote)
+    if not prepared:
+        return 1
+    command, env = prepared
     try:
         if capture:
             return subprocess.run(command, env=env, cwd=cwd, capture_output=True, text=True, encoding="utf-8",

@@ -127,6 +127,34 @@ hearthwork disconnect      # back to local models
 
 **Limits:** traffic is plain HTTP (not encrypted), so use it on home networks you trust only. Anyone on the network can see the traffic. To use a model from outside your home network, put both computers on a VPN such as Tailscale and run `hearthwork connect <tailscale ip>`.
 
+## Use Hearthwork as a subagent from any agent
+
+Any agent harness (cloud Claude Code, Codex, Cursor, OpenCode, ...) can hand a coding task to "our Claude" or "our Codex" running on the local model (or on the computer you `hearthwork connect` to) and get the result back. Two ways:
+
+**1. The `task` command**, from the other agent's shell tool (no terminal needed):
+
+```
+hearthwork task [--agent claude|codex] [--allow "pytest *"]... [--cwd DIR] [--timeout 900] [--json] "TASK"
+echo "TASK" | hearthwork task -        # "-" reads the task from stdin: no shell quoting problems
+```
+
+It starts the model if none is running (the last used one; if none can be chosen without asking, it stops with a message), runs the agent non-interactively, and prints a report on stdout: agent, model, host, duration, status, files created/modified/deleted (compared before and after, `.git`, `node_modules`, `.venv` and `__pycache__` skipped) and the agent's final message. Progress goes to stderr. Exit code 0 means success; 124 a timeout (the agent and its child processes are killed), 1 an agent error. The agent starts without the parent session's `CLAUDECODE` / `CLAUDE_CODE_*` / `CODEX_*` variables, so it does not think it is nested.
+
+- **Claude Code** may read, search and edit files, and run only commands matching an `--allow` pattern (`--allow "python *"` becomes `Bash(python *)`); everything else is denied.
+- **Codex** runs in its `workspace-write` sandbox: it may edit inside the folder and run commands there, and the sandbox decides the rest. `--allow` has no effect on it.
+
+**2. The MCP server**, so the other agent gets tools instead of a shell command:
+
+```
+hearthwork mcp install claude   # claude mcp add --scope user hearthwork -- <path to hearthwork> mcp
+hearthwork mcp install codex    # codex mcp add hearthwork -- <path to hearthwork> mcp
+hearthwork mcp install print    # JSON for Cursor, OpenCode, Claude Desktop: {"mcpServers": {"hearthwork": {"command": ..., "args": ["mcp"]}}}
+```
+
+The path to `hearthwork` is absolute, so GUI clients with another PATH work too. Tools: `local_task_start` (returns an id) and `local_task_result` (waits up to 55 s per call; status running, done or failed, plus the report), `local_task` (blocking), and `local_model_status`. Prefer start + result: some clients, Codex among them, cancel an MCP tool call after about 60 s. For the blocking `local_task` in Codex raise the limit in `~/.codex/config.toml`: under `[mcp_servers.hearthwork]` set `tool_timeout_sec = 900`.
+
+Tips: give small, precise tasks (file names, interfaces, the test command), and review the result afterwards, as the local model is weaker than the agent calling it. Run up to as many tasks in parallel as the server has slots (2 by default; give parallel tasks different files). `hearthwork claude` / `hearthwork codex` without a terminal and without a prompt exit with a hint pointing here; `hearthwork claude -p "..."` works as before.
+
 ## Benchmark
 
 `hearthwork bench` (or menu option 6) drives the running model through Claude Code or Codex in a fresh folder, with 8 prompts in one conversation. It grades each step by checking the files and running the code, not by trusting the agent's reply:

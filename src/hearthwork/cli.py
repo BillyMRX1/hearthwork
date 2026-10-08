@@ -145,6 +145,9 @@ def main(argv=None):
                 remote = config["remote"]
                 print(f"connected to: {remote.get('hostName') or remote['host']} ({remote['host']}:{remote['port']}) as {remote['name']}")
                 got = require(config)
+                if remote.get("via"):
+                    print(f"route: via {remote['via']}" + (f"   (other addresses: {', '.join(a for a in remote['addresses'] if a != remote['host'])})"
+                                                           if len(remote.get("addresses") or []) > 1 else ""))
                 print(f"model: {GREEN + got[0] + RESET + '  (shared, context ' + str(got[1]) + ')' if got else 'unavailable'}")
                 sys.exit(0 if got else 1)
             running = served_model(port)

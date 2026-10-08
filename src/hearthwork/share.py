@@ -7,8 +7,11 @@ on the client. Only a SHA-256 of each key is stored (config["share"]["devices"])
 """
 import hashlib
 import hmac
+import ipaddress
 import json
+import os
 import secrets
+import shutil
 import socket
 import subprocess
 import threading
@@ -19,6 +22,7 @@ from .harnesses import make_relay
 from .onboard import CYAN, GREEN, RED, RESET, WINDOWS, YELLOW, load_config, save_config
 from .server import agent_context, served_model
 
+DIM = "\033[2m"
 DEFAULT_PORT = 8484
 DISCOVERY_PORT = 8485
 DISCOVERY_QUERY = b"HEARTHWORK?"
@@ -172,17 +176,126 @@ def lan_addresses():
             found.add(sock.getsockname()[0])
     except OSError:
         pass
-    return sorted(ip for ip in found if not ip.startswith(("127.", "169.254.", "0.")))
+    return sorted(ip for ip in found if not ip.startswith(("127.", "169.254.", "0.")) and not is_tailscale_ip(ip))
+
+
+# ---------- Tailscale ----------
+
+TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")      # the CGNAT range Tailscale hands out
+TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+TAILSCALE_PATHS = ("C:\\Program Files\\Tailscale\\tailscale.exe", "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+
+
+def _address(ip):
+    try:
+        address = ipaddress.ip_address(str(ip).split("%")[0])
+    except ValueError:
+        return None
+    return getattr(address, "ipv4_mapped", None) or address
+
+
+def is_tailscale_ip(ip):
+    address = _address(ip)
+    return bool(address) and address in (TAILSCALE_V4 if address.version == 4 else TAILSCALE_V6)
+
+
+def is_loopback_ip(ip):
+    address = _address(ip)
+    return bool(address) and address.is_loopback
+
+
+def is_lan_ip(ip):
+    """A private or link-local address (home or office LAN), which is not Tailscale's."""
+    address = _address(ip)
+    return bool(address) and (address.is_private or address.is_link_local) and not address.is_loopback and not is_tailscale_ip(ip)
+
+
+def peer_allowed(ip, tailscale_only=False, lan_ok=True):
+    """May a connection from `ip` use the share? Loopback and Tailscale always. Without `--tailscale` everyone else
+    too (the old behaviour: it listens on all networks). With it, only private LAN addresses, and only while
+    `lan_ok` (no Public network is active); never the public internet or a cafe's Wi-Fi."""
+    if is_loopback_ip(ip) or is_tailscale_ip(ip):
+        return True
+    return not tailscale_only or (lan_ok and is_lan_ip(ip))
+
+
+def find_tailscale():
+    return shutil.which("tailscale") or next((path for path in TAILSCALE_PATHS if os.path.isfile(path)), None)
+
+
+def parse_tailscale_status(text):
+    """{"ips", "dns", "hostname", "peers": [{"hostname", "dns", "ips", "online", "os"}]} from `tailscale status --json`,
+    or None when Tailscale is not connected (no address of its own)."""
+    try:
+        data = json.loads(text)
+        me = data.get("Self") or {}
+        ips = [ip for ip in (me.get("TailscaleIPs") or data.get("TailscaleIPs") or []) if is_tailscale_ip(ip)]
+        if not ips or data.get("BackendState", "Running") != "Running":
+            return None
+        peers = []
+        for peer in (data.get("Peer") or {}).values():
+            peer_ips = [ip for ip in (peer.get("TailscaleIPs") or []) if is_tailscale_ip(ip)]
+            if peer_ips:
+                peers.append({"hostname": str(peer.get("HostName") or ""), "dns": str(peer.get("DNSName") or "").rstrip("."),
+                              "ips": peer_ips, "online": bool(peer.get("Online")), "os": str(peer.get("OS") or "")})
+        return {"ips": ips, "dns": str(me.get("DNSName") or "").rstrip("."), "hostname": str(me.get("HostName") or ""),
+                "peers": peers}
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def interface_tailscale_ips():
+    """Fallback without the CLI: this computer's own addresses inside Tailscale's ranges."""
+    found = set()
+    try:
+        found.update(i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None))
+    except OSError:
+        pass
+    try:  # the source address a packet to Tailscale's MagicDNS address would use (nothing is sent)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(0.5)
+            sock.connect(("100.100.100.100", 9))
+            found.add(sock.getsockname()[0])
+    except OSError:
+        pass
+    return sorted(ip for ip in found if is_tailscale_ip(ip))
+
+
+def tailscale_info():
+    """Tailscale's state on this computer (see parse_tailscale_status), or None when it is absent or not connected.
+    Never raises and never waits long: without Tailscale nothing changes."""
+    binary = find_tailscale()
+    if binary:
+        try:
+            info = parse_tailscale_status(subprocess.run([binary, "status", "--json"], capture_output=True, text=True,
+                                                         timeout=4).stdout)
+            if info:
+                return info
+        except (OSError, subprocess.SubprocessError):
+            pass
+    ips = interface_tailscale_ips()
+    return {"ips": ips, "dns": "", "hostname": "", "peers": []} if ips else None
+
+
+def host_addresses(tailscale=None):
+    """The addresses a client can use for this host: {"lan": [...], "tailscale": [...], "dns": "..."}."""
+    tailscale = tailscale or {}
+    return {"lan": lan_addresses(), "tailscale": list(tailscale.get("ips") or []), "dns": tailscale.get("dns") or ""}
 
 
 # ---------- network guard ----------
 
-def parse_profiles(text):
-    """Names of the Public networks in `Name|Category` lines (output of the PowerShell query)."""
+def parse_profiles(text, skip_tailscale=False):
+    """Names of the Public networks in `Name|Category` or `Name|Interface|Category` lines (output of the PowerShell
+    query). With `skip_tailscale`, Tailscale's own adapter is ignored: its traffic is encrypted whatever Windows calls it."""
     public = []
     for line in text.splitlines():
-        name, _, category = line.rpartition("|")
+        parts = line.strip().split("|")
+        name, category = parts[0], parts[-1]
+        alias = parts[1] if len(parts) > 2 else ""
         if category.strip().lower() == "public":
+            if skip_tailscale and "tailscale" in (alias + " " + name).lower():
+                continue
             public.append(name.strip() or "unnamed network")
     return public
 
@@ -194,24 +307,26 @@ def public_networks():
         return []
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-Command",
-                              "Get-NetConnectionProfile | ForEach-Object { $_.Name + '|' + $_.NetworkCategory }"],
+                              "Get-NetConnectionProfile | ForEach-Object { $_.Name + '|' + $_.InterfaceAlias + '|' + $_.NetworkCategory }"],
                              capture_output=True, text=True, timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
         return []
-    return parse_profiles(out)
+    return parse_profiles(out, skip_tailscale=True)
 
 
 # ---------- the shared server ----------
 
 class Share:
-    def __init__(self, config, port):
+    def __init__(self, config, port, tailscale_only=False, lan_ok=True, tailscale=None):
         self.config, self.port, self.pairing = config, port, Pairing()
+        self.tailscale_only, self.lan_ok, self.tailscale = tailscale_only, lan_ok, tailscale
         self.seen, self.written = set(), {}
         self.model_port = config["server"]["port"]
 
     def info(self):
         return {"hearthwork": __version__, "host": socket.gethostname(), "model": served_model(self.model_port),
-                "context": agent_context(self.config), "pairing": not self.pairing.locked()}
+                "context": agent_context(self.config), "pairing": not self.pairing.locked(),
+                "addresses": host_addresses(self.tailscale)}
 
     def authenticate(self, handler):
         config = load_config()  # fresh each time: `hearthwork devices remove` takes effect at once
@@ -270,6 +385,9 @@ class Share:
         handler._send_json(410 if status == "expired" else 404, {"error": {"message": message}})
 
     def intercept(self, handler):
+        if not peer_allowed(handler.client_address[0], self.tailscale_only, self.lan_ok):
+            handler._send_json(403, {"error": {"message": "This host only accepts Tailscale connections."}})
+            return True
         path = handler.path.split("?")[0].rstrip("/")
         if path.startswith("/hearthwork/"):
             if path == "/hearthwork/info" and handler.command == "GET":
@@ -295,9 +413,17 @@ def share_main(argv):
     parser = argparse.ArgumentParser(prog="hearthwork share")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--allow-public", action="store_true", help="share even on a network Windows calls Public")
+    parser.add_argument("--tailscale", action="store_true",
+                        help="accept only Tailscale computers (and this local network when it is not Public): safe on any Wi-Fi")
     args = parser.parse_args(argv)
     public = public_networks()
-    if public and not args.allow_public:
+    tailscale = tailscale_info()
+    if args.tailscale and not tailscale:
+        print(f"{RED}Tailscale is not running or not signed in on this computer.{RESET} Install it from "
+              "https://tailscale.com/download, sign in, and try again.")
+        return 1
+    lan_ok = not public or args.allow_public
+    if public and not args.allow_public and not args.tailscale:
         print(f"{RED}Not sharing: this computer is on a Public network ({', '.join(public)}).{RESET}\n"
               "Sharing uses plain HTTP, so it is only for your own home network. If this is your home network, mark it "
               "private:\n  Windows Settings > Network & internet > Wi-Fi (or Ethernet) > your network > Network profile type > Private network\n"
@@ -307,7 +433,7 @@ def share_main(argv):
     config = configured()
     if not ensure_server(config):
         return 1
-    share = Share(config, args.port)
+    share = Share(config, args.port, args.tailscale, lan_ok, tailscale)
     try:
         server = make_relay(config["server"]["port"], ("0.0.0.0", args.port), share.intercept)
     except OSError as error:
@@ -318,14 +444,23 @@ def share_main(argv):
         serve_discovery(DISCOVERY_PORT, lambda: discovery_reply(socket.gethostname(), args.port, served_model(share.model_port)))
     except OSError as error:
         print(f"{YELLOW}Discovery is off (UDP port {DISCOVERY_PORT}: {error}); clients must use `hearthwork connect <ip>`.{RESET}")
-    ips = lan_addresses()
+    ips = lan_addresses() if lan_ok or not args.tailscale else []
     print(f"\n{GREEN}Sharing {served_model(share.model_port)} on port {args.port}.{RESET}  Ctrl+C stops sharing.")
     print("This computer's address: " + (", ".join(f"{ip}:{args.port}" for ip in ips) or "(no local network found)"))
+    if args.tailscale and not lan_ok:
+        print(f"{YELLOW}Public network ({', '.join(public)}): only Tailscale computers can connect, not this local network.{RESET}")
+    if tailscale:
+        name = f"  ({tailscale['dns']})" if tailscale["dns"] else ""
+        print(f"Tailscale address: {GREEN}{', '.join(f'{ip}:{args.port}' for ip in tailscale['ips'])}{RESET}{name}")
+        if args.tailscale:
+            print(f"Away from home: {CYAN}hearthwork connect {tailscale['dns'] or tailscale['ips'][0]}{RESET} (encrypted by Tailscale)")
+        else:
+            print(f"{DIM}Tailscale is up: `hearthwork share --tailscale` also works on any Wi-Fi away from home.{RESET}")
     print(f"On the other computer: {CYAN}hearthwork connect{RESET}" + (f"   (or `hearthwork connect {ips[0]}`)" if ips else ""))
     print(f"{len(devices_of(config))} trusted device(s); `hearthwork devices` lists them. A PIN will show here when a computer asks to connect.")
     if WINDOWS:
-        print(f"{YELLOW}Windows Firewall may ask to allow Python: allow it on private networks, or other computers cannot "
-              f"connect.{RESET}")
+        print(f"{YELLOW}Windows Firewall may ask to allow Python: allow it on private networks"
+              f"{' and for the Tailscale interface' if tailscale else ''}, or other computers cannot connect.{RESET}")
     try:
         while True:
             time.sleep(3600)

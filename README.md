@@ -94,9 +94,9 @@ The first run sets things up (see below). After that you get one menu:
 | `hearthwork serve [--model X]` | Runs the model server in this terminal; Ctrl+C stops it. |
 | `hearthwork context [model] [N\|auto]` | Shows the context range for each model on this computer; with `N` (e.g. `96K`) saves it for that model, `auto` clears it. |
 | `hearthwork status` | Shows what is running, with the context the server really runs with. |
-| `hearthwork share [--port 8484] [--allow-public]` | Shares the running model on your home network (starts one if needed); Ctrl+C stops. A PIN shows here when another computer asks to connect. |
+| `hearthwork share [--port 8484] [--allow-public] [--tailscale]` | Shares the running model on your home network (starts one if needed); Ctrl+C stops. `--tailscale` also makes it usable from anywhere through Tailscale. A PIN shows here when another computer asks to connect. |
 | `hearthwork devices [remove <name>]` | Lists the computers allowed to use your model; `remove` revokes one at once. |
-| `hearthwork connect [host[:port]]` | Uses the model of a computer that is sharing: finds it on the network (or give its address), pairs with the PIN. |
+| `hearthwork connect [host[:port]]` | Uses the model of a computer that is sharing: finds it on the local network and among your Tailscale computers (or give its address), pairs with the PIN. |
 | `hearthwork disconnect` | Goes back to local models. |
 | `hearthwork model <link>` | Downloads a model from Hugging Face. |
 | `hearthwork bench [--agent claude\|codex] [--all] [--warmup] [--show]` | Benchmarks the running model through an agent. `--all` is the release check (every installed agent, see Benchmark). `--show` prints the scoreboard and the latest summary. |
@@ -125,7 +125,21 @@ hearthwork disconnect      # back to local models
 - **Windows host:** the firewall may ask to allow Python; allow it on private networks. Sharing is refused while a network is marked Public (mark it Private, or pass `--allow-public`).
 - **Discovery** uses UDP port 8485; if it does not find the host, run `hearthwork connect <ip>[:8484]`.
 
-**Limits:** traffic is plain HTTP (not encrypted), so use it on home networks you trust only. Anyone on the network can see the traffic. To use a model from outside your home network, put both computers on a VPN such as Tailscale and run `hearthwork connect <tailscale ip>`.
+**Limits:** on a home network the traffic is plain HTTP (not encrypted), so use it on networks you trust only. To use the model away from home, use Tailscale (below).
+
+### From anywhere with Tailscale
+
+[Tailscale](https://tailscale.com) is a WireGuard-based private network between your own devices. Install it and sign in on both computers, then:
+
+```
+hearthwork share --tailscale   # on the model computer (also fine on a cafe's Wi-Fi)
+hearthwork connect             # on the other one: lists LAN hosts and Tailscale peers "(tailscale)"
+```
+
+- **Host:** `share` prints the Tailscale address and MagicDNS name (e.g. `my-pc.tailnet.ts.net`). With `--tailscale` the host accepts only Tailscale and local (loopback) computers, plus your local network when no network is Public; the Public-network guard ignores Tailscale's own adapter. Plain `share` just mentions the Tailscale address when Tailscale is up. On Windows, allow the firewall prompt for the Tailscale interface too.
+- **Client:** `connect` also asks every online Tailscale peer on port 8484, so no address is needed. Pairing stores every address of the host (LAN IP, Tailscale IP, MagicDNS name). Each run tries the LAN first (fast), then Tailscale, so the same key works at home and away without pairing again; `hearthwork status` shows the route (`via LAN 192.168.0.7` or `via Tailscale 100.x.y.z`). Older pairings with a single address keep working.
+- **Security:** Tailscale traffic is encrypted end to end by WireGuard and only devices of your tailnet can reach the host. The PIN and device keys still apply (a tailnet can be shared with other people).
+- Tailscale is optional: without it nothing changes.
 
 ## Use Hearthwork as a subagent from any agent
 

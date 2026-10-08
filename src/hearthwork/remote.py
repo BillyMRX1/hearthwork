@@ -1,17 +1,24 @@
 """The client side of LAN sharing: `hearthwork connect`, `hearthwork disconnect`, and using the host's model.
 
-config["remote"] = {"host", "port", "key", "name", "hostName"} once paired. The agent commands, the menu, `status`
+config["remote"] = {"host", "port", "key", "name", "hostName", "addresses"} once paired. "addresses" lists every way
+to reach the host (LAN IP, Tailscale IP, MagicDNS name); older configs have only "host". Each run tries the LAN first,
+then Tailscale (session), and sets remote["host"] to the one that answered, in memory only, with remote["via"] naming it. The agent commands, the menu, `status`
 and `bench` then talk to the host (which normalizes requests) instead of starting a model here.
 """
 import json
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 
 from .onboard import CYAN, GREEN, RED, RESET, YELLOW, ask, load_config, save_config
-from .share import DEFAULT_PORT, DISCOVERY_PORT, DISCOVERY_QUERY, lan_addresses, parse_discovery
+from .share import (DEFAULT_PORT, DISCOVERY_PORT, DISCOVERY_QUERY, is_tailscale_ip, lan_addresses, parse_discovery,
+                    tailscale_info)
+
+LAN_TIMEOUT, TAILSCALE_TIMEOUT = 1.0, 3.0   # connect timeouts per route
+PEER_TIMEOUT = 1.5
 
 
 class RemoteError(Exception):
@@ -71,23 +78,109 @@ def discover(timeout=2.0):
     return list(found.values())
 
 
+def is_tailscale_address(address):
+    return is_tailscale_ip(address) or address.lower().rstrip(".").endswith(".ts.net")
+
+
+def route_label(address):
+    return "Tailscale" if is_tailscale_address(address) else "LAN"
+
+
+def ordered_addresses(remote):
+    """Every address of the host to try, LAN first, then Tailscale (older configs: just "host")."""
+    found = []
+    for address in [remote["host"]] + list(remote.get("addresses") or []):
+        if address and address not in found:
+            found.append(address)
+    return sorted(found, key=is_tailscale_address)  # stable: LAN addresses keep their order
+
+
+def merged_addresses(host, info):
+    """Addresses to remember for a host paired through `host`, from its /hearthwork/info (older hosts: just `host`)."""
+    given = info.get("addresses") if isinstance(info.get("addresses"), dict) else {}
+    found = [host]
+    for address in list(given.get("lan") or []) + list(given.get("tailscale") or []) + [given.get("dns") or ""]:
+        if isinstance(address, str) and address and address not in found:
+            found.append(address)
+    return found
+
+
+def discover_tailscale(timeout=PEER_TIMEOUT, port=DEFAULT_PORT):
+    """Hearthwork hosts among the online Tailscale peers (asked concurrently), as discover() entries marked "tailscale"."""
+    state = tailscale_info()
+    peers = [p for p in (state or {}).get("peers", []) if p["online"] and p["ips"]]
+    found, lock = [], threading.Lock()
+
+    def ask_peer(peer):
+        try:
+            status, info = call(peer["ips"][0], port, "/hearthwork/info", timeout=timeout)
+        except OSError:
+            return
+        if status == 200 and info.get("hearthwork"):
+            with lock:
+                found.append({"host": peer["ips"][0], "port": port, "hostname": str(info.get("host") or peer["hostname"]),
+                              "model": str(info.get("model") or ""), "version": str(info.get("hearthwork") or ""),
+                              "tailscale": True})
+    threads = [threading.Thread(target=ask_peer, args=(p,), daemon=True) for p in peers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout + 1)
+    return sorted(found, key=lambda h: h["hostname"])
+
+
+def find_hosts():
+    """LAN hosts (broadcast) followed by Tailscale peers that run `hearthwork share` and are not already listed."""
+    results, lan = [], []
+    thread = threading.Thread(target=lambda: results.extend(discover_tailscale()), daemon=True)
+    thread.start()
+    lan = discover()
+    thread.join(PEER_TIMEOUT + 2)
+    names = {h["hostname"] for h in lan}
+    return lan + [h for h in results if h["hostname"] not in names]
+
+
 def unreachable(remote, error):
-    return (f"Cannot reach {remote.get('hostName') or remote['host']} ({remote['host']}:{remote['port']}): {error}\n"
+    tried = ", ".join(ordered_addresses(remote))
+    return (f"Cannot reach {remote.get('hostName') or remote['host']} ({tried}; port {remote['port']}): {error}\n"
             "The computer may be off or asleep, not running `hearthwork share`, or on another network. "
             "Run `hearthwork connect` to find it again, or `hearthwork disconnect` to go back to local models.")
 
 
+def resolve(remote):
+    """(address, info, models status) for the first address of the host that answers as this host, LAN before
+    Tailscale. Raises OSError (the last error) when none does; a 401 is kept as the answer when no other address works."""
+    last, refused = OSError("no address"), None
+    for address in ordered_addresses(remote):
+        timeout = TAILSCALE_TIMEOUT if is_tailscale_address(address) else LAN_TIMEOUT
+        try:
+            status, info = call(address, remote["port"], "/hearthwork/info", timeout=timeout)
+            if status != 200 or not info.get("hearthwork"):
+                last = OSError(f"{address}:{remote['port']} is not a Hearthwork share")
+                continue
+            status, _ = call(address, remote["port"], "/v1/models", key=remote["key"], timeout=5)
+        except OSError as error:
+            last = error
+            continue
+        if status == 401:  # maybe another Hearthwork host on a network that reuses this LAN address
+            refused = refused or (address, info, status)
+            continue
+        return address, info, status
+    if refused:
+        return refused
+    raise last
+
+
 def session(config):
     """(model name, context) of the host's model, checking that the host answers and still trusts this device.
+    Sets remote["host"] to the address that answered (this run only) and remote["via"] to "LAN <ip>" / "Tailscale <ip>".
     Raises RemoteError with what to do otherwise."""
     remote = config["remote"]
     try:
-        status, info = call(remote["host"], remote["port"], "/hearthwork/info")
-        if status != 200 or not info.get("hearthwork"):
-            raise RemoteError(f"{remote['host']}:{remote['port']} is not a Hearthwork share. Run `hearthwork connect` again.")
-        status, _ = call(remote["host"], remote["port"], "/v1/models", key=remote["key"])
+        address, info, status = resolve(remote)
     except OSError as error:
         raise RemoteError(unreachable(remote, error))
+    remote["host"], remote["via"] = address, f"{route_label(address)} {address}"
     if status == 401:
         raise RemoteError(f"{remote.get('hostName') or remote['host']} no longer trusts this device (it was removed). "
                           "Run `hearthwork connect` to pair again, or `hearthwork disconnect` to go back to local models.")
@@ -119,14 +212,14 @@ def connect_main(argv):
             print(error)
             return 2
     else:
-        print("Looking for computers sharing a model on this network...")
-        hosts = discover()
+        print("Looking for computers sharing a model on this network and your Tailscale network...")
+        hosts = find_hosts()
         if not hosts:
             print(f"{YELLOW}None found.{RESET} Is `hearthwork share` running on the other computer, on the same network? "
-                  "Or give its address: `hearthwork connect <ip>[:port]` (e.g. a Tailscale IP).")
+                  "Or give its address: `hearthwork connect <ip or name>[:port]` (e.g. a Tailscale IP).")
             return 1
         for i, h in enumerate(hosts, 1):
-            print(f"  {i}) {h['hostname']}  {h['host']}:{h['port']}  {h['model']}")
+            print(f"  {i}) {h['hostname']}  {h['host']}:{h['port']}  {h['model']}" + ("  (tailscale)" if h.get("tailscale") else ""))
         choice = 1
         if len(hosts) > 1:
             answer = ask(f"Connect to which? [1-{len(hosts)}, Enter = 1]: ")
@@ -144,10 +237,12 @@ def connect_main(argv):
     host_name = info.get("host") or host
     config = load_config()
     old = config.get("remote") or {}
-    if old.get("host") == host and old.get("port") == port and old.get("key"):
+    addresses = merged_addresses(host, info)
+    if port == old.get("port") and old.get("key") and set(addresses) & set(ordered_addresses(old) if old.get("host") else []):
         try:
             if call(host, port, "/v1/models", key=old["key"])[0] == 200:
-                config["remote"] = dict(old, hostName=host_name)
+                known = ordered_addresses(old)
+                config["remote"] = dict(old, hostName=host_name, addresses=known + [a for a in addresses if a not in known])
                 save_config(config)
                 print(f"{GREEN}Already connected to {host_name}.{RESET} Model: {info.get('model')}")
                 return 0
@@ -181,7 +276,8 @@ def connect_main(argv):
             return 1
         print(f"{left} attempt(s) left.")
         pin = None
-    config["remote"] = {"host": host, "port": port, "key": reply["key"], "name": reply["name"], "hostName": host_name}
+    config["remote"] = {"host": host, "port": port, "key": reply["key"], "name": reply["name"], "hostName": host_name,
+                        "addresses": addresses}
     save_config(config)
     print(f"{GREEN}Connected to {host_name} as '{reply['name']}'.{RESET} Model: {info.get('model')}\n"
           "Now `hearthwork claude` / `hearthwork codex` use it. `hearthwork disconnect` goes back to local models.")

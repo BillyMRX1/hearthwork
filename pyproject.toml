@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,8 @@ dynamic = ["version"]
 description = "Run a local llama.cpp model and connect Claude Code or Codex to it from one menu, tuned to your own machine."
 readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = []
 keywords = ["llama.cpp", "local llm", "claude code", "codex", "coding agent"]
 

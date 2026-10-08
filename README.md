@@ -367,3 +367,7 @@ uvx hearthwork check
 ```
 
 It shows the hardware, the verdict, installed agents, and the best version of each suggested coding model that fits (sizes live from Hugging Face). Once Hearthwork is installed: `hearthwork check` (add `--json` for machine-readable output).
+
+## License
+
+[MIT](LICENSE)

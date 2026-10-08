@@ -24,7 +24,12 @@ def parallel_slots(config):
             value = source.get("slots")
             if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                 return value
-        return DEFAULT_SLOTS
+        try:  # not asked yet: ask the host (session() stores its "slots" in config["remote"])
+            from .remote import remote_slots, session
+            session(config)
+            return remote_slots(config, DEFAULT_SLOTS)
+        except Exception:
+            return DEFAULT_SLOTS
     value = (config.get("server") or {}).get("slots", DEFAULT_SLOTS)
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else DEFAULT_SLOTS
 

@@ -192,10 +192,11 @@ def dump_request(incoming, normalized):
             json.dump(data, f)
 
 
-def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None):
+def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_headers=None):
     """HTTP relay to llama-server on `upstream_port`, bound to `address` (not yet serving). `intercept(handler)`, when
     given, runs first for every request and returns True once it has answered it itself: `hearthwork share` uses it
-    for the device check and the pairing endpoints, and everything else goes through the same normalization."""
+    for the device check and the pairing endpoints, and everything else goes through the same normalization.
+    `extra_headers(handler)` returns [(name, value)] added to every response (CORS in `hearthwork api`)."""
 
     class Relay(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"  # the body ends when the connection closes: simple, works for streams
@@ -205,8 +206,13 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None):
             self.send_response(status)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(data)))
+            self._extra()
             self.end_headers()
             self.wfile.write(data)
+
+        def _extra(self):
+            for name, value in (extra_headers(self) if extra_headers else ()):
+                self.send_header(name, value)
 
         def read_body(self, limit=None):
             length = int(self.headers.get("content-length") or 0)
@@ -252,6 +258,7 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None):
                 for key, value in response.getheaders():
                     if key.lower() not in ("transfer-encoding", "content-length", "connection"):
                         self.send_header(key, value)
+                self._extra()
                 self.end_headers()
                 while chunk := response.read1(65536):
                     self.wfile.write(chunk)
@@ -261,7 +268,7 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None):
             finally:
                 upstream.close()
 
-        do_GET = do_POST = _relay
+        do_GET = do_POST = do_OPTIONS = _relay
 
         def log_message(self, *args):
             pass
@@ -532,22 +539,33 @@ def qwen_task(allow, last_message, prompt, resume=False, cwd=None):
             *(["--continue"] if resume else [])], {}
 
 
+def text_of(value):
+    """A final message as clean text: strings stripped, anything else (None, lists of blocks) made printable."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        value = "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in value)
+    return str(value).replace(chr(0), "").strip()
+
+
 def result_claude(stdout, stderr, returncode, last_message):
     """(final message, error text or None) from what Claude Code printed."""
-    try:
-        data = json.loads(stdout.strip().splitlines()[-1])
-    except (ValueError, IndexError):
+    stdout, stderr = stdout or "", stderr or ""
+    data = next((e for e in reversed(json_events(stdout)) if e.get("type") == "result" or "result" in e), None)
+    if data is None:
         return "", f"Claude Code exited with {returncode}: {(stdout + stderr)[-400:].strip()}"
-    message = data.get("result") or ""
+    message = text_of(data.get("result"))
     if data.get("is_error"):
         return message, f"Claude Code reported an error: {message or str(data)[:400]}"
     return message, (f"Claude Code exited with {returncode}" if returncode else None)
 
 
 def result_codex(stdout, stderr, returncode, last_message):
+    stdout, stderr = stdout or "", stderr or ""
     try:
-        message = open(last_message, encoding="utf-8", errors="replace").read().strip()
-    except OSError:
+        with open(last_message, encoding="utf-8", errors="replace") as f:
+            message = text_of(f.read())
+    except (OSError, TypeError):
         message = ""
     if returncode != 0:
         return message, f"Codex exited with {returncode}: {(stdout + stderr)[-400:].strip()}"
@@ -569,15 +587,16 @@ def json_events(text):
 
 def result_opencode(stdout, stderr, returncode, last_message):
     """`opencode run --format json` prints one event per line; the final message is the text after the last tool call."""
+    stdout, stderr = stdout or "", stderr or ""
     texts, errors = [], []
     for event in json_events(stdout):
         if event.get("type") == "tool_use":
             texts = []
         elif event.get("type") == "text":
-            texts.append(event.get("part", {}).get("text", ""))
+            texts.append(text_of((event.get("part") or {}).get("text")))
         elif event.get("type") == "error":
             errors.append(str(event.get("error", {}).get("data", {}).get("message") or event.get("error"))[:300])
-    message = "".join(texts).strip()
+    message = text_of("".join(texts))
     if errors or returncode:
         return message, f"OpenCode failed (exit {returncode}): {'; '.join(errors) or (stdout + stderr)[-400:].strip()}"
     return message, None if message else "OpenCode finished without a final message"
@@ -589,7 +608,8 @@ def session_opencode(stdout):
 
 
 def result_aider(stdout, stderr, returncode, last_message):
-    message = stdout.strip()[-4000:]  # aider prints the model's reply and what it changed, no tool calls to filter out
+    stdout, stderr = stdout or "", stderr or ""
+    message = text_of(stdout)[-4000:]  # aider prints the model's reply and what it changed, no tool calls to filter out
     if returncode != 0:
         return message, f"Aider exited with {returncode}: {(stdout + stderr)[-400:].strip()}"
     return message, None if message else "Aider finished without output"
@@ -597,6 +617,7 @@ def result_aider(stdout, stderr, returncode, last_message):
 
 def result_qwen(stdout, stderr, returncode, last_message):
     """`qwen --output-format json` prints a JSON array of messages; its last item is the result."""
+    stdout, stderr = stdout or "", stderr or ""
     start = stdout.find("[{")
     try:
         items = json.loads(stdout[start:]) if start >= 0 else []
@@ -605,7 +626,7 @@ def result_qwen(stdout, stderr, returncode, last_message):
     final = next((i for i in reversed(items) if isinstance(i, dict) and i.get("type") == "result"), None)
     if not final:
         return "", f"Qwen Code exited with {returncode}: {(stdout + stderr)[-400:].strip()}"
-    message = final.get("result") or ""
+    message = text_of(final.get("result"))
     if final.get("is_error"):
         return message, f"Qwen Code reported an error: {message or str(final)[:400]}"
     return message, (f"Qwen Code exited with {returncode}" if returncode else None)

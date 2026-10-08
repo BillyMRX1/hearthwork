@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import context as ctx
 from .onboard import GREEN, RED, RESET, WINDOWS, YELLOW, ask, find_models, memory_gb
-from .paths import LOG, SLOTS, STATE, TEMPLATES
+from .paths import HOME, LOG, SLOTS, STATE, TEMPLATES
 
 DIM = "\033[2m"
 
@@ -178,6 +178,17 @@ def _alive(pid):
         return False
 
 
+def popen_server(cmd):
+    """Windows: start llama-server in its own console, with the data folder as its cwd (it would otherwise lock
+    whatever folder the caller was in, e.g. a worktree, so Windows could not delete it) and outside any job object
+    of the caller (an MCP task's Job Object must not take the shared model server down with it)."""
+    flags = subprocess.CREATE_NEW_CONSOLE
+    try:
+        return subprocess.Popen(cmd, creationflags=flags | 0x01000000, cwd=str(HOME))  # CREATE_BREAKAWAY_FROM_JOB
+    except OSError:  # the caller's job does not allow breakaway
+        return subprocess.Popen(cmd, creationflags=flags, cwd=str(HOME))
+
+
 def start_background(config, model, context=None):
     """Start the server in its own window (Windows) or in the background with a log file; wait until ready."""
     stop(config, quiet=True)
@@ -185,11 +196,11 @@ def start_background(config, model, context=None):
     print(f"{DIM}{ctx.describe(context, source, rng)}{RESET}")
     cmd = command(config, model, context)
     if WINDOWS:  # its own console window shows the server log; closing that window stops the server
-        process = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        process = popen_server(cmd)
         where = "its own window"
     else:
         log = open(LOG, "w")
-        process = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        process = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, cwd=str(HOME))
         where = str(LOG)
     STATE.write_text(json.dumps({"pid": process.pid, "model": str(model), "port": config["server"]["port"]}))
     print(f"Starting {model.name} (log: {where})", end="", flush=True)
@@ -254,7 +265,7 @@ def run_foreground(config, model, context=None):
 
     threading.Thread(target=restore_when_ready, daemon=True).start()
     try:
-        sys.exit(subprocess.call(command(config, model, context)))
+        sys.exit(subprocess.call(command(config, model, context), cwd=str(HOME)))
     except KeyboardInterrupt:
         pass
 

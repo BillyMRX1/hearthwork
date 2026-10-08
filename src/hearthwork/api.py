@@ -9,6 +9,7 @@ import argparse
 import hmac
 import io
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -30,6 +31,35 @@ def key_ok(expected, headers):
     if not expected:
         return True
     return hmac.compare_digest(request_key(headers).encode(), expected.encode())
+
+
+LOCAL_ORIGIN = re.compile(r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$", re.IGNORECASE)
+CORS_HEADERS = "authorization, x-api-key, content-type, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access"
+
+
+def origin_allowed(origin, key):
+    """Whether a browser page at `origin` may call the API. No Origin (curl, SDKs): yes. With an API key any origin
+    may try (the key is the protection). Without one, only pages on localhost / 127.0.0.1, because any web page you
+    visit could otherwise use your model."""
+    if not origin or key:
+        return True
+    return bool(LOCAL_ORIGIN.match(origin))
+
+
+def cors_headers(origin, key):
+    """[(name, value)] to add to a response for a request from `origin` ([] when there is no Origin or it is refused)."""
+    if not origin or not origin_allowed(origin, key):
+        return []
+    headers = [("Access-Control-Allow-Origin", "*" if key else origin), ("Access-Control-Expose-Headers", "*")]
+    if not key:
+        headers.append(("Vary", "Origin"))
+    return headers
+
+
+def preflight_headers(origin, key, requested_headers=None):
+    return cors_headers(origin, key) + [
+        ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+        ("Access-Control-Allow-Headers", requested_headers or CORS_HEADERS), ("Access-Control-Max-Age", "600")]
 
 
 def model_id(path):
@@ -111,6 +141,18 @@ class Api:
     def intercept(self, handler):
         """Answer the request itself (True) or let the relay forward it (False)."""
         path = handler.path.split("?")[0].rstrip("/")
+        origin = handler.headers.get("Origin")
+        if not origin_allowed(origin, self.key):
+            handler._send_json(403, error_body("permission_error", f"Origin {origin} is not allowed. Without --api-key only "
+                                               "pages on localhost / 127.0.0.1 may call this API; start it with --api-key to allow other sites."))
+            return True
+        if handler.command == "OPTIONS":  # CORS preflight: browsers send no key here
+            handler.send_response(204)
+            for name, value in preflight_headers(origin, self.key, handler.headers.get("Access-Control-Request-Headers")):
+                handler.send_header(name, value)
+            handler.send_header("content-length", "0")
+            handler.end_headers()
+            return True
         if not key_ok(self.key, handler.headers):
             handler._send_json(401, error_body("authentication_error", "Invalid or missing API key."))
             return True
@@ -118,6 +160,11 @@ class Api:
             return False
         if not path.startswith(JSON_PATHS):
             handler._send_json(404, error_body("not_found_error", f"No such endpoint: {path}"))
+            return True
+        if path == "/v1/embeddings":
+            handler._send_json(501, error_body("not_implemented_error",
+                                               "embeddings not enabled: the model server is not started with --embeddings, "
+                                               "so `hearthwork api` offers chat, messages, responses and completions only."))
             return True
         if path == "/v1/models" and handler.command == "GET":
             handler._send_json(200, models_listing(self.models(), served_model(self.model_port)))
@@ -227,14 +274,15 @@ def api_main(argv):
         return 1
     api = Api(config, args.port, args.api_key, args.allow_switch)
     try:
-        server = make_relay(api.model_port, ("127.0.0.1", args.port), api.intercept)
+        server = make_relay(api.model_port, ("127.0.0.1", args.port), api.intercept,
+                            lambda handler: cors_headers(handler.headers.get("Origin"), api.key))
     except OSError as error:
         print(f"{RED}Cannot listen on port {args.port}: {error}{RESET}")
         return 1
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{args.port}"
     print(f"\n{GREEN}Hearthwork API ready.{RESET}  Ctrl+C stops it.")
-    print(f"  OpenAI:     {base}/v1   (chat/completions, responses, completions, embeddings, models)")
+    print(f"  OpenAI:     {base}/v1   (chat/completions, responses, completions, models; embeddings answer 501)")
     print(f"  Anthropic:  {base}   (v1/messages, v1/messages/count_tokens)")
     print(f"  Model:      {name}   context {agent_context(config):,}")
     print(f"  Key:        {'required' if args.api_key else 'none (any program on this computer can use it)'}"

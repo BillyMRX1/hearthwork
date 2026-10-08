@@ -12,7 +12,7 @@ from .harnesses import HARNESSES, installed, launch
 from .onboard import CYAN, GREEN, RED, RESET, YELLOW, ask, find_models, onboard, yes
 from .paths import BENCH, STATE
 from .remote import disconnect_main
-from .server import agent_context, choose_and_remember, running_context, served_model, start_background, stop
+from .server import agent_context, choose_and_remember, port_open, running_context, served_model, start_background, stop
 
 BOLD, DIM = "\033[1m", "\033[2m"
 
@@ -47,9 +47,12 @@ def status_lines(config):
 def ensure_server(config):
     """The running model's name, starting one (after picking a model) if none is running."""
     port = config["server"]["port"]
-    name = served_model(port)
+    name = served_model(port) or (port_open(port) and served_model(port, timeout=60))
     if name:
         return name
+    if port_open(port):
+        print(f"{YELLOW}Port {port} is in use but no model answers. Stop it with `hearthwork stop` first.{RESET}")
+        return None
     if not find_models(config["modelsDir"]):
         print(f"{YELLOW}No models yet. Download one first: menu option 'Download a model', or "
               f"`hearthwork model <Hugging Face link>`.{RESET}")

@@ -88,6 +88,16 @@ def served_model(port, timeout=2):
         return None
 
 
+def port_open(port):
+    """Something is listening on `port` (a busy server can be slow to answer /v1/models; never restart it then)."""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
 def running_context(port, timeout=2):
     """The context size (n_ctx) the server on `port` is running with, or None. This, not config.json, is what
     agents and `hearthwork share` must use: `start --context N` or a per-model value changes it."""

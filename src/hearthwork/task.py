@@ -157,9 +157,12 @@ def model_for_task(config):
             sys.exit(str(error))
         return None, name, context, config["remote"]
     port = config["server"]["port"]
-    name = next((n for n in (served_model(port, timeout=5) for _ in range(3)) if n), None)  # a busy server answers slowly: never restart it
+    from .server import port_open
+    name = served_model(port) or (port_open(port) and served_model(port, timeout=60))  # busy: wait, never restart it
     if name:
         return port, name, agent_context(config), None
+    if port_open(port):
+        raise SystemExit(f"Port {port} is in use but no model answers; run `hearthwork stop` first.")
     from .onboard import find_models
     from .server import start_background
     models = find_models(config["modelsDir"])

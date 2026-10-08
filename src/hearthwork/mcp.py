@@ -19,6 +19,7 @@ import uuid
 
 from . import __version__
 from .harnesses import HARNESSES
+from .procs import KillOnClose, kill_tree, new_group_flags, parallel_slots, setup_stdio
 
 VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 MAX_WAIT = 55
@@ -36,7 +37,7 @@ TASK_PROPERTIES = {
 def guidance(slots):
     return (f"Use for small, well-specified coding tasks: name the files, the interfaces and the command that verifies the result. "
             f"It is a local model, so keep each task focused, and review what it changed afterwards. "
-            f"You can run up to {slots} tasks in parallel (the server's slots); give parallel tasks different files.")
+            f"You can run up to {slots} tasks in parallel (the server's slots; more are queued and start when one finishes); give parallel tasks different files.")
 
 
 def tools(slots):
@@ -48,17 +49,25 @@ def tools(slots):
          "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "wait_seconds": {"type": "integer", "default": 50, "maximum": MAX_WAIT}}, "required": ["id"]}},
         {"name": "local_task", "description": f"Run a coding task on the local model and wait for the report (blocking; can take minutes, so the caller's tool timeout must be long: for Codex raise tool_timeout_sec). Prefer local_task_start + local_task_result when unsure. {note}",
          "inputSchema": {"type": "object", "properties": TASK_PROPERTIES, "required": ["task"]}},
+        {"name": "local_task_cancel", "description": "Cancel a task started with local_task_start (queued or running); a running one is killed with everything it started.",
+         "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
         {"name": "local_model_status", "description": "Which local model is available (host, model, context) and whether it is reachable.",
          "inputSchema": {"type": "object", "properties": {}}},
     ]
 
 
 class Tasks:
-    """Background `hearthwork task` processes, by id."""
+    """Background `hearthwork task` processes, by id. At most `slots` run at once (the model server's parallel
+    sessions); the rest wait in a queue and start as slots free up. Everything running is killed on shutdown()."""
 
-    def __init__(self, default_cwd=None):
+    def __init__(self, default_cwd=None, slots=2):
         self.items = {}
+        self.queue = []  # ids waiting, oldest first
+        self.slots = max(1, slots)
         self.cwd = default_cwd or os.getcwd()
+        self.lock = threading.RLock()
+        self.job = KillOnClose()  # Windows: children die with this process, even if it is killed hard
+        self.closed = False
 
     def command(self, args):
         task = args.get("task")
@@ -71,7 +80,7 @@ class Tasks:
         if not isinstance(allow, list) or not all(isinstance(a, str) for a in allow):
             raise ValueError("allow_commands must be a list of strings")
         timeout = args.get("timeout_seconds", 900)
-        if not isinstance(timeout, int) or timeout <= 0:
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
             raise ValueError("timeout_seconds must be a positive integer")
         command = [sys.executable, "-m", "hearthwork", "task", "--json", "--agent", agent, "--timeout", str(timeout),
                    "--cwd", args.get("cwd") or self.cwd]
@@ -80,26 +89,90 @@ class Tasks:
         return command + ["-"], task
 
     def start(self, args):
+        """Queue a task (it starts at once when a slot is free). Returns its id."""
         command, task = self.command(args)
-        item = {"done": threading.Event(), "report": None, "error": None, "started": time.time()}
-        task_id = uuid.uuid4().hex[:8]
-        self.items[task_id] = item
-
-        def work():
-            try:
-                done = subprocess.run(command, input=task, capture_output=True, text=True, encoding="utf-8",
-                                      errors="replace")
-                try:
-                    item["report"] = json.loads(done.stdout)
-                except ValueError:
-                    item["error"] = (done.stderr or done.stdout or f"exit {done.returncode}").strip()[-1500:]
-            except Exception as error:
-                item["error"] = str(error)
-            finally:
-                item["done"].set()
-
-        threading.Thread(target=work, daemon=True).start()
+        with self.lock:
+            if self.closed:
+                raise ValueError("the server is shutting down")
+            task_id = uuid.uuid4().hex[:8]
+            self.items[task_id] = {"done": threading.Event(), "report": None, "error": None, "created": time.time(),
+                                   "started": None, "state": "queued", "process": None, "command": command, "task": task}
+            self.queue.append(task_id)
+            self.pump()
         return task_id
+
+    def running(self):
+        return [i for i, item in self.items.items() if item["state"] == "running"]
+
+    def pump(self):
+        """Start queued tasks while slots are free."""
+        with self.lock:
+            while self.queue and len(self.running()) < self.slots and not self.closed:
+                task_id = self.queue.pop(0)
+                item = self.items[task_id]
+                item["state"], item["started"] = "running", time.time()
+                threading.Thread(target=self.work, args=(task_id,), daemon=True).start()
+
+    def spawn(self, command):
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", HEARTHWORK_MCP="1")
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, encoding="utf-8", errors="replace", env=env, **new_group_flags())
+        self.job.add(process)
+        return process
+
+    def work(self, task_id):
+        item = self.items[task_id]
+        try:
+            with self.lock:
+                if item["state"] != "running":  # cancelled before it started
+                    return
+                process = item["process"] = self.spawn(item["command"])
+            stdout, stderr = process.communicate(item["task"])
+            if item["state"] == "cancelled":
+                return
+            try:
+                item["report"] = json.loads(stdout)
+            except ValueError:
+                item["error"] = (stderr or stdout or f"exit {process.returncode}").strip()[-1500:]
+        except Exception as error:
+            if item["state"] != "cancelled":
+                item["error"] = str(error)
+        finally:
+            with self.lock:
+                if item["state"] == "running":
+                    item["state"] = "finished"
+            item["done"].set()
+            self.pump()
+
+    def cancel(self, task_id):
+        with self.lock:
+            item = self.items.get(task_id)
+            if not item:
+                raise ValueError(f"unknown task id '{task_id}'")
+            if item["state"] not in ("queued", "running"):
+                return {"id": task_id, "status": "cancelled" if item["state"] == "cancelled" else "finished",
+                        "note": "the task had already ended"}
+            was = item["state"]
+            item["state"] = "cancelled"
+            if task_id in self.queue:
+                self.queue.remove(task_id)
+            if item["process"] is not None:
+                kill_tree(item["process"])
+            item["done"].set()
+            self.pump()
+            return {"id": task_id, "status": "cancelled", "was": was}
+
+    def shutdown(self):
+        """Refuse new tasks, drop the queue, kill every running task and its process tree."""
+        with self.lock:
+            self.closed = True
+            self.queue.clear()
+            for item in self.items.values():
+                if item["state"] in ("queued", "running"):
+                    item["state"] = "cancelled"
+                    if item["process"] is not None:
+                        kill_tree(item["process"])
+                    item["done"].set()
 
     def result(self, task_id, wait):
         item = self.items.get(task_id)
@@ -107,7 +180,13 @@ class Tasks:
             raise ValueError(f"unknown task id '{task_id}'")
         item["done"].wait(max(0, min(wait, MAX_WAIT)))
         if not item["done"].is_set():
-            return {"id": task_id, "status": "running", "elapsed_seconds": round(time.time() - item["started"])}
+            if item["state"] == "queued":
+                position = self.queue.index(task_id) + 1 if task_id in self.queue else 1
+                return {"id": task_id, "status": "queued", "position": position,
+                        "detail": f"waiting for a free session of the model ({self.slots} at a time)"}
+            return {"id": task_id, "status": "running", "elapsed_seconds": round(time.time() - (item["started"] or time.time()))}
+        if item["state"] == "cancelled":
+            return {"id": task_id, "status": "cancelled"}
         report = item["report"]
         ok = bool(report) and report.get("status") == "ok"
         out = {"id": task_id, "status": "done" if ok else "failed"}
@@ -143,7 +222,7 @@ def model_status():
 class Server:
     def __init__(self, slots=2, cwd=None):
         self.slots = slots
-        self.tasks = Tasks(cwd)
+        self.tasks = Tasks(cwd, slots)
 
     def handle(self, message):
         """Response dict for a JSON-RPC message, or None (notifications and responses get no answer)."""
@@ -186,6 +265,10 @@ class Server:
                     raise ValueError("id is required")
                 wait = args.get("wait_seconds", 50)
                 data = self.tasks.result(args["id"], wait if isinstance(wait, (int, float)) else 50)
+            elif name == "local_task_cancel":
+                if not isinstance(args.get("id"), str):
+                    raise ValueError("id is required")
+                data = self.tasks.cancel(args["id"])
             elif name == "local_task":
                 task_id = self.tasks.start(args)
                 data = self.tasks.result(task_id, 10 ** 9)
@@ -193,7 +276,7 @@ class Server:
                 data = model_status()
         except ValueError as error:
             return {"content": [{"type": "text", "text": str(error)}], "isError": True}
-        failed = name in ("local_task", "local_task_result") and data.get("status") == "failed"
+        failed = name in ("local_task", "local_task_result") and data.get("status") in ("failed", "cancelled")
         return {"content": [{"type": "text", "text": json.dumps(data, indent=2)}], "isError": failed}
 
 
@@ -206,9 +289,12 @@ def error_reply(msg_id, code, text):
 
 
 def serve(slots=None):
+    import atexit
+    import signal
     from .onboard import load_config
+    setup_stdio()
     if slots is None:
-        slots = load_config().get("server", {}).get("slots", 2)
+        slots = parallel_slots(load_config())
     server = Server(slots)
     out_lock = threading.Lock()
 
@@ -222,16 +308,33 @@ def serve(slots=None):
         if response is not None:
             send(response)
 
-    for line in sys.stdin.buffer:  # a thread per request: local_task blocks, and pings must still be answered
-        line = line.decode("utf-8", errors="replace").strip()
-        if not line:
-            continue
-        try:
-            message = json.loads(line)
-        except ValueError:
-            send(error_reply(None, -32700, "Parse error"))
-            continue
-        threading.Thread(target=dispatch, args=(message,), daemon=True).start()
+    def stop(*_):
+        server.tasks.shutdown()
+
+    def on_signal(number, frame):
+        stop()
+        os._exit(143)
+
+    atexit.register(stop)
+    for name in ("SIGTERM", "SIGINT", "SIGBREAK", "SIGHUP"):
+        if hasattr(signal, name):
+            try:
+                signal.signal(getattr(signal, name), on_signal)
+            except (ValueError, OSError):
+                pass
+    try:
+        for line in sys.stdin.buffer:  # a thread per request: local_task blocks, and pings must still be answered
+            line = line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except ValueError:
+                send(error_reply(None, -32700, "Parse error"))
+                continue
+            threading.Thread(target=dispatch, args=(message,), daemon=True).start()
+    finally:
+        stop()  # the client went away (stdin closed): leave no orphaned tasks
     return 0
 
 

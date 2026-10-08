@@ -87,7 +87,7 @@ class McpTests(unittest.TestCase):
 
     def test_tools_list_and_ping(self):
         names = [t["name"] for t in self.rpc("tools/list")["result"]["tools"]]
-        self.assertEqual(names, ["local_task_start", "local_task_result", "local_task", "local_model_status"])
+        self.assertEqual(names, ["local_task_start", "local_task_result", "local_task", "local_task_cancel", "local_model_status"])
         self.assertEqual(self.rpc("ping")["result"], {})
 
     def test_unknown_method_and_bad_params(self):

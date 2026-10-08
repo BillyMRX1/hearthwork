@@ -17,7 +17,6 @@ import argparse
 import contextlib
 import json
 import os
-import signal
 import subprocess
 import sys
 import tempfile
@@ -25,6 +24,7 @@ import threading
 import time
 
 from .harnesses import HARNESSES, installed, prepare, preview
+from .procs import kill_tree, new_group_flags, overload_warning, parallel_slots, register_task, running_tasks, setup_stdio, utf8_stream
 
 SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__"}
 MAX_FILES = 5000
@@ -85,26 +85,10 @@ def parse_result(agent, stdout, stderr, returncode, last_message=None):
     return HARNESSES[agent]["result"](stdout, stderr, returncode, last_message)
 
 
-def kill_tree(process):
-    """Kill the agent and everything it started."""
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True)
-        else:
-            os.killpg(process.pid, signal.SIGKILL)
-    except (OSError, subprocess.SubprocessError):
-        pass
-    try:
-        process.kill()
-    except OSError:
-        pass
-
-
 def run_process(command, env, cwd, stdin_text, timeout):
     """(returncode, stdout, stderr, timed_out). The process tree is killed at the timeout."""
-    extra = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
     process = subprocess.Popen(command, env=env, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", **extra)
+                               stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", **new_group_flags())
     out, err = [], []
     readers = [threading.Thread(target=lambda s=s, b=b: b.append(s.read()), daemon=True)
                for s, b in ((process.stdout, out), (process.stderr, err))]
@@ -231,9 +215,11 @@ def run_task(config, task, agent="claude", allow=(), cwd=None, timeout=900):
     if timed_out:
         error = f"timed out after {timeout} s; the agent was killed"
     created, modified, deleted = diff_snapshots(before, after)
+    if status == "ok" and not (message or "").strip() and not (created or modified or deleted):
+        status, error = "no_result", "no result: the agent produced no final message and changed no files"
     return {"agent": agent, "model": model, "host": host, "cwd": folder, "duration_seconds": round(duration, 1),
             "status": status, "exit_code": returncode, "error": error, "created": created, "modified": modified,
-            "deleted": deleted, "files_capped": len(before) >= MAX_FILES or len(after) >= MAX_FILES, "message": message}
+            "deleted": deleted, "files_capped": len(before) >= MAX_FILES or len(after) >= MAX_FILES, "message": message or ""}
 
 
 def format_report(report):
@@ -256,7 +242,7 @@ def format_report(report):
 
 
 def exit_code(report):
-    return 0 if report["status"] == "ok" else 124 if report["status"] == "timeout" else 1
+    return 0 if report["status"] == "ok" else 124 if report["status"] == "timeout" else 1  # error and no_result: 1
 
 
 def main(argv):
@@ -270,6 +256,7 @@ def main(argv):
     parser.add_argument("--json", action="store_true", help="report as JSON")
     parser.add_argument("--dry-run", action="store_true", help="print the command, environment and generated files; start nothing")
     args = parser.parse_args(argv)
+    setup_stdio()  # a task piped in as UTF-8 must not be read with the ANSI code page, nor the report written with it
     task = sys.stdin.read() if args.task == "-" else args.task
     if not task.strip():
         parser.error("the task is empty")
@@ -284,8 +271,11 @@ def main(argv):
         if not setup_complete(config):
             sys.exit("Hearthwork is not set up yet. Run `hearthwork` once in a terminal.")
         config = configured(interactive=False)
+    if not os.environ.get("HEARTHWORK_MCP"):  # the MCP server queues tasks itself
+        warning = overload_warning(len(running_tasks()), parallel_slots(config))
+        if warning:
+            log(warning)
+    register_task()
     report = run_task(config, task, args.agent, args.allow, args.cwd, args.timeout)
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(errors="replace")  # an agent's reply can hold characters the console code page lacks
-    print(json.dumps(report, indent=2) if args.json else format_report(report), flush=True)
+    print(json.dumps(report, indent=2, ensure_ascii=not utf8_stream(sys.stdout)) if args.json else format_report(report), flush=True)
     return exit_code(report)

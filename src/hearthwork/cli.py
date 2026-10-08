@@ -11,6 +11,7 @@
   hearthwork context [model] [N|auto]   context per model: range for this computer; save N for a model
   hearthwork status             what is running
   hearthwork share [--port N]   share the running model on your home network (Ctrl+C stops); a PIN pairs each computer
+  hearthwork api [--port N]     OpenAI + Anthropic compatible endpoint on this computer for any tool (--show: setup snippets)
   hearthwork devices            trusted devices (devices remove <name> revokes one)
   hearthwork connect [host]     use the model of a computer that is sharing (finds it, or give host[:port]); pair with the PIN
   hearthwork disconnect         back to local models
@@ -175,6 +176,9 @@ def main(argv=None):
         elif command == "share":
             from . import share
             sys.exit(share.share_main(rest))
+        elif command == "api":
+            from . import api
+            sys.exit(api.api_main(rest))
         elif command == "devices":
             from . import share
             sys.exit(share.devices_main(rest))

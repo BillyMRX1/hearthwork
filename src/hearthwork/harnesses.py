@@ -90,6 +90,50 @@ def normalize_anthropic(body):
     return dict(body, messages=out)
 
 
+def normalize_chat(body):
+    """OpenAI Chat Completions (SDKs, Aider, ...). Leading system/developer messages join into one system message;
+    later ones move into the neighbouring user message as a reminder, so strict chat templates accept them."""
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not any(isinstance(m, dict) and m.get("role") in ("system", "developer")
+                                                   for m in messages):
+        return body
+
+    def text_of(content):
+        if isinstance(content, str):
+            return content
+        return "\n".join(p.get("text", "") for p in content or [] if isinstance(p, dict) and p.get("type") == "text")
+
+    def add(message, text, front=False):
+        content = message.get("content")
+        if isinstance(content, str) or content is None:
+            joined = [text, content or ""] if front else [content or "", text]
+            return dict(message, content="\n\n".join(t for t in joined if t))
+        part = {"type": "text", "text": text}
+        return dict(message, content=[part, *content] if front else [*content, part])
+
+    system, out, pending = [], [], []
+    for message in messages:
+        role = message.get("role") if isinstance(message, dict) else None
+        if role in ("system", "developer"):
+            text = text_of(message.get("content"))
+            if not out:
+                system.append(text)
+            elif out[-1].get("role") == "user":
+                out[-1] = add(out[-1], _reminder(text))
+            else:
+                pending.append(_reminder(text))
+            continue
+        if pending and role == "user":
+            message = add(message, "\n\n".join(pending), front=True)
+            pending = []
+        out.append(message)
+    if pending:
+        out.append({"role": "user", "content": "\n\n".join(pending)})
+    if system:
+        out.insert(0, {"role": "system", "content": "\n\n".join(t for t in system if t)})
+    return dict(body, messages=out)
+
+
 def normalize_responses(body):
     """OpenAI Responses (Codex). Codex sends `instructions` plus a `developer` message, and two user messages
     in a row. Leading system/developer messages join `instructions` (one system prompt); later ones become
@@ -187,6 +231,8 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None):
                     raw = payload
                     if path.endswith("/messages"):
                         payload = normalize_anthropic(payload)
+                    elif path.endswith("/chat/completions"):
+                        payload = normalize_chat(payload)
                     elif path.endswith("/responses"):
                         payload = normalize_responses(payload)
                     body = json.dumps(payload).encode()

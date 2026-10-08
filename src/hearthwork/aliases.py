@@ -15,7 +15,7 @@ from .harnesses import HARNESSES
 MARKER = "created by `hearthwork alias`"
 WINDOWS = os.name == "nt"
 USAGE = """Usage:
-  hearthwork alias add <name> claude|codex   create a short command, e.g. `hearthwork alias add ccl claude`
+  hearthwork alias add <name> <agent>   create a short command, e.g. `hearthwork alias add ccl claude`
   hearthwork alias list
   hearthwork alias remove <name>"""
 
@@ -109,7 +109,7 @@ def main(args):
         for name, agent, path in found:
             print(f"{name}  ->  hearthwork {agent}   ({path})")
         if not found:
-            print("No aliases yet. Create one with: hearthwork alias add <name> claude|codex")
+            print("No aliases yet. Create one with: hearthwork alias add <name> <agent>")
         return 0
     if len(args) == 2 and args[0] == "remove":
         return remove(args[1])

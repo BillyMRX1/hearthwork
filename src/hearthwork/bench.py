@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark the running model through a real coding agent, and keep a scoreboard.
 
-  hearthwork bench   [--agent claude|codex] [--all] [--no-warmup] [--show]
+  hearthwork bench   [--agent claude|codex|opencode|aider|qwen] [--all] [--no-warmup] [--show]
   (or menu option "Benchmark the running model")
 
 Eight prompts run as one agent conversation in a fresh folder (bench/runs/...): chat, list files, read a file,
@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from datetime import datetime
@@ -35,6 +36,7 @@ from .server import agent_context, served_model
 
 RESULTS = BENCH / "results.jsonl"
 BOLD, DIM = "\033[1m", "\033[2m"
+BENCH_ALLOW = ["python *", "python3 *", "py *"]  # commands the other agents may run (they all need to run Python)
 TIMEOUT = 20 * 60  # per prompt
 WARMUP_TOKENS = 30000
 CONFIG_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}  # where each agent keeps its history
@@ -160,6 +162,8 @@ def ask_agent(agent, config, model, folder, prompt, first, session, env=None):
         if data.get("is_error") and not data.get("result"):
             raise AgentError(f"Claude Code reported an error: {str(data)[:400]}")
         return data.get("result") or "", session
+    if agent != "codex":
+        return ask_other(agent, port, remote, context, model, folder, prompt, first, session, env)
     last = folder / ".codex-last-message.txt"
     last.unlink(missing_ok=True)  # never grade a turn on the previous turn's reply
     # `codex exec resume` has no -s flag; the sandbox is set as config, which both forms accept.
@@ -181,9 +185,29 @@ def ask_agent(agent, config, model, folder, prompt, first, session, env=None):
     return reply, session
 
 
+def ask_other(agent, port, remote, context, model, folder, prompt, first, session, env):
+    """One turn through an agent that is described by its registry entry (OpenCode, Aider, Qwen Code, ...)."""
+    spec = HARNESSES[agent]
+    handle, prompt_file = tempfile.mkstemp(prefix="hearthwork-bench-", suffix=".txt")  # outside the agent's folder
+    os.close(handle)
+    try:
+        Path(prompt_file).write_text(prompt, encoding="utf-8")
+        args, extra = spec["task"](BENCH_ALLOW, None, prompt_file, resume=session or not first, cwd=folder)
+        result = launch(agent, port, model, context, remote=remote, capture=True, cwd=folder, timeout=TIMEOUT, args=args,
+                        extra_env={**(env or {}), **extra}, input_text=prompt if spec["prompt"] == "stdin" else None)
+    finally:
+        os.unlink(prompt_file)
+    reply, error = spec["result"](result.stdout, result.stderr, result.returncode, None)
+    if error and not reply:
+        raise AgentError(error)
+    return reply, (spec["session"](result.stdout) if "session" in spec else None) or session
+
+
 def isolated_env(agent, folder):
     """Env that points `agent`'s config/history folder at the empty folder `folder`. Exits if that folder could be
     the user's real one (~/.codex, ~/.claude, or wherever CODEX_HOME / CLAUDE_CONFIG_DIR already point)."""
+    if agent not in CONFIG_ENV:  # the others keep their history per project folder, and every run has its own
+        return {}
     var = CONFIG_ENV[agent]
     folder = Path(folder)
     real = {(Path.home() / REAL_DIRS[agent]).resolve()}

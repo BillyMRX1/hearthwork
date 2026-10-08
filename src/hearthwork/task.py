@@ -1,14 +1,17 @@
-"""`hearthwork task`: hand one coding task to the local (or connected) model through Claude Code or Codex, without a
-terminal, and get a report back. For other agents that want "our Claude" / "our Codex" as a subagent.
+"""`hearthwork task`: hand one coding task to the local (or connected) model through a coding agent (Claude Code,
+Codex, OpenCode, Aider, Qwen Code; see `hearthwork agents`), without a terminal, and get a report back. For other agents
+that want "our Claude" / "our Codex" as a subagent.
 
-  hearthwork task [--agent claude|codex] [--allow "pytest *"]... [--cwd DIR] [--timeout SECONDS] [--json] "TASK"
+  hearthwork task [--agent claude|codex|...] [--allow "pytest *"]... [--cwd DIR] [--timeout SECONDS] [--json] [--dry-run] "TASK"
 
 TASK may be "-" to read it from stdin (no shell quoting). The report goes to stdout (plain text, or JSON with
 --json); progress and logs go to stderr. Exit code 0 only when the agent finished without error.
 
 Permissions: Claude Code can read, search and edit files, and run only the commands matching --allow (each becomes
 `Bash(<pattern>)`); anything else is denied. Codex runs with its workspace-write sandbox: it may edit inside the
-folder and run commands there, and the sandbox (not --allow, which Codex ignores) decides the rest.
+folder and run commands there, and the sandbox (not --allow, which Codex ignores) decides the rest. OpenCode and Qwen Code get the same rule as Claude Code
+(edits plus the --allow commands). Aider only edits files: it cannot limit the commands it runs, so they are off.
+--dry-run prints the command, environment and generated files that would be used, and starts nothing.
 """
 import argparse
 import contextlib
@@ -21,11 +24,10 @@ import tempfile
 import threading
 import time
 
-from .harnesses import HARNESSES, installed, prepare
+from .harnesses import HARNESSES, installed, prepare, preview
 
 SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__"}
 MAX_FILES = 5000
-CLAUDE_TOOLS = ["Read", "Grep", "Glob", "Edit", "Write", "MultiEdit"]
 SUFFIX = ("\n\nWork only inside the current folder. When you are done, finish with a short summary of what you "
           "changed and how you verified it.")
 
@@ -73,32 +75,14 @@ def diff_snapshots(before, after):
 
 # ---------- the agent command ----------
 
-def task_args(agent, task, allow=(), last_message=None):
-    """Arguments after the agent's name. The task itself goes in through stdin (never on the command line)."""
-    if agent == "claude":
-        tools = CLAUDE_TOOLS + [f"Bash({pattern})" for pattern in allow]
-        return ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--allowedTools", *tools]
-    return ["exec", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-o", str(last_message), "-"]
+def task_args(agent, task, allow=(), last_message=None, prompt_file=None):
+    """Arguments after the agent's name. The task itself goes in through stdin or a file (never on the command line)."""
+    return HARNESSES[agent]["task"](allow, last_message, prompt_file)[0]
 
 
 def parse_result(agent, stdout, stderr, returncode, last_message=None):
     """(final message, error text or None) from what the agent printed."""
-    if agent == "claude":
-        try:
-            data = json.loads(stdout.strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            return "", f"Claude Code exited with {returncode}: {(stdout + stderr)[-400:].strip()}"
-        message = data.get("result") or ""
-        if data.get("is_error"):
-            return message, f"Claude Code reported an error: {message or str(data)[:400]}"
-        return message, (f"Claude Code exited with {returncode}" if returncode else None)
-    try:
-        message = open(last_message, encoding="utf-8", errors="replace").read().strip()
-    except OSError:
-        message = ""
-    if returncode != 0:
-        return message, f"Codex exited with {returncode}: {(stdout + stderr)[-400:].strip()}"
-    return message, None if message else "Codex finished without a final message"
+    return HARNESSES[agent]["result"](stdout, stderr, returncode, last_message)
 
 
 def kill_tree(process):
@@ -182,35 +166,67 @@ def model_for_task(config):
 
 # ---------- the task ----------
 
+def preview_model(config):
+    """(model name, context, remote or None) for a dry run: the running model if there is one; nothing is started."""
+    if config.get("remote"):
+        from .remote import RemoteError, session
+        try:
+            return (*session(config), config["remote"])
+        except RemoteError:
+            return "<shared-model>", 32768, config["remote"]
+    from .server import agent_context, served_model
+    name = served_model(config.get("server", {}).get("port", 8001))
+    return (name, agent_context(config), None) if name else ("<model-name>", 32768, None)
+
+
+def dry_run_task(config, task, agent, allow, cwd=None):
+    """`hearthwork task --dry-run`: print what the task would run, start nothing."""
+    name, context, remote = preview_model(config)
+    arguments, extra = HARNESSES[agent]["task"](allow, "<last-message-file>", "<task-file>", cwd=os.path.abspath(cwd or os.getcwd()))
+    prompt = HARNESSES[agent]["prompt"]
+    preview(agent, name, context, args=arguments, extra_env=extra, remote=remote,
+            note=f"The task ({len(task)} characters, plus a short closing instruction) is given to the agent "
+                 + ("on stdin." if prompt == "stdin" else "in a temporary file (<task-file>)."))
+
+
 def run_task(config, task, agent="claude", allow=(), cwd=None, timeout=900):
     """Run one task and return the report dict."""
     folder = os.path.abspath(cwd or os.getcwd())
     if not os.path.isdir(folder):
         sys.exit(f"Folder not found: {folder}")
     if not installed(agent):
-        sys.exit(f"{HARNESSES[agent]['title']} is not installed. Get it from {HARNESSES[agent]['install']}")
+        sys.exit(f"{HARNESSES[agent]['title']} is not installed. Install: {HARNESSES[agent]['install']}")
     port, model, context, remote = model_for_task(config)
     host = (remote.get("hostName") or remote["host"]) if remote else "local"
-    last_message = None
-    if agent == "codex":
-        handle, last_message = tempfile.mkstemp(prefix="hearthwork-last-", suffix=".txt")
+    temporary = []  # the file the final message goes to (Codex), and the task for agents that cannot read stdin
+    for prefix in ("last", "task"):
+        handle, path = tempfile.mkstemp(prefix=f"hearthwork-{prefix}-", suffix=".txt")
         os.close(handle)
+        temporary.append(path)
+    last_message, prompt_file = temporary
+    text = task.rstrip() + HARNESSES[agent].get("suffix", SUFFIX)
     try:
-        prepared = prepare(agent, port, model, context, args=task_args(agent, task, allow, last_message), remote=remote, clean=True)
+        arguments, extra = HARNESSES[agent]["task"](allow, last_message, prompt_file, cwd=folder)
+        stdin_text = text
+        if HARNESSES[agent]["prompt"] == "file":
+            with open(prompt_file, "w", encoding="utf-8") as f:
+                f.write(text)
+            stdin_text = ""
+        prepared = prepare(agent, port, model, context, args=arguments, extra_env=extra, remote=remote, clean=True)
         if not prepared:
             sys.exit(1)
         command, env = prepared
         log(f"hearthwork task: {HARNESSES[agent]['title']} with {model} ({host}) in {folder}")
         before = snapshot(folder)
         started = time.time()
-        returncode, out, err, timed_out = run_process(command, env, folder, task.rstrip() + SUFFIX, timeout)
+        returncode, out, err, timed_out = run_process(command, env, folder, stdin_text, timeout)
         duration = time.time() - started
         after = snapshot(folder)
         message, error = parse_result(agent, out, err, returncode, last_message)
     finally:
-        if last_message:
+        for path in temporary:
             with contextlib.suppress(OSError):
-                os.unlink(last_message)
+                os.unlink(path)
     status = "timeout" if timed_out else "error" if error else "ok"
     if timed_out:
         error = f"timed out after {timeout} s; the agent was killed"
@@ -244,14 +260,15 @@ def exit_code(report):
 
 
 def main(argv):
-    parser = argparse.ArgumentParser(prog="hearthwork task", description="Run one coding task with the local model through Claude Code or Codex.")
+    parser = argparse.ArgumentParser(prog="hearthwork task", description="Run one coding task with the local model through a coding agent.")
     parser.add_argument("task", help='what to do; "-" reads it from stdin')
-    parser.add_argument("--agent", choices=["claude", "codex"], default="claude")
+    parser.add_argument("--agent", choices=sorted(HARNESSES), default="claude")
     parser.add_argument("--allow", action="append", default=[], metavar="PATTERN",
-                        help='command pattern the agent may run, e.g. "pytest *" (Claude Code; repeatable)')
+                        help='command pattern the agent may run, e.g. "pytest *" (not Codex or Aider; repeatable)')
     parser.add_argument("--cwd", help="folder to work in (default: here)")
     parser.add_argument("--timeout", type=int, default=900, help="seconds before the agent is killed (default 900)")
     parser.add_argument("--json", action="store_true", help="report as JSON")
+    parser.add_argument("--dry-run", action="store_true", help="print the command, environment and generated files; start nothing")
     args = parser.parse_args(argv)
     task = sys.stdin.read() if args.task == "-" else args.task
     if not task.strip():
@@ -259,11 +276,16 @@ def main(argv):
     from .cli import configured
     from .onboard import load_config
     config = load_config()
+    if args.dry_run:
+        dry_run_task(config, task, args.agent, args.allow, args.cwd)
+        return 0
     if not config.get("remote"):
         from .onboard import setup_complete
         if not setup_complete(config):
             sys.exit("Hearthwork is not set up yet. Run `hearthwork` once in a terminal.")
         config = configured(interactive=False)
     report = run_task(config, task, args.agent, args.allow, args.cwd, args.timeout)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")  # an agent's reply can hold characters the console code page lacks
     print(json.dumps(report, indent=2) if args.json else format_report(report), flush=True)
     return exit_code(report)

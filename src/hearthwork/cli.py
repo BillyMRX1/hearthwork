@@ -3,11 +3,14 @@
   hearthwork                    menu (run it from the project you want the agent to work on)
   hearthwork claude [args...]   Claude Code with the local model (starts one if needed); args go to `claude`
   hearthwork codex [args...]    Codex with the local model; args go to `codex`
+  hearthwork opencode|aider|qwen [args...]   OpenCode, Aider or Qwen Code with the local model
+  hearthwork agents             supported agents: installed?, version, API, how Hearthwork connects each
+  hearthwork <agent> --dry-run  show the command, environment and generated files, start nothing (also: task --dry-run)
   hearthwork task "TASK"        one coding task for another agent to delegate (no terminal needed); see --help
   hearthwork mcp [install ...]  MCP server so any agent can use the local model as a subagent
   hearthwork start [--model X]  start the model in the background     hearthwork stop
   hearthwork serve [--model X]  run the model server in this terminal (Ctrl+C stops it)
-  hearthwork alias add <name> claude|codex   short command for it, e.g. ccl  (also: alias list, alias remove <name>)
+  hearthwork alias add <name> <agent>   short command for it, e.g. ccl  (also: alias list, alias remove <name>)
   hearthwork context [model] [N|auto]   context per model: range for this computer; save N for a model
   hearthwork status             what is running
   hearthwork share [--port N]   share the running model on your home network (Ctrl+C stops); a PIN pairs each computer
@@ -108,6 +111,14 @@ def main(argv=None):
         elif command == "mcp":
             from . import mcp
             sys.exit(mcp.main(rest))
+        elif command == "agents":
+            from .harnesses import agents_table
+            print(agents_table())
+        elif command in HARNESSES and rest[:1] == ["--dry-run"]:  # only first: the agent's own flags follow it
+            from .harnesses import preview
+            from .task import preview_model
+            name, context, remote = preview_model(load_config())
+            preview(command, name, context, args=rest[1:], remote=remote)
         elif command in HARNESSES:  # every following argument belongs to the agent (e.g. -p "...")
             if not rest and not has_terminal():
                 print(f"{command} needs a terminal to talk to you. Running inside another agent? Use:\n"

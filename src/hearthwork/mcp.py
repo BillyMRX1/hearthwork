@@ -1,5 +1,5 @@
-"""`hearthwork mcp`: a stdio MCP server that lets any agent hand coding tasks to the local model (Claude Code or Codex
-running on it). Newline-delimited JSON-RPC 2.0 on stdin/stdout; nothing else is ever printed to stdout.
+"""`hearthwork mcp`: a stdio MCP server that lets any agent hand coding tasks to the local model (Claude Code, Codex, OpenCode,
+Aider or Qwen Code running on it; see `hearthwork agents`). Newline-delimited JSON-RPC 2.0 on stdin/stdout; nothing else is ever printed to stdout.
 
   hearthwork mcp                       run the server (what the agent's MCP config starts)
   hearthwork mcp install claude|codex  register it with that agent
@@ -18,16 +18,17 @@ import time
 import uuid
 
 from . import __version__
+from .harnesses import HARNESSES
 
 VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 MAX_WAIT = 55
 
 TASK_PROPERTIES = {
     "task": {"type": "string", "description": "Complete task description: files to touch, interfaces, and the command that verifies it (e.g. the test command)."},
-    "agent": {"type": "string", "enum": ["claude", "codex"], "default": "claude", "description": "Which agent runs it on the local model."},
+    "agent": {"type": "string", "enum": list(HARNESSES), "default": "claude", "description": "Which agent runs it on the local model."},
     "cwd": {"type": "string", "description": "Absolute folder to work in (default: the server's folder)."},
     "allow_commands": {"type": "array", "items": {"type": "string"},
-                       "description": 'Command patterns the claude agent may run, e.g. ["pytest *", "python *"]. Without them it can only read and edit files. Codex uses its own sandbox instead.'},
+                       "description": 'Command patterns the agent may run, e.g. ["pytest *", "python *"] (claude, opencode, qwen). Without them it can only read and edit files. Codex uses its own sandbox instead; aider never runs commands.'},
     "timeout_seconds": {"type": "integer", "default": 900, "description": "The agent is killed after this long."},
 }
 
@@ -64,8 +65,8 @@ class Tasks:
         if not isinstance(task, str) or not task.strip():
             raise ValueError("task must be a non-empty string")
         agent = args.get("agent") or "claude"
-        if agent not in ("claude", "codex"):
-            raise ValueError("agent must be 'claude' or 'codex'")
+        if agent not in HARNESSES:
+            raise ValueError("agent must be one of: " + ", ".join(HARNESSES))
         allow = args.get("allow_commands") or []
         if not isinstance(allow, list) or not all(isinstance(a, str) for a in allow):
             raise ValueError("allow_commands must be a list of strings")

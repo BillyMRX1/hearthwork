@@ -1,9 +1,9 @@
 """Coding agents ("harnesses") that can use the local model, and the relay that makes their requests fit any model.
 
-Each harness is one entry in HARNESSES: how to find it and how to launch it against the local server. Both
-launch through a relay (a small HTTP server in this process) that cleans up requests on their way to llama.cpp:
+Each harness is one entry in HARNESSES: how to find it, how to launch it against the local server, and how to run it
+headless. All launch through a relay (a small HTTP server in this process) that cleans up requests on their way to llama.cpp:
 strict chat templates (e.g. Qwen3.5/3.8-style) reject a second system/developer message, unknown roles, or two
-user messages in a row, all of which these agents send. To add another harness, add a command function to HARNESSES.
+user messages in a row, all of which these agents send. To add another harness, add an entry to HARNESSES (see there).
 """
 import http.client
 import http.server
@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 from . import paths
 from .paths import HOME
@@ -339,14 +340,34 @@ def claude_settings(name, context):
 
 # ---------- harnesses ----------
 
+_preview = None  # a list while `--dry-run` previews a launch: generated files are collected instead of written
+
+
+def write_file(path, text):
+    """Write a file Hearthwork generates for a session (in its data folder, never in the agent's own config). The new
+    file replaces the old one in one step, so two launches never read half a file. During a preview nothing is written."""
+    path = Path(path)
+    if _preview is not None:
+        _preview.append((str(path), text))
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
+    return path
+
+
+def safe_name(name):
+    return re.sub(r"[^\w.-]+", "_", name)
+
+
 def claude_command(binary, base_url, token, name, context, max_output, args):
     # The connection stays in process env vars, not the settings file: the relay port changes every session, and
     # env vars are what already works. The settings file only holds what is the same for every session.
     settings, auto = claude_settings(name, context)
     # One file per model: two sessions on different models must not share (and overwrite) a status line.
-    settings_file = HOME / f"claude-settings-{name}.json"
-    settings_file.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    if auto:
+    settings_file = write_file(HOME / f"claude-settings-{name}.json", json.dumps(settings, indent=2))
+    if auto and _preview is None:
         print("\033[2mYour settings-hearthwork.json starts Claude Code in auto mode: every command is first checked "
               "by the local model, which can be slow or time out and block it.\033[0m")
     env = dict(os.environ)
@@ -367,8 +388,10 @@ def codex_catalog(binary, name, context):
     is Codex's own ModelInfo (see `codex debug models --bundled`); it is the same for every model, so only the
     name and context window are filled in. Written per launch so a changed model or context is always current."""
     # Required field: Codex's system prompt. Reuse one Codex ships, so the model gets the normal Codex prompt.
-    instructions = ""
+    instructions = "(Codex's own system prompt, read from `codex debug models --bundled` at launch)" if _preview is not None else ""
     try:
+        if _preview is not None:
+            raise OSError  # a preview starts nothing, not even `codex debug models`
         shipped = subprocess.run([binary, "debug", "models", "--bundled"], capture_output=True, text=True,
                                  encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=20)
         for entry in json.loads(shipped.stdout).get("models", []):
@@ -389,11 +412,7 @@ def codex_catalog(binary, name, context):
         "supports_parallel_tool_calls": True,
         "base_instructions": instructions or "You are Codex, a coding agent running in the user's terminal.",
     }
-    path = paths.HOME / "codex-models.json"
-    temporary = path.with_name(f"{path.name}.{os.getpid()}")  # replace, so two launches never read half a file
-    temporary.write_text(json.dumps({"models": [entry]}, indent=1), encoding="utf-8")
-    os.replace(temporary, path)
-    return path
+    return write_file(paths.HOME / "codex-models.json", json.dumps({"models": [entry]}, indent=1))
 
 
 def codex_command(binary, base_url, token, name, context, max_output, args):
@@ -426,12 +445,213 @@ def codex_command(binary, base_url, token, name, context, max_output, args):
     return [*command, "-m", name, *rest], ({**os.environ, "HEARTHWORK_KEY": token} if token else None)
 
 
+def opencode_command(binary, base_url, token, name, context, max_output, args):
+    # Docs: https://opencode.ai/docs/providers/ (custom @ai-sdk/openai-compatible provider with limit.context/output)
+    # and https://opencode.ai/docs/config/ (OPENCODE_CONFIG_CONTENT: inline config with the highest priority of the
+    # normal sources, so no file is written and ~/.config/opencode/opencode.json stays as it is).
+    config = {
+        "$schema": "https://opencode.ai/config.json", "autoupdate": False, "share": "disabled",
+        "provider": {"hearthwork": {
+            "npm": "@ai-sdk/openai-compatible", "name": "Hearthwork (local model)",
+            "options": {"baseURL": f"{base_url}/v1", "apiKey": "{env:HEARTHWORK_KEY}"},
+            "models": {name: {"name": name, "limit": {"context": context, "output": max_output}}}}},
+    }
+    env = {**os.environ, "OPENCODE_CONFIG_CONTENT": json.dumps(config), "HEARTHWORK_KEY": token or "local-model"}
+    model = ["-m", f"hearthwork/{name}"]
+    return ([binary, "run", *model, *args[1:]] if args[:1] == ["run"] else [binary, *model, *args]), env
+
+
+def aider_command(binary, base_url, token, name, context, max_output, args):
+    # Docs: https://aider.chat/docs/llms/openai-compat.html (OPENAI_API_BASE / OPENAI_API_KEY, model openai/<name>),
+    # https://aider.chat/docs/config/adv-model-settings.html (metadata file: context; settings file: extra_params).
+    # --no-analytics only turns it off for this session (--analytics-disable would write into ~/.aider).
+    model = f"openai/{name}"
+    stem = safe_name(name)
+    metadata = write_file(HOME / f"aider-metadata-{stem}.json", json.dumps({model: {
+        "max_input_tokens": context, "max_tokens": max_output, "max_output_tokens": max_output,
+        "input_cost_per_token": 0, "output_cost_per_token": 0, "litellm_provider": "openai", "mode": "chat"}}, indent=1))
+    settings = write_file(HOME / f"aider-settings-{stem}.json", json.dumps(  # JSON is YAML: aider reads it as it is
+        [{"name": model, "extra_params": {"max_tokens": max_output}}], indent=1))
+    env = {**os.environ, "OPENAI_API_BASE": f"{base_url}/v1", "OPENAI_API_KEY": token or "local-model",
+           "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}  # aider's console crashes on Windows code pages otherwise
+    flags = ["--model", model, "--model-metadata-file", str(metadata), "--model-settings-file", str(settings),
+             "--no-show-model-warnings", "--no-check-update", "--no-analytics", "--no-show-release-notes"]
+    return [binary, *flags, *args], env
+
+
+def qwen_command(binary, base_url, token, name, context, max_output, args):
+    # Docs: https://qwenlm.github.io/qwen-code-docs/en/users/configuration/settings/ (OPENAI_BASE_URL / OPENAI_API_KEY /
+    # OPENAI_MODEL; model.generationConfig; QWEN_CODE_SYSTEM_SETTINGS_PATH: an extra settings file that layers over
+    # ~/.qwen/settings.json, which stays untouched).
+    settings = {"security": {"auth": {"selectedType": "openai"}},
+                "model": {"name": name, "generationConfig": {"contextWindowSize": context,
+                                                             "samplingParams": {"max_tokens": max_output}}},
+                "general": {"disableAutoUpdate": True}, "privacy": {"usageStatisticsEnabled": False}}
+    path = write_file(HOME / f"qwen-settings-{safe_name(name)}.json", json.dumps(settings, indent=2))
+    env = {**os.environ, "OPENAI_BASE_URL": f"{base_url}/v1", "OPENAI_API_KEY": token or "local-model",
+           "OPENAI_MODEL": name, "QWEN_CODE_SYSTEM_SETTINGS_PATH": str(path)}
+    return [binary, "--model", name, *args], env
+
+
+# ---------- headless runs (hearthwork task, bench) ----------
+# Each returns (arguments after the agent's name, extra env). `allow`: command patterns the agent may run; `prompt`
+# is the file holding the task for agents that cannot read it from stdin; `resume` continues the previous session
+# (True, or its id when the entry has a `session` reader); `cwd` is the folder it works in.
+
+CLAUDE_TOOLS = ["Read", "Grep", "Glob", "Edit", "Write", "MultiEdit"]
+
+
+def claude_task(allow, last_message, prompt, resume=False, cwd=None):
+    tools = CLAUDE_TOOLS + [f"Bash({pattern})" for pattern in allow]
+    return ["-p", "--output-format", "json", "--permission-mode", "acceptEdits", "--allowedTools", *tools], {}
+
+
+def codex_task(allow, last_message, prompt, resume=False, cwd=None):
+    return ["exec", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "-o", str(last_message), "-"], {}
+
+
+def opencode_task(allow, last_message, prompt, resume=False, cwd=None):
+    # Everything is denied except editing and the allowed commands (the last matching rule wins).
+    permission = {"edit": "allow", "webfetch": "deny", "bash": {"*": "deny", **{pattern: "allow" for pattern in allow}}}
+    # `--continue` takes the newest session of any folder, so a later turn names its session (see session_opencode)
+    again = ["--session", resume] if isinstance(resume, str) else ["--continue"] if resume else []
+    # --dir: a resumed session otherwise works in the folder it was first started from, not in this one
+    where = ["--dir", str(cwd)] if cwd else []
+    return ["run", "--format", "json", *again, *where], {"OPENCODE_PERMISSION": json.dumps(permission)}
+
+
+def aider_task(allow, last_message, prompt, resume=False, cwd=None):
+    # Aider edits files; the shell commands it suggests can't be limited to patterns, so they are switched off.
+    return ["--message-file", str(prompt), "--yes-always", "--no-suggest-shell-commands", "--no-pretty", "--no-stream", "--no-fancy-input",
+            *(["--restore-chat-history"] if resume else [])], {}
+
+
+def qwen_task(allow, last_message, prompt, resume=False, cwd=None):
+    tools = [f"run_shell_command({pattern.removesuffix(' *').removesuffix('*')})" for pattern in allow]
+    return ["--approval-mode", "auto-edit", "--output-format", "json", *(["--allowed-tools", *tools] if tools else []),
+            *(["--continue"] if resume else [])], {}
+
+
+def result_claude(stdout, stderr, returncode, last_message):
+    """(final message, error text or None) from what Claude Code printed."""
+    try:
+        data = json.loads(stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return "", f"Claude Code exited with {returncode}: {(stdout + stderr)[-400:].strip()}"
+    message = data.get("result") or ""
+    if data.get("is_error"):
+        return message, f"Claude Code reported an error: {message or str(data)[:400]}"
+    return message, (f"Claude Code exited with {returncode}" if returncode else None)
+
+
+def result_codex(stdout, stderr, returncode, last_message):
+    try:
+        message = open(last_message, encoding="utf-8", errors="replace").read().strip()
+    except OSError:
+        message = ""
+    if returncode != 0:
+        return message, f"Codex exited with {returncode}: {(stdout + stderr)[-400:].strip()}"
+    return message, None if message else "Codex finished without a final message"
+
+
+def json_events(text):
+    """The JSON objects among the lines of `text` (other lines are skipped)."""
+    events = []
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def result_opencode(stdout, stderr, returncode, last_message):
+    """`opencode run --format json` prints one event per line; the final message is the text after the last tool call."""
+    texts, errors = [], []
+    for event in json_events(stdout):
+        if event.get("type") == "tool_use":
+            texts = []
+        elif event.get("type") == "text":
+            texts.append(event.get("part", {}).get("text", ""))
+        elif event.get("type") == "error":
+            errors.append(str(event.get("error", {}).get("data", {}).get("message") or event.get("error"))[:300])
+    message = "".join(texts).strip()
+    if errors or returncode:
+        return message, f"OpenCode failed (exit {returncode}): {'; '.join(errors) or (stdout + stderr)[-400:].strip()}"
+    return message, None if message else "OpenCode finished without a final message"
+
+
+def session_opencode(stdout):
+    """The id of the session an `opencode run --format json` run used, or None."""
+    return next((e["sessionID"] for e in json_events(stdout) if e.get("sessionID")), None)
+
+
+def result_aider(stdout, stderr, returncode, last_message):
+    message = stdout.strip()[-4000:]  # aider prints the model's reply and what it changed, no tool calls to filter out
+    if returncode != 0:
+        return message, f"Aider exited with {returncode}: {(stdout + stderr)[-400:].strip()}"
+    return message, None if message else "Aider finished without output"
+
+
+def result_qwen(stdout, stderr, returncode, last_message):
+    """`qwen --output-format json` prints a JSON array of messages; its last item is the result."""
+    start = stdout.find("[{")
+    try:
+        items = json.loads(stdout[start:]) if start >= 0 else []
+    except ValueError:
+        items = []
+    final = next((i for i in reversed(items) if isinstance(i, dict) and i.get("type") == "result"), None)
+    if not final:
+        return "", f"Qwen Code exited with {returncode}: {(stdout + stderr)[-400:].strip()}"
+    message = final.get("result") or ""
+    if final.get("is_error"):
+        return message, f"Qwen Code reported an error: {message or str(final)[:400]}"
+    return message, (f"Qwen Code exited with {returncode}" if returncode else None)
+
+
+# Aider only edits files (no tools): told it can run things, a local model answers in a format Aider rejects.
+AIDER_SUFFIX = ("\n\nYou can only create and edit files in this folder; you cannot run commands, so do not try to or "
+                "write example output. Answer with the file contents in the required format, then one short sentence.")
+
+# One entry per agent; adding an agent is adding an entry (and a command + task + result function above).
+#   title/binary/version   display name, program name, arguments that print its version
+#   install                official install command and URL, shown when it is missing
+#   api                    what it speaks: "anthropic" (/v1/messages), "openai-responses" (/v1/responses) or
+#                          "openai-chat" (/v1/chat/completions); the relay cleans up all three
+#   connects               how Hearthwork points it at the model, for `hearthwork agents`
+#   command                (binary, base_url, token, model, context, max_output, args) -> (command, env). base_url is the
+#                          relay without /v1; token is the device key of a shared model (None: local); the context and
+#                          max_output come from the running server. Never edits the agent's own config.
+#   task/prompt/result     headless run for `hearthwork task`/MCP/bench: arguments, how the task goes in ("stdin" or a
+#                          "file"), and how to read the final message from the output
+#   session                (optional) reads the session id from a headless run's output, so bench can continue it
+#   suffix                 (optional) closing instruction for `hearthwork task`, instead of the default one
+#   headless               example flags shown when an agent is started without a terminal
 HARNESSES = {
-    "claude": {"title": "Claude Code", "binary": "claude", "command": claude_command,
-               "install": "https://code.claude.com"},
-    "codex": {"title": "Codex", "binary": "codex", "command": codex_command,
-              "install": "https://developers.openai.com/codex (or: npm install -g @openai/codex)"},
+    "claude": {"title": "Claude Code", "binary": "claude", "version": ["--version"], "api": "anthropic",
+               "install": "curl -fsSL https://claude.ai/install.sh | bash  (https://code.claude.com)",
+               "connects": "ANTHROPIC_* env vars + --settings file", "command": claude_command,
+               "task": claude_task, "prompt": "stdin", "result": result_claude, "headless": '-p "prompt"'},
+    "codex": {"title": "Codex", "binary": "codex", "version": ["--version"], "api": "openai-responses",
+              "install": "npm install -g @openai/codex  (https://developers.openai.com/codex)",
+              "connects": "-c overrides + generated model catalogue", "command": codex_command,
+              "task": codex_task, "prompt": "stdin", "result": result_codex, "headless": 'exec "prompt"'},
+    "opencode": {"title": "OpenCode", "binary": "opencode", "version": ["--version"], "api": "openai-chat",
+                 "install": "npm i -g opencode-ai  (https://opencode.ai)",
+                 "connects": "OPENCODE_CONFIG_CONTENT env (provider + limits)", "command": opencode_command,
+                 "task": opencode_task, "prompt": "stdin", "result": result_opencode, "session": session_opencode, "headless": 'run "prompt"'},
+    "aider": {"title": "Aider", "binary": "aider", "version": ["--version"], "api": "openai-chat",
+              "install": "uv tool install --python 3.12 aider-chat  (https://aider.chat/docs/install.html)",
+              "connects": "OPENAI_API_* env + generated model metadata/settings files", "command": aider_command,
+              "task": aider_task, "prompt": "file", "suffix": AIDER_SUFFIX, "result": result_aider, "headless": '--message "prompt" --yes-always'},
+    "qwen": {"title": "Qwen Code", "binary": "qwen", "version": ["--version"], "api": "openai-chat",
+             "install": "npm i -g @qwen-code/qwen-code  (https://github.com/QwenLM/qwen-code)",
+             "connects": "OPENAI_* env + generated settings file (QWEN_CODE_SYSTEM_SETTINGS_PATH)", "command": qwen_command,
+             "task": qwen_task, "prompt": "stdin", "result": result_qwen, "headless": '"prompt"'},
 }
+API_NAMES = {"anthropic": "Anthropic Messages", "openai-responses": "OpenAI Responses", "openai-chat": "OpenAI Chat Completions"}
 
 
 def installed(key):
@@ -446,7 +666,7 @@ def prepare(key, port, name, context, max_output=4096, args=(), extra_env=None, 
     harness = HARNESSES[key]
     binary = installed(key)
     if not binary:
-        print(f"{harness['title']} is not installed. Get it from {harness['install']}", file=sys.stderr if clean else sys.stdout)
+        print(f"{harness['title']} is not installed. Install: {harness['install']}", file=sys.stderr if clean else sys.stdout)
         return None
     if remote:
         base_url, token = f"http://{remote['host']}:{remote['port']}", remote["key"]
@@ -458,6 +678,92 @@ def prepare(key, port, name, context, max_output=4096, args=(), extra_env=None, 
     if clean:
         env = clean_env(os.environ if env is None else env)
     return command, env
+
+
+# ---------- dry run ----------
+
+SECRET = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD)$", re.I)  # not ..._TOKENS (a count)
+
+
+def shown(arg):
+    return arg if re.fullmatch(r"[\w@%+=:,./\\~-]+", arg) else json.dumps(arg)
+
+
+def preview(key, name, context, max_output=4096, args=(), extra_env=None, remote=None, note=None):
+    """Print what launching `key` would run, without starting the model, the relay or the agent: the command, the
+    environment variables Hearthwork sets (secrets masked), and the files it generates (path and content). The relay
+    port is a placeholder; nothing is written."""
+    global _preview
+    harness = HARNESSES[key]
+    base_url, token = ((f"http://{remote['host']}:{remote['port']}", remote["key"]) if remote
+                       else ("http://127.0.0.1:<relay-port>", None))
+    binary = installed(key) or harness["binary"]
+    _preview = []
+    try:
+        command, env = harness["command"](binary, base_url, token, name, context, max_output, list(args))
+        files = _preview
+    finally:
+        _preview = None
+    changed = {k: v for k, v in {**(os.environ if env is None else env), **(extra_env or {})}.items() if os.environ.get(k) != v}
+    removed = [k for k in os.environ if env is not None and k not in env]
+    print(f"{harness['title']}: {'installed' if installed(key) else 'NOT installed (' + harness['install'] + ')'}   "
+          f"API: {API_NAMES[harness['api']]}   model: {name}   context: {context}   max output: {max_output}")
+    print("\ncommand:\n  " + " ".join(shown(a) for a in command))
+    print("\nenvironment Hearthwork sets (secrets masked):")
+    for k, v in sorted(changed.items()):
+        if SECRET.search(k):
+            v = "********"
+        try:  # a JSON value (OpenCode's config) is easier to read indented
+            if v.startswith("{"):
+                v = "\n" + "\n".join("    " + line for line in json.dumps(json.loads(v), indent=2).splitlines())
+        except ValueError:
+            pass
+        print(f"  {k}={v}")
+    for k in removed:
+        print(f"  {k} (removed)")
+    if not changed and not removed:
+        print("  (none)")
+    print("\ngenerated files (written to Hearthwork's data folder at launch; your own agent config is never edited):")
+    for path, text in files or []:
+        print(f"  {path}\n" + "\n".join("    " + line for line in text.splitlines()))
+    if not files:
+        print("  (none)")
+    print("\nHearthwork starts a relay on a free local port " + ("(not used: the model is on another computer)" if remote else
+          "in front of the model server; <relay-port> stands for it") + ".")
+    if note:
+        print(note)
+
+
+def agent_version(key, timeout=20):
+    """Version text of an installed agent, or None."""
+    binary = installed(key)
+    if not binary:
+        return None
+    try:
+        done = subprocess.run([binary, *HARNESSES[key]["version"]], capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", stdin=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return "?"
+    lines = [line.strip() for line in (done.stdout + done.stderr).splitlines() if line.strip()]
+    found = re.search(r"\d+\.\d+[\w.+-]*", lines[0]) if lines else None
+    return found.group(0) if found else (lines[0][:30] if lines else "?")
+
+
+def agents_table():
+    """The `hearthwork agents` text: every supported agent, whether it is installed, and how it is connected."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(len(HARNESSES)) as pool:
+        versions = dict(zip(HARNESSES, pool.map(agent_version, HARNESSES)))
+    rows = [("agent", "installed", "API", "how Hearthwork connects it")]
+    rows += [(f"{key}", (versions[key] or "-") if installed(key) else "no", API_NAMES[h["api"]], h["connects"])
+             for key, h in HARNESSES.items()]
+    widths = [max(len(r[i]) for r in rows) for i in range(3)]
+    lines = ["  ".join(c.ljust(w) for c, w in zip(r, widths)) + "  " + r[3] for r in rows]
+    missing = [(h["title"], h["install"]) for key, h in HARNESSES.items() if not installed(key)]
+    if missing:
+        lines += ["", "Not installed:"] + [f"  {title}: {hint}" for title, hint in missing]
+    lines += ["", "Start one with `hearthwork <agent>`; `hearthwork <agent> --dry-run` shows what would run, without starting anything."]
+    return "\n".join(lines)
 
 
 # Set by a running Claude Code / Codex for its own session; a child started inside one must not inherit them (it
@@ -475,10 +781,10 @@ def clean_env(env):
 
 
 def launch(key, port, name, context, max_output=4096, args=(), capture=False, cwd=None, timeout=None, extra_env=None,
-           remote=None):
+           remote=None, input_text=None):
     """Run harness `key` against the server on `port`: in this terminal, or with `capture` its output is
     returned as a CompletedProcess (for the benchmark). `extra_env` is added to the agent's environment. Returns the
-    exit code otherwise. With `remote` the agent talks to the shared model directly, with no local prompt-cache saves."""
+    exit code otherwise. `input_text` goes to the agent's stdin (with `capture`). With `remote` the agent talks to the shared model directly, with no local prompt-cache saves."""
     prepared = prepare(key, port, name, context, max_output, args, extra_env, remote)
     if not prepared:
         return 1
@@ -486,7 +792,8 @@ def launch(key, port, name, context, max_output=4096, args=(), capture=False, cw
     try:
         if capture:
             return subprocess.run(command, env=env, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
-                                  errors="replace", stdin=subprocess.DEVNULL, timeout=timeout)
+                                  errors="replace", input=input_text, stdin=None if input_text else subprocess.DEVNULL,
+                                  timeout=timeout)
         return subprocess.call(command, env=env, cwd=cwd)
     except KeyboardInterrupt:
         return 130

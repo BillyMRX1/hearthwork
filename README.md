@@ -2,7 +2,7 @@
 
 # Hearthwork
 
-**Hearthwork runs a local AI model on your own computer and connects your coding agent to it, from one menu.** The model runs on your GPU and RAM, and the agent is Claude Code or Codex. It sets itself up for your hardware, tells you honestly whether your PC is good enough, and handles the small incompatibilities that otherwise break agents on local models.
+**Hearthwork runs a local AI model on your own computer and connects your coding agent to it, from one menu.** The model runs on your GPU and RAM, and the agent is Claude Code, Codex, OpenCode, Aider or Qwen Code (`hearthwork agents`). It sets itself up for your hardware, tells you honestly whether your PC is good enough, and handles the small incompatibilities that otherwise break agents on local models.
 
 Works on Windows, macOS and Linux. Needs Python 3.9+ and the agent(s) you want to use; no extra Python packages.
 
@@ -88,6 +88,9 @@ The first run sets things up (see below). After that you get one menu:
 |---|---|
 | `hearthwork` | The menu above. |
 | `hearthwork claude [args]` | Claude Code with the local model; starts a model first if none is running. Extra arguments go to `claude`. |
+| `hearthwork opencode\|aider\|qwen [args]` | OpenCode, Aider or Qwen Code with the local model (see Agents). Extra arguments go to the agent, e.g. `hearthwork opencode run "..."`, `hearthwork aider --message "..."`. |
+| `hearthwork <agent> --dry-run` | Prints the exact command, the environment variables Hearthwork sets (keys and tokens masked) and the files it generates, without starting the model, the relay or the agent. Must be the first argument. |
+| `hearthwork agents` | Lists the supported agents: installed (and version), the API each uses, how Hearthwork connects it, and the install command of the missing ones. |
 | `hearthwork codex [args]` | Codex with the local model; starts a model first if none is running. Extra arguments go to `codex`, e.g. `hearthwork codex exec "..."`. |
 | `hearthwork start [--model X]` | Starts the model server in the background. |
 | `hearthwork stop` | Stops the background model server. |
@@ -99,7 +102,7 @@ The first run sets things up (see below). After that you get one menu:
 | `hearthwork connect [host[:port]]` | Uses the model of a computer that is sharing: finds it on the local network and among your Tailscale computers (or give its address), pairs with the PIN. |
 | `hearthwork disconnect` | Goes back to local models. |
 | `hearthwork model <link>` | Downloads a model from Hugging Face. |
-| `hearthwork bench [--agent claude\|codex] [--all] [--warmup] [--show]` | Benchmarks the running model through an agent. `--all` is the release check (every installed agent, see Benchmark). `--show` prints the scoreboard and the latest summary. |
+| `hearthwork bench [--agent claude\|codex\|opencode\|aider\|qwen] [--all] [--warmup] [--show]` | Benchmarks the running model through an agent. `--all` is the release check (every installed agent, see Benchmark). `--show` prints the scoreboard and the latest summary. |
 | `hearthwork check [--json]` | Checks whether this PC suits Hearthwork and which models fit (see below). |
 | `hearthwork runtime [install <name> \| use <name> \| update \| rollback]` | Lists the llama.cpp engines (CUDA 13/12, ROCm, Vulkan, SYCL, Metal, CPU) installed side by side, the one recommended for this PC and why. `install` downloads another next to the others, `use` switches (applies at the next model start), `update` gets the newest build, `rollback` goes back to the previous one. |
 | `hearthwork setup [--update-llama] [--reset] [--import FOLDER]` | Runs setup again. `--update-llama` gets the newest llama.cpp, `--reset` starts setup from scratch, `--import` brings in an old clone-based setup. |
@@ -110,12 +113,12 @@ The first run sets things up (see below). After that you get one menu:
 
 ## Use the model from another computer
 
-Run the model on one computer (say, a PC with a GPU) and use Claude Code or Codex from another one on the same home network. Both need Hearthwork; the second one needs no model, llama.cpp or setup.
+Run the model on one computer (say, a PC with a GPU) and use any supported agent from another one on the same home network. Both need Hearthwork; the second one needs no model, llama.cpp or setup.
 
 ```
 hearthwork share           # on the computer with the model; leave it running
 hearthwork connect         # on the other computer: finds it, then asks for the PIN shown on the first
-hearthwork claude          # now uses the other computer's model (same for codex, the menu, bench)
+hearthwork claude          # now uses the other computer's model (same for every agent, the menu, bench)
 hearthwork disconnect      # back to local models
 ```
 
@@ -160,12 +163,12 @@ hearthwork api --show               # copy-paste setup for each tool
 
 ## Use Hearthwork as a subagent from any agent
 
-Any agent harness (cloud Claude Code, Codex, Cursor, OpenCode, ...) can hand a coding task to "our Claude" or "our Codex" running on the local model (or on the computer you `hearthwork connect` to) and get the result back. Two ways:
+Any agent harness (cloud Claude Code, Codex, Cursor, OpenCode, ...) can hand a coding task to "our Claude", "our Codex" (or OpenCode, Aider, Qwen Code) running on the local model (or on the computer you `hearthwork connect` to) and get the result back. Two ways:
 
 **1. The `task` command**, from the other agent's shell tool (no terminal needed):
 
 ```
-hearthwork task [--agent claude|codex] [--allow "pytest *"]... [--cwd DIR] [--timeout 900] [--json] "TASK"
+hearthwork task [--agent claude|codex|opencode|aider|qwen] [--allow "pytest *"]... [--cwd DIR] [--timeout 900] [--json] [--dry-run] "TASK"
 echo "TASK" | hearthwork task -        # "-" reads the task from stdin: no shell quoting problems
 ```
 
@@ -173,6 +176,9 @@ It starts the model if none is running (the last used one; if none can be chosen
 
 - **Claude Code** may read, search and edit files, and run only commands matching an `--allow` pattern (`--allow "python *"` becomes `Bash(python *)`); everything else is denied.
 - **Codex** runs in its `workspace-write` sandbox: it may edit inside the folder and run commands there, and the sandbox decides the rest. `--allow` has no effect on it.
+- **OpenCode** and **Qwen Code** follow the same rule as Claude Code: file edits plus the `--allow` commands (OpenCode through `OPENCODE_PERMISSION`, Qwen Code through `--approval-mode auto-edit --allowed-tools`).
+- **Aider** only edits files: it cannot limit the commands it would run, so they are switched off.
+- **`--dry-run`** prints the command, environment and generated files the task would use and starts nothing.
 
 **2. The MCP server**, so the other agent gets tools instead of a shell command:
 
@@ -188,7 +194,7 @@ Tips: give small, precise tasks (file names, interfaces, the test command), and 
 
 ## Benchmark
 
-`hearthwork bench` (or menu option 6) drives the running model through Claude Code or Codex in a fresh folder, with 8 prompts in one conversation. It grades each step by checking the files and running the code, not by trusting the agent's reply:
+`hearthwork bench` (or menu option 6) drives the running model through a coding agent (`--agent`, Claude Code by default) in a fresh folder, with 8 prompts in one conversation. It grades each step by checking the files and running the code, not by trusting the agent's reply:
 
 | # | Task | Graded by |
 |---|---|---|
@@ -203,7 +209,7 @@ Tips: give small, precise tasks (file names, interfaces, the test command), and 
 
 - **Results** are added to `bench/results.jsonl` in the data folder. The scoreboard ranks every model and agent you have tried, by score and then time.
 - **Each run's folder** stays in `bench/runs/<date-time>/<agent>/` in the data folder, so you can inspect what the agent wrote.
-- **Isolated agent history:** each run gives the agent an empty config folder (`CODEX_HOME` for Codex, `CLAUDE_CONFIG_DIR` for Claude Code) next to its work folder, so benchmark sessions never fill your real `~/.codex` or `~/.claude`. The benchmark refuses to start if that folder would be your real one. Codex gets a copy of only the `[windows]` table of your `config.toml` (its sandbox setting); without it Codex on Windows blocks every command. No login is needed: the local provider is passed as `-c` overrides, and Claude Code runs with the dummy token Hearthwork already sets.
+- **Isolated agent history:** each run gives the agent an empty config folder (`CODEX_HOME` for Codex, `CLAUDE_CONFIG_DIR` for Claude Code) next to its work folder, so benchmark sessions never fill your real `~/.codex` or `~/.claude`. The other agents keep their history per project folder, and every run has its own folder. The benchmark refuses to start if that folder would be your real one. Codex gets a copy of only the `[windows]` table of your `config.toml` (its sandbox setting); without it Codex on Windows blocks every command. No login is needed: the local provider is passed as `-c` overrides, and Claude Code runs with the dummy token Hearthwork already sets.
 
 ### Release check: `hearthwork bench --all`
 
@@ -220,14 +226,29 @@ Runs every installed agent one after another (never in parallel, which would sta
 
 ## Agents
 
-| Agent | How it connects | Notes |
-|---|---|---|
-| Claude Code | Anthropic Messages API (`/v1/messages`) | Told the real context size, so it compacts in time. |
-| Codex | OpenAI Responses API (`/v1/responses`), as a one-off model provider through `-c` overrides | `~/.codex/config.toml` is not changed. Hearthwork also writes a model catalogue entry (`codex-models.json` in its data folder) so Codex knows the model and its context window. |
+`hearthwork agents` shows which are installed (with version), the API each speaks, how Hearthwork connects it, and the install command of the missing ones. Every agent works the same way in `hearthwork <agent> [args]`, the menu, `hearthwork task --agent <agent>`, the MCP tools, remote mode (`share` / `connect`) and `bench`. The context window and output limit each agent is told come from the running server (or the shared one).
 
-- **Every agent goes through a small relay** inside Hearthwork (`src/hearthwork/harnesses.py`). It reshapes requests so any model's chat template accepts them.
-- **Why the relay is needed:** strict templates (e.g. Qwen3.5/3.8) reject a second system/developer message, unknown roles, or two user messages in a row, and both agents send these. Without the relay, Claude Code and Codex requests failed on Qwen3.8 with "System message must be at the beginning".
-- **Adding another agent** means adding one launch function to `HARNESSES` in `src/hearthwork/harnesses.py`.
+| Agent | Install | API (relay path) | How Hearthwork connects it | Known quirks |
+|---|---|---|---|---|
+| Claude Code (`claude`) | https://code.claude.com | Anthropic Messages (`/v1/messages`) | `ANTHROPIC_*` env vars and a `--settings` file in the data folder | Told the real context size, so it compacts in time. |
+| Codex (`codex`) | `npm i -g @openai/codex` | OpenAI Responses (`/v1/responses`) | `-c` overrides as a one-off model provider, plus a model catalogue (`codex-models.json`) | `~/.codex/config.toml` is not changed. |
+| OpenCode (`opencode`) | `npm i -g opencode-ai` | OpenAI Chat Completions (`/v1/chat/completions`) | `OPENCODE_CONFIG_CONTENT` env var: provider `@ai-sdk/openai-compatible` with the model's `limit.context` / `limit.output`; `-m hearthwork/<model>`; the key is passed as `HEARTHWORK_KEY` | Nothing is written to disk. Auto-update and sharing are turned off for the session. Headless: `opencode run`. |
+| Aider (`aider`) | `uv tool install --python 3.12 aider-chat` | OpenAI Chat Completions | `OPENAI_API_BASE` / `OPENAI_API_KEY` env vars, `--model openai/<model>`, a generated `--model-metadata-file` (context) and `--model-settings-file` (`max_tokens`); `--no-show-model-warnings --no-check-update --no-analytics` | Not an agent loop: it edits files from a reply format and cannot read or run anything on its own, so `hearthwork task` switches its shell commands off and `hearthwork bench` scores it low (1.7/8 on Qwen3.5-35B-A3B). It keeps its own git behaviour (creates a repo, commits, adds `.aider*` to `.gitignore`). Install with Python 3.12: `uv tool install aider-chat` fails to build `scipy` on 3.13+ on Windows. Hearthwork sets `PYTHONUTF8=1` so its console does not crash on Windows code pages. |
+| Qwen Code (`qwen`) | `npm i -g @qwen-code/qwen-code` | OpenAI Chat Completions | `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` env vars and a generated settings file (`contextWindowSize`, `max_tokens`) given through `QWEN_CODE_SYSTEM_SETTINGS_PATH`; `~/.qwen/settings.json` is not changed | Headless: `qwen "prompt"`; `hearthwork task` uses `--approval-mode auto-edit` plus `--allowed-tools` for the `--allow` commands. It also runs a background memory extraction that makes extra requests. |
+
+- **Every agent goes through a small relay** inside Hearthwork (`src/hearthwork/harnesses.py`). It reshapes requests so any model's chat template accepts them, for all three APIs.
+- **Why the relay is needed:** strict templates (e.g. Qwen3.5/3.8) reject a second system/developer message, unknown roles, or two user messages in a row, and these agents send them. Without the relay, Claude Code and Codex requests failed on Qwen3.8 with "System message must be at the beginning".
+- **Your own config is never edited.** Each agent gets environment variables, command-line flags, or a generated file in the data folder. They write their own state (history, caches) where they always do.
+- **`--dry-run`** shows all of it without starting anything:
+
+```
+hearthwork opencode --dry-run      # the command, the environment (keys masked), the generated config
+hearthwork task --agent qwen --dry-run "fix the failing test"
+```
+
+It prints the placeholder `http://127.0.0.1:<relay-port>` for the relay, which gets a free port at launch. Put `--dry-run` first: everything after it goes to the agent as usual (Aider has a `--dry-run` of its own, which still works after another argument).
+- **Adding another agent** means adding one entry to `HARNESSES` in `src/hearthwork/harnesses.py`: names, version command, install hint, which API it speaks, a function that builds its command and environment, and how to run it headless and read its final message. Menu, `agents`, `task`, MCP and `bench` pick it up from there.
+- **Not yet supported:** Goose (environment variables look possible: `GOOSE_PROVIDER`, `OPENAI_HOST`, `GOOSE_MODEL`, but not verified), Crush, Kilo Code CLI, OpenHands (needs Docker or its own runtime) and Hermes. A clean, non-invasive way to point each at a custom endpoint was not verified, so they are left out rather than guessed. Until then, `hearthwork api --show` gives setup snippets for tools without a launcher.
 
 ### Claude Code settings Hearthwork adds
 

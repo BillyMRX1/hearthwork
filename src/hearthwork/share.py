@@ -459,12 +459,17 @@ def share_main(argv):
         print(f"{YELLOW}Discovery is off (UDP port {DISCOVERY_PORT}: {error}); clients must use `hearthwork connect <ip>`.{RESET}")
     ips = lan_addresses() if lan_ok or not args.tailscale else []
     print(f"\n{GREEN}Sharing {served_model(share.model_port)} on port {args.port}.{RESET}  Ctrl+C stops sharing.")
-    print("This computer's address: " + (", ".join(f"{ip}:{args.port}" for ip in ips) or "(no local network found)"))
+    if ips:
+        print("This computer's address: " + ", ".join(f"{ip}:{args.port}" for ip in ips))
+    elif args.tailscale and not lan_ok:
+        print("Local network: not shared (it is marked Public); Tailscale only.")
+    else:
+        print("This computer's address: (no local network found)")
     if args.tailscale and not lan_ok:
         print(f"{YELLOW}Public network ({', '.join(public)}): only Tailscale computers can connect, not this local network.{RESET}")
     if tailscale:
         name = f"  ({tailscale['dns']})" if tailscale["dns"] else ""
-        print(f"Tailscale address: {GREEN}{', '.join(f'{ip}:{args.port}' for ip in tailscale['ips'])}{RESET}{name}")
+        print(f"Tailscale address: {GREEN}{', '.join(f'[{ip}]:{args.port}' if ':' in ip else f'{ip}:{args.port}' for ip in tailscale['ips'])}{RESET}{name}")
         if args.tailscale:
             print(f"Away from home: {CYAN}hearthwork connect {tailscale['dns'] or tailscale['ips'][0]}{RESET} (encrypted by Tailscale)")
         else:

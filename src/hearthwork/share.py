@@ -131,8 +131,11 @@ def clean_name(text, fallback):
 
 # ---------- discovery ----------
 
-def discovery_reply(hostname, port, model):
-    return json.dumps({"hostname": hostname, "port": port, "model": model, "version": __version__}).encode()
+def discovery_reply(hostname, port, model, lan=True, tailscale=()):
+    """`lan` False: this host refuses local-network peers (share --tailscale on a Public network), so clients must use
+    one of the `tailscale` addresses instead."""
+    return json.dumps({"hostname": hostname, "port": port, "model": model, "version": __version__,
+                       "lan": lan, "tailscale": list(tailscale)}).encode()
 
 
 def parse_discovery(data, ip):
@@ -140,7 +143,8 @@ def parse_discovery(data, ip):
     try:
         info = json.loads(data.decode("utf-8"))
         return {"host": ip, "port": int(info["port"]), "hostname": str(info["hostname"]),
-                "model": str(info.get("model") or ""), "version": str(info.get("version") or "")}
+                "model": str(info.get("model") or ""), "version": str(info.get("version") or ""),
+                "lan": info.get("lan") is not False, "tailscaleIps": [str(a) for a in info.get("tailscale") or []]}
     except (ValueError, KeyError, TypeError, AttributeError):
         return None
 
@@ -281,7 +285,8 @@ def tailscale_info():
 def host_addresses(tailscale=None):
     """The addresses a client can use for this host: {"lan": [...], "tailscale": [...], "dns": "..."}."""
     tailscale = tailscale or {}
-    return {"lan": lan_addresses(), "tailscale": list(tailscale.get("ips") or []), "dns": tailscale.get("dns") or ""}
+    ipv4 = [ip for ip in tailscale.get("ips") or [] if ":" not in ip]  # the share listens on IPv4 (0.0.0.0) only
+    return {"lan": lan_addresses(), "tailscale": ipv4, "dns": tailscale.get("dns") or ""}
 
 
 # ---------- network guard ----------
@@ -399,7 +404,8 @@ class Share:
 
     def intercept(self, handler):
         if not peer_allowed(handler.client_address[0], self.tailscale_only, self.lan_ok):
-            handler._send_json(403, {"error": {"message": "This host only accepts Tailscale connections."}})
+            handler._send_json(403, {"error": {"message": "This host only accepts Tailscale connections."},
+                                     "tailscaleOnly": True, "addresses": host_addresses(self.tailscale)})
             return True
         path = handler.path.split("?")[0].rstrip("/")
         if path.startswith("/hearthwork/"):
@@ -454,7 +460,9 @@ def share_main(argv):
         return 1
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        serve_discovery(DISCOVERY_PORT, lambda: discovery_reply(socket.gethostname(), args.port, served_model(share.model_port)))
+        serve_discovery(DISCOVERY_PORT, lambda: discovery_reply(
+            socket.gethostname(), args.port, served_model(share.model_port), lan=lan_ok or not args.tailscale,
+            tailscale=[ip for ip in (tailscale or {}).get("ips") or [] if ":" not in ip]))
     except OSError as error:
         print(f"{YELLOW}Discovery is off (UDP port {DISCOVERY_PORT}: {error}); clients must use `hearthwork connect <ip>`.{RESET}")
     ips = lan_addresses() if lan_ok or not args.tailscale else []
@@ -469,7 +477,7 @@ def share_main(argv):
         print(f"{YELLOW}Public network ({', '.join(public)}): only Tailscale computers can connect, not this local network.{RESET}")
     if tailscale:
         name = f"  ({tailscale['dns']})" if tailscale["dns"] else ""
-        print(f"Tailscale address: {GREEN}{', '.join(f'[{ip}]:{args.port}' if ':' in ip else f'{ip}:{args.port}' for ip in tailscale['ips'])}{RESET}{name}")
+        print(f"Tailscale address: {GREEN}{', '.join(f'{ip}:{args.port}' for ip in tailscale['ips'] if ':' not in ip)}{RESET}{name}")
         if args.tailscale:
             print(f"Away from home: {CYAN}hearthwork connect {tailscale['dns'] or tailscale['ips'][0]}{RESET} (encrypted by Tailscale)")
         else:

@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.request
 
+from .harnesses import url_host
 from .onboard import CYAN, GREEN, RED, RESET, YELLOW, ask, load_config, save_config
 from .share import (DEFAULT_PORT, DISCOVERY_PORT, DISCOVERY_QUERY, is_tailscale_ip, lan_addresses, parse_discovery,
                     tailscale_info)
@@ -31,7 +32,7 @@ def call(host, port, path, key=None, body=None, timeout=5):
     headers = {"content-type": "application/json"}
     if key:
         headers["authorization"] = f"Bearer {key}"
-    request = urllib.request.Request(f"http://{host}:{port}{path}", data=data, headers=headers)
+    request = urllib.request.Request(f"http://{url_host(host)}:{port}{path}", data=data, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status, raw = response.status, response.read()
@@ -136,8 +137,14 @@ def find_hosts():
     thread.start()
     lan = discover()
     thread.join(PEER_TIMEOUT + 2)
-    names = {h["hostname"] for h in lan}
-    return lan + [h for h in results if h["hostname"] not in names]
+    hosts = []
+    for h in lan:  # a host that refuses this network (share --tailscale): list it by its Tailscale address instead
+        if not h.get("lan", True):
+            ts = next((t for t in results if t["hostname"] == h["hostname"]), None)
+            h = ts or (dict(h, host=h["tailscaleIps"][0], tailscale=True) if h.get("tailscaleIps") else h)
+        hosts.append(h)
+    names = {h["hostname"] for h in hosts}
+    return hosts + [h for h in results if h["hostname"] not in names]
 
 
 def unreachable(remote, error):
@@ -156,7 +163,8 @@ def resolve(remote):
         try:
             status, info = call(address, remote["port"], "/hearthwork/info", timeout=timeout)
             if status != 200 or not info.get("hearthwork"):
-                last = OSError(f"{address}:{remote['port']} is not a Hearthwork share")
+                last = OSError(f"{address}:{remote['port']} only accepts Tailscale connections" if info.get("tailscaleOnly")
+                               else f"{address}:{remote['port']} is not a Hearthwork share")
                 continue
             status, _ = call(address, remote["port"], "/v1/models", key=remote["key"], timeout=5)
         except OSError as error:
@@ -261,6 +269,20 @@ def connect_main(argv):
         print(f"{RED}Cannot reach {host}:{port}: {error}{RESET}\nIs `hearthwork share` running there, and did "
               "Windows Firewall allow it on private networks?")
         return 1
+    if status == 403 and info.get("tailscaleOnly"):  # reached over the LAN, but the host takes Tailscale only
+        for address in list((info.get("addresses") or {}).get("tailscale") or []) + [(info.get("addresses") or {}).get("dns")]:
+            try:
+                if address and call(address, port, "/hearthwork/info", timeout=TAILSCALE_TIMEOUT)[0] == 200:
+                    print(f"{CYAN}{host} only accepts Tailscale connections here; using {address}.{RESET}")
+                    host = address
+                    status, info = call(host, port, "/hearthwork/info")
+                    break
+            except OSError:
+                continue
+        else:
+            print(f"{RED}{host}:{port} only accepts Tailscale connections.{RESET} Sign in to Tailscale on this computer "
+                  "(same account), then run `hearthwork connect` again.")
+            return 1
     if status != 200 or "hearthwork" not in info:
         print(f"{RED}{host}:{port} did not answer like a Hearthwork share.{RESET}")
         return 1

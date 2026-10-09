@@ -192,6 +192,11 @@ def dump_request(incoming, normalized):
             json.dump(data, f)
 
 
+def url_host(host):
+    """`host` as it goes in a URL: IPv6 addresses need brackets."""
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
 def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_headers=None):
     """HTTP relay to llama-server on `upstream_port`, bound to `address` (not yet serving). `intercept(handler)`, when
     given, runs first for every request and returns True once it has answered it itself: `hearthwork share` uses it
@@ -712,7 +717,7 @@ def prepare(key, port, name, context, max_output=4096, args=(), extra_env=None, 
         print(f"{harness['title']} is not installed. Install: {harness['install']}", file=sys.stderr if clean else sys.stdout)
         return None
     if remote:
-        base_url, token = f"http://{remote['host']}:{remote['port']}", remote["key"]
+        base_url, token = f"http://{url_host(remote['host'])}:{remote['port']}", remote["key"]
     else:
         base_url, token = f"http://127.0.0.1:{start_relay(port)}", None
     global _remote
@@ -743,7 +748,7 @@ def preview(key, name, context, max_output=4096, args=(), extra_env=None, remote
     port is a placeholder; nothing is written."""
     global _preview, _remote
     harness = HARNESSES[key]
-    base_url, token = ((f"http://{remote['host']}:{remote['port']}", remote["key"]) if remote
+    base_url, token = ((f"http://{url_host(remote['host'])}:{remote['port']}", remote["key"]) if remote
                        else ("http://127.0.0.1:<relay-port>", None))
     binary = installed(key) or harness["binary"]
     _preview, _remote = [], remote

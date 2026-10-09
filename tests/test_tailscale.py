@@ -131,3 +131,23 @@ class Addresses(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TailscaleOnlyDiscoveryTest(unittest.TestCase):
+    def test_reply_round_trip(self):
+        from hearthwork import share
+        raw = share.discovery_reply("PC", 8484, "m", lan=False, tailscale=["100.1.2.3"])
+        host = share.parse_discovery(raw, "192.168.0.7")
+        self.assertFalse(host["lan"])
+        self.assertEqual(host["tailscaleIps"], ["100.1.2.3"])
+        self.assertTrue(share.parse_discovery(share.discovery_reply("PC", 8484, "m"), "192.168.0.7")["lan"])
+
+    def test_lan_refusing_host_listed_by_tailscale_address(self):
+        from unittest import mock
+        from hearthwork import remote
+        lan = [{"host": "192.168.0.7", "port": 8484, "hostname": "PC", "model": "m", "version": "x",
+                "lan": False, "tailscaleIps": ["100.1.2.3"]}]
+        with mock.patch.object(remote, "discover", return_value=lan), \
+             mock.patch.object(remote, "discover_tailscale", return_value=[]):
+            hosts = remote.find_hosts()
+        self.assertEqual([(h["host"], h.get("tailscale")) for h in hosts], [("100.1.2.3", True)])

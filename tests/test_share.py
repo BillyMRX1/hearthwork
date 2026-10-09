@@ -89,7 +89,8 @@ class DiscoveryTests(unittest.TestCase):
     def test_reply_round_trip(self):
         data = share.discovery_reply("pc", 8484, "Qwen")
         self.assertEqual(share.parse_discovery(data, "192.168.0.7"),
-                         {"host": "192.168.0.7", "port": 8484, "hostname": "pc", "model": "Qwen", "version": share.__version__})
+                         {"host": "192.168.0.7", "port": 8484, "hostname": "pc", "model": "Qwen", "version": share.__version__,
+                      "lan": True, "tailscaleIps": []})
 
     def test_garbage_is_ignored(self):
         for data in (b"", b"HEARTHWORK?", b"{}", b'{"hostname": "x"}', b"\xff\xfe"):

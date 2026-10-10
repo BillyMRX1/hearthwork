@@ -106,7 +106,7 @@ def wire(api, conv, model, tools=False, stream=False):
                 role = "developer" if kind == "system" and seen_user else kind
                 seen_user = seen_user or kind == "user"
                 part = "output_text" if kind == "assistant" else "input_text"
-                items.append({"role": role, "content": [{"type": part, "text": item[1]}]})
+                items.append({"type": "message", "role": role, "content": [{"type": part, "text": item[1]}]})
             elif kind == "call":
                 items.append({"type": "function_call", "call_id": item[1], "name": item[2], "arguments": item[3]})
             else:
@@ -289,7 +289,7 @@ def protocol_stages(api, endpoint, model):
         text, _ = parse_reply(api, endpoint.send(api, wire(api, [("user", "Reply with the word ok.")], model)))
         if not text.strip():
             return FAIL, "HTTP 200 but the reply has no text", (
-                "The model answered with an empty message: check the chat template and the server log (`hearthwork status`).")
+                "the model gave no answer (check the chat template and the server log)."), "model"
         return OK, f"reply: {short(text, 40)!r}", None
 
     def streaming():
@@ -320,12 +320,12 @@ def protocol_stages(api, endpoint, model):
                 state["call"] = (call_id or "call_1", name, json.dumps(parsed))
                 return OK, f"get_secret({json.dumps(parsed)})", None
             return FAIL, f"tool call {name}({short(arguments, 40)}) does not ask for 'alpha'", (
-                "The model called the tool with the wrong name or arguments: a capability limit of the model.", "model")
+                "The model called the tool with the wrong name or arguments: a capability limit of the model."), "model"
         if LOOKS_LIKE_CALL.search(text):
             return FAIL, f"the call came back as text: {short(text, 80)!r}", TEXT_CALL
         return FAIL, f"no tool call; the model answered in text: {short(text, 60)!r}", (
             "The model did not call the offered tool. Check that the server runs with --jinja (Hearthwork does) and "
-            "that the model supports tool use; otherwise it is a model capability limit.", "model")
+            "that the model supports tool use; otherwise it is a model capability limit."), "model"
 
     def tool_result():
         conv = state["conv"] + [("call", *state["call"]), ("result", state["call"][0], SECRET_ANSWER)]
@@ -334,7 +334,7 @@ def protocol_stages(api, endpoint, model):
         if SECRET_ANSWER not in text:
             return FAIL, f"final text lacks {SECRET_ANSWER}: {short(text, 60)!r}", (
                 "After the tool result the model did not use it: the tool result may be dropped by the chat template "
-                "(role mapping) or the model ignores it. Check the template with the Environment fingerprint.", "model")
+                "(role mapping) or the model ignores it. Check the template with the Environment fingerprint."), "model"
         return OK, "answer contains the tool result", None
 
     def next_turn():
@@ -343,7 +343,7 @@ def protocol_stages(api, endpoint, model):
         if SECRET_ANSWER not in text:
             return FAIL, f"second turn lacks {SECRET_ANSWER}: {short(text, 60)!r}", (
                 "The history with the tool call and result is not carried into the next turn: a chat template "
-                "problem with tool messages in history, or the model forgot the answer.", "model")
+                "problem with tool messages in history, or the model forgot the answer."), "model"
         return OK, "history with the tool call survives", None
 
     def late_system():
@@ -351,7 +351,7 @@ def protocol_stages(api, endpoint, model):
                 ("system", "Always answer in one word."), ("user", "Reply with the word fine.")]
         text, _ = parse_reply(api, endpoint.send(api, wire(api, conv, model)))
         if not text.strip():
-            return FAIL, "HTTP 200 but the reply has no text", "An empty reply after a late system message: check the chat template."
+            return FAIL, "HTTP 200 but the reply has no text", "The model gave no answer after a late system message: check the chat template.", "model"
         return OK, "accepted", None
 
     def late_system_suggestion(check):
@@ -534,10 +534,14 @@ def agent_stages(key, config, remote, work, coding, context):
                         os.environ.pop(k, None)
                     else:
                         os.environ[k] = v
+            if report["status"] == "timeout" and grade:  # the file may be right even though the agent kept going
+                solved = grade(report, folder)
+                if solved[0] == OK:
+                    return OK, f"calc.py is correct, but the agent kept working until the {timeout} s limit", None
             if report["status"] != "ok":
                 return FAIL, f"{report['status']}: {short(report.get('error') or '', 200)}", (
                     f"{harness['title']} did not complete the run ({report['status']}). Run "
-                    f"`hearthwork task --agent {key} \"Reply with the word ok\"` to see its output, and `hearthwork {key} --dry-run` for its configuration.", "agent")
+                    f"`hearthwork task --agent {key} \"Reply with the word ok\"` to see its output, and `hearthwork {key} --dry-run` for its configuration."), "agent"
             return grade(report, folder) if grade else (OK, f"replied {short(report['message'], 40)!r} in {report['duration_seconds']} s", None)
         return check
 
@@ -552,16 +556,26 @@ def agent_stages(key, config, remote, work, coding, context):
         return found + [stage("coding task", SKIP, 0, "headless reply failed")]
     folder = Path(work) / f"{key}-coding"
     folder.mkdir(parents=True, exist_ok=True)
-    text = "Create a file calc.py in this folder with a function add(a, b) that returns a + b" + (
-        "." if harness.get("tools") is False else ", then run it to check that it works.")
+    # No "run it": agents may not run commands without --allow, and Hearthwork grades the file itself.
+    text = "Create a file calc.py in this folder with a function add(a, b) that returns a + b. Do not run anything and do not create other files; reply \"done\" when calc.py exists."
 
     def grade(report, folder):
         code, output = bench.run_py(folder, "-c", "import calc; assert calc.add(2, 3) == 5; print('GRADE-OK')")
         if code == 0 and "GRADE-OK" in output:
             return OK, f"calc.add(2, 3) == 5 in {report['duration_seconds']} s", None
+        said = report.get("message") or ""
+        if code != 0 and "calc" in output and re.search(r"sandbox|blocked|read-only|not permitted|denied by", said, re.I):
+            return FAIL, f"no calc.py; the agent says: {short(said, 100)}", (
+                f"{harness['title']} reports that its sandbox blocked writing files, so the coding task could not run. This is "
+                "the agent's sandbox in the temporary config, not the model's ability (Codex on Windows: see its [windows] "
+                "sandbox setting)."), "agent"
+        if "PermissionError" in output or "Permission denied" in output:
+            return FAIL, "Hearthwork could not read the agent's folder (permission denied)", (
+                f"{harness['title']}'s sandbox locked the folder it worked in, so calc.py could not be graded. This is the "
+                "agent's sandbox, not the model: check its Windows sandbox setting (`~/.codex/config.toml` [windows])."), "agent"
         return FAIL, f"graded by Hearthwork: {short(output.splitlines()[-1] if output.strip() else 'no calc.py created', 120)}", (
             "The protocol works, but the model did not solve the coding task: a capability limit of this model "
-            f"(or its quantization), not a configuration problem. Try a larger model; compare with `hearthwork bench --agent {key}`.", "model")
+            f"(or its quantization), not a configuration problem. Try a larger model; compare with `hearthwork bench --agent {key}`."), "model"
 
     found.append(timed("coding task", headless(text, str(folder), 600, grade)))
     return found
@@ -590,7 +604,8 @@ def verdict(key, server, protocol, agent):
             if item["status"] == FAIL:
                 name = item["name"]
                 if item["name"] == "coding task":
-                    name += f" ({item['detail'].split(':')[0]})"  # timeout vs error
+                    run = re.match(r"(timeout|error|no_result)", item["detail"])  # timeout vs error
+                    name += f" ({run.group(1)})" if run else ""
                 return text.format(name), item["name"]
     for item in capability:
         if item["status"] == FAIL:

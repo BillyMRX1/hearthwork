@@ -110,7 +110,8 @@ class WireTests(unittest.TestCase):
     def test_responses_items(self):
         body = doctor.wire("openai-responses", self.CONV, "m", tools=True)
         self.assertEqual([i.get("type") or i["role"] for i in body["input"]],
-                         ["user", "function_call", "function_call_output", "assistant", "developer", "user"])
+                         ["message", "function_call", "function_call_output", "message", "message", "message"])
+        self.assertEqual([i.get("role") for i in body["input"] if i["type"] == "message"], ["user", "assistant", "developer", "user"])
 
     def test_chat_roles(self):
         body = doctor.wire("openai-chat", self.CONV, "m")
@@ -223,6 +224,21 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIn("output limit", item["detail"])
         text = doctor.verdict("claude", self.server, self.with_failure(0, "limit"), self.agent())[0]
         self.assertIn("output limit", text)
+
+    def test_empty_answer_after_think_is_model_cause(self):
+        original = doctor.Endpoint.send
+        doctor.Endpoint.send = lambda self, api, body: {"choices": [{"finish_reason": "stop", "message": {"content": "<think>hmm</think>"}}]}
+        try:
+            stages = doctor.protocol_stages("openai-chat", doctor.Endpoint("x", 1), "m")
+        finally:
+            doctor.Endpoint.send = original
+        self.assertEqual((stages[0]["status"], stages[0]["cause"]), (FAIL, "model"))
+
+    def test_suggestions_are_strings_and_causes_set(self):
+        stages = by_name(run_against("text_call"))
+        self.assertIsInstance(stages["tool call"]["suggestion"], str)
+        self.assertEqual(stages["tool call"]["cause"], "protocol")
+        self.assertTrue(all(isinstance(s.get("suggestion", ""), str) for s in stages.values()))
 
     def test_think_blocks_are_stripped(self):
         self.assertEqual(doctor.strip_think("<think>ZEBRA-42 maybe</think>ok"), "ok")

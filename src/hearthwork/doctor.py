@@ -483,6 +483,18 @@ def server_stage(config, remote):
 
 # ---------- agents ----------
 
+def codex_needs_real_home(key):
+    """True for Codex on Windows when the user's Codex uses the elevated sandbox (see agent_stages)."""
+    if key != "codex" or os.name != "nt":
+        return False
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    try:
+        text = (home / "config.toml").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return bool(re.search(r'^\s*sandbox\s*=\s*"elevated"', text, re.M))
+
+
 def agent_stages(key, config, remote, work, coding, context):
     """Stages 3 and 4 for one agent: installed, configuration, headless reply, coding task."""
     from . import bench
@@ -522,7 +534,10 @@ def agent_stages(key, config, remote, work, coding, context):
     def headless(task, folder, timeout, grade=None):
         def check():
             config_dir = Path(work) / f"{key}-config"
-            env = bench.isolated_env(key, config_dir)
+            # Codex's Windows "elevated" sandbox must be set up (with an admin prompt) for each Codex config folder: in a
+            # new, temporary one every command fails. So Codex runs with the user's own settings there, as `hearthwork
+            # codex` does; its two short sessions show up in Codex's history.
+            env = {} if codex_needs_real_home(key) else bench.isolated_env(key, config_dir)
             before = {k: os.environ.get(k) for k in env}
             os.environ.update(env)
             try:
@@ -542,7 +557,10 @@ def agent_stages(key, config, remote, work, coding, context):
                 return FAIL, f"{report['status']}: {short(report.get('error') or '', 200)}", (
                     f"{harness['title']} did not complete the run ({report['status']}). Run "
                     f"`hearthwork task --agent {key} \"Reply with the word ok\"` to see its output, and `hearthwork {key} --dry-run` for its configuration."), "agent"
-            return grade(report, folder) if grade else (OK, f"replied {short(report['message'], 40)!r} in {report['duration_seconds']} s", None)
+            result = grade(report, folder) if grade else (OK, f"replied {short(report['message'], 40)!r} in {report['duration_seconds']} s", None)
+            if env == {} and codex_needs_real_home(key):
+                result = (result[0], result[1] + " (ran with your Codex settings: Windows sandbox)") + tuple(result[2:])
+            return result
         return check
 
     folder = Path(work) / f"{key}-reply"
@@ -650,7 +668,11 @@ def run_doctor(config, agents, quick=False, keep=False, endpoint_override=None):
         report["environment"].setdefault("runningContext", context)
     selected = [a for a in agents]
     report["protocol"], report["agents"] = {}, {}
-    work = tempfile.mkdtemp(prefix="hearthwork-doctor-")
+    # Inside Hearthwork's data folder, like bench runs: Codex's Windows sandbox refuses to write in (or locks)
+    # folders under the system temp directory.
+    from .paths import HOME
+    (HOME / "doctor").mkdir(parents=True, exist_ok=True)
+    work = tempfile.mkdtemp(prefix="run-", dir=HOME / "doctor")
     relay = None
     try:
         if report["server"]["status"] == OK:

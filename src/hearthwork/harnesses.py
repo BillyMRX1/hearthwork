@@ -676,6 +676,7 @@ AIDER_SUFFIX = ("\n\nYou can only create and edit files in this folder; you cann
 #                          "file"), and how to read the final message from the output
 #   session                (optional) reads the session id from a headless run's output, so bench can continue it
 #   suffix                 (optional) closing instruction for `hearthwork task`, instead of the default one
+#   tools                  (optional) False for an agent that never calls tools (Aider): `hearthwork doctor` skips those checks
 #   headless               example flags shown when an agent is started without a terminal
 HARNESSES = {
     "claude": {"title": "Claude Code", "binary": "claude", "version": ["--version"], "api": "anthropic",
@@ -693,7 +694,7 @@ HARNESSES = {
     "aider": {"title": "Aider", "binary": "aider", "version": ["--version"], "api": "openai-chat",
               "install": "uv tool install --python 3.12 aider-chat  (https://aider.chat/docs/install.html)",
               "connects": "OPENAI_API_* env + generated model metadata/settings files", "command": aider_command,
-              "task": aider_task, "prompt": "file", "suffix": AIDER_SUFFIX, "result": result_aider, "headless": '--message "prompt" --yes-always'},
+              "tools": False, "task": aider_task, "prompt": "file", "suffix": AIDER_SUFFIX, "result": result_aider, "headless": '--message "prompt" --yes-always'},
     "qwen": {"title": "Qwen Code", "binary": "qwen", "version": ["--version"], "api": "openai-chat",
              "install": "npm i -g @qwen-code/qwen-code  (https://github.com/QwenLM/qwen-code)",
              "connects": "OPENAI_* env + generated settings file (QWEN_CODE_SYSTEM_SETTINGS_PATH)", "command": qwen_command,

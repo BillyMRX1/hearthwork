@@ -22,14 +22,13 @@ from datetime import datetime
 from pathlib import Path
 
 from . import __version__
+from .context import MIN_CONTEXT
 from .harnesses import API_NAMES, HARNESSES, SECRET, installed, make_relay, preview, url_host
 
 OK, FAIL, SKIP = "pass", "fail", "skip"
 MARK = {OK: "✓", FAIL: "✗", SKIP: "–"}
 SECRET_ANSWER = "ZEBRA-42"
-MIN_CONTEXT = {"claude": 32768, "codex": 24576}  # tokens an agent's own prompt and tools need before any work
-DEFAULT_MIN_CONTEXT = 16384
-MAX_TOKENS = 1024  # thinking models spend part of it before they answer
+MAX_TOKENS = 4096  # thinking models spend part of it before they answer
 PROTOCOL = ["plain reply", "streaming", "tool call", "tool result", "next turn", "late system message"]
 TOOL_STAGES = ("tool call", "tool result", "next turn")
 FILE_TYPES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0", 9: "Q5_1", 10: "Q2_K", 11: "Q3_K_S",
@@ -38,22 +37,32 @@ FILE_TYPES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0", 9:
 
 # ---------- stages ----------
 
-def stage(name, status, seconds=0.0, detail="", suggestion=None):
+def stage(name, status, seconds=0.0, detail="", suggestion=None, cause=None):
+    """cause of a failure: "protocol" (structural: relay/API/template), "model" (capability), "limit" (output limit
+    reached), "agent" (the agent run itself failed)."""
     found = {"name": name, "status": status, "seconds": round(seconds, 1), "detail": detail}
+    if cause and status == FAIL:
+        found["cause"] = cause
     if suggestion and status == FAIL:
         found["suggestion"] = suggestion
     return found
 
 
 def timed(name, check):
-    """Run `check() -> (status, detail, suggestion)` as a stage; an exception is a failed stage."""
+    """Run `check() -> (status, detail, suggestion[, cause])` as a stage; an exception is a failed stage."""
     started = time.time()
+    cause = None
     try:
-        status, detail, suggestion = check()
+        status, detail, suggestion, *rest = check()
+        cause = rest[0] if rest else None
+    except OutputLimit as error:
+        status, detail, cause = FAIL, str(error), "limit"
+        suggestion = ("The reply hit the output limit before it finished (a thinking model can spend it all thinking). "
+                      "This is not a protocol failure; try a model that thinks less, or disable thinking.")
     except (Exception, SystemExit) as error:
         plain = isinstance(error, (SystemExit, ProtocolError))
         status, detail, suggestion = FAIL, str(error) if plain else f"{type(error).__name__}: {error}", None
-    return stage(name, status, time.time() - started, detail, suggestion)
+    return stage(name, status, time.time() - started, detail, suggestion, cause or ("protocol" if status == FAIL else None))
 
 
 # ---------- wire formats ----------
@@ -122,8 +131,35 @@ def wire(api, conv, model, tools=False, stream=False):
     return body
 
 
+def strip_think(text):
+    """`text` without <think>...</think> blocks (and whatever follows an unclosed <think>)."""
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
+    return text.split("<think>")[0]
+
+
+def truncated(api, data):
+    """The reply stopped at the output limit."""
+    if api == "anthropic":
+        return data.get("stop_reason") == "max_tokens"
+    if api == "openai-responses":
+        return data.get("status") == "incomplete"
+    return ((data.get("choices") or [{}])[0]).get("finish_reason") == "length"
+
+
+class OutputLimit(Exception):
+    pass
+
+
 def parse_reply(api, data):
-    """(text, [(id, name, arguments JSON text)]) of a non-streaming reply."""
+    """(text, [(id, name, arguments JSON text)]) of a non-streaming reply, without <think> blocks. Raises OutputLimit
+    when the reply was cut at the output limit before any tool call."""
+    text, calls = _parse_reply(api, data)
+    if truncated(api, data) and not calls:
+        raise OutputLimit("output limit reached: the reply was cut off at max tokens")
+    return strip_think(text), calls
+
+
+def _parse_reply(api, data):
     text, calls = "", []
     if api == "anthropic":
         for block in data.get("content") or []:
@@ -253,8 +289,7 @@ def protocol_stages(api, endpoint, model):
         text, _ = parse_reply(api, endpoint.send(api, wire(api, [("user", "Reply with the word ok.")], model)))
         if not text.strip():
             return FAIL, "HTTP 200 but the reply has no text", (
-                "The model answered with an empty message: raise max tokens, or check the chat template "
-                "(a thinking model may spend everything on thinking). See `hearthwork status` and the server log.")
+                "The model answered with an empty message: check the chat template and the server log (`hearthwork status`).")
         return OK, f"reply: {short(text, 40)!r}", None
 
     def streaming():
@@ -285,12 +320,12 @@ def protocol_stages(api, endpoint, model):
                 state["call"] = (call_id or "call_1", name, json.dumps(parsed))
                 return OK, f"get_secret({json.dumps(parsed)})", None
             return FAIL, f"tool call {name}({short(arguments, 40)}) does not ask for 'alpha'", (
-                "The model called the tool with the wrong name or arguments: a capability limit of the model.")
+                "The model called the tool with the wrong name or arguments: a capability limit of the model.", "model")
         if LOOKS_LIKE_CALL.search(text):
             return FAIL, f"the call came back as text: {short(text, 80)!r}", TEXT_CALL
         return FAIL, f"no tool call; the model answered in text: {short(text, 60)!r}", (
             "The model did not call the offered tool. Check that the server runs with --jinja (Hearthwork does) and "
-            "that the model supports tool use; otherwise it is a model capability limit.")
+            "that the model supports tool use; otherwise it is a model capability limit.", "model")
 
     def tool_result():
         conv = state["conv"] + [("call", *state["call"]), ("result", state["call"][0], SECRET_ANSWER)]
@@ -299,7 +334,7 @@ def protocol_stages(api, endpoint, model):
         if SECRET_ANSWER not in text:
             return FAIL, f"final text lacks {SECRET_ANSWER}: {short(text, 60)!r}", (
                 "After the tool result the model did not use it: the tool result may be dropped by the chat template "
-                "(role mapping) or the model ignores it. Check the template with the Environment fingerprint.")
+                "(role mapping) or the model ignores it. Check the template with the Environment fingerprint.", "model")
         return OK, "answer contains the tool result", None
 
     def next_turn():
@@ -308,7 +343,7 @@ def protocol_stages(api, endpoint, model):
         if SECRET_ANSWER not in text:
             return FAIL, f"second turn lacks {SECRET_ANSWER}: {short(text, 60)!r}", (
                 "The history with the tool call and result is not carried into the next turn: a chat template "
-                "problem with tool messages in history.")
+                "problem with tool messages in history, or the model forgot the answer.", "model")
         return OK, "history with the tool call survives", None
 
     def late_system():
@@ -430,17 +465,20 @@ def server_stage(config, remote):
             f"No model server on port {port}. Start one with `hearthwork start`, or point Hearthwork at another "
             "computer with `hearthwork connect`.")
 
+    got = {}
+
     def remote_check():
         from .remote import RemoteError, session
         try:
             name, context = session(config)
+            got["context"] = context
         except RemoteError as error:
             return FAIL, short(str(error), 300), str(error).splitlines()[-1] if "\n" in str(error) else (
                 "Run `hearthwork connect` to pair again, or `hearthwork disconnect` to go back to local models.")
         return OK, f"{name} on {config['remote'].get('hostName') or config['remote']['host']} ({config['remote'].get('via')})", None
 
     item = timed("server", remote_check if remote else local)
-    return item
+    return item, got.get("context")
 
 
 # ---------- agents ----------
@@ -462,18 +500,20 @@ def agent_stages(key, config, remote, work, coding, context):
 
     def configuration():
         nonlocal context
-        context = context or agent_context(config)
-        need = MIN_CONTEXT.get(key, DEFAULT_MIN_CONTEXT)
+        if not context and not remote:
+            context = agent_context(config)
+        need = MIN_CONTEXT
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            preview(key, "doctor-model", context, remote=remote)
+            preview(key, "doctor-model", context or 32768, remote=remote)
         text = out.getvalue()
         if remote and remote["key"] in text:
             return FAIL, "the dry run would print the device key", "Bug in the dry-run masking; please report."
         if context and context < need:
-            return FAIL, f"context {context:,} is below the {need:,} {harness['title']} needs", (
+            return FAIL, f"context {context:,} is below Hearthwork's minimum of {need:,}", (
                 f"The model runs with {context:,} tokens of context, too little for {harness['title']}'s own prompt and "
-                f"tools. Raise it: `hearthwork context` (then restart the model), needs at least {need // 1024}K.")
-        return OK, f"builds ({len(text.splitlines())} lines of dry run, secrets masked), context {context:,}", None
+                f"tools (Hearthwork's minimum is {need // 1024}K). Raise it with `hearthwork context`, then restart the model"
+                + (" (on the host computer)." if remote else "."))
+        return OK, f"builds ({len(text.splitlines())} lines of dry run, secrets masked), context {context or '?'}", None
 
     found.append(timed("configuration", configuration))
     if found[-1]["status"] != OK:
@@ -497,7 +537,7 @@ def agent_stages(key, config, remote, work, coding, context):
             if report["status"] != "ok":
                 return FAIL, f"{report['status']}: {short(report.get('error') or '', 200)}", (
                     f"{harness['title']} did not complete the run ({report['status']}). Run "
-                    f"`hearthwork task --agent {key} \"Reply with the word ok\"` to see its output, and `hearthwork {key} --dry-run` for its configuration.")
+                    f"`hearthwork task --agent {key} \"Reply with the word ok\"` to see its output, and `hearthwork {key} --dry-run` for its configuration.", "agent")
             return grade(report, folder) if grade else (OK, f"replied {short(report['message'], 40)!r} in {report['duration_seconds']} s", None)
         return check
 
@@ -521,7 +561,7 @@ def agent_stages(key, config, remote, work, coding, context):
             return OK, f"calc.add(2, 3) == 5 in {report['duration_seconds']} s", None
         return FAIL, f"graded by Hearthwork: {short(output.splitlines()[-1] if output.strip() else 'no calc.py created', 120)}", (
             "The protocol works, but the model did not solve the coding task: a capability limit of this model "
-            f"(or its quantization), not a configuration problem. Try a larger model; compare with `hearthwork bench --agent {key}`.")
+            f"(or its quantization), not a configuration problem. Try a larger model; compare with `hearthwork bench --agent {key}`.", "model")
 
     found.append(timed("coding task", headless(text, str(folder), 600, grade)))
     return found
@@ -534,20 +574,31 @@ def uses_tools(key):
 # ---------- verdicts ----------
 
 def verdict(key, server, protocol, agent):
-    """(text, failing stage name or None) for one agent. `protocol` are the stages of its API."""
+    """(text, failing stage name or None) for one agent. `protocol` are the stages of its API. Only structural
+    failures (cause "protocol") are protocol problems; a wrong answer is the model's capability."""
     api = API_NAMES[HARNESSES[key]["api"]]
     relevant = [s for s in protocol if uses_tools(key) or s["name"] not in TOOL_STAGES]
-    ordered = [("configuration/connection problem", [server] + [s for s in agent if s["name"] in ("installed", "configuration")]),
-               ("protocol problem", relevant),
-               ("configuration/connection problem", [s for s in agent if s["name"] == "headless reply"]),
-               ("coding", [s for s in agent if s["name"] == "coding task"])]
-    for kind, items in ordered:
+    named = lambda name: [s for s in agent if s["name"] == name]
+    structural = [s for s in relevant if s.get("cause", "protocol") == "protocol"]
+    capability = [s for s in relevant if s.get("cause") in ("model", "limit")]
+    coding = named("coding task")
+    for text, items in (("configuration/connection problem at {}", [server] + named("installed") + named("configuration")),
+                        ("protocol problem at {} (" + api + ")", structural),
+                        ("configuration/connection problem at {}", named("headless reply")),
+                        ("configuration/connection problem at {}", [s for s in coding if s.get("cause") != "model"])):
         for item in items:
             if item["status"] == FAIL:
-                if kind == "coding":
-                    return "protocol OK, but the model failed the coding task (model capability)", item["name"]
-                where = f"{item['name']} ({api})" if kind == "protocol problem" else item["name"]
-                return f"{kind} at {where}", item["name"]
+                name = item["name"]
+                if item["name"] == "coding task":
+                    name += f" ({item['detail'].split(':')[0]})"  # timeout vs error
+                return text.format(name), item["name"]
+    for item in capability:
+        if item["status"] == FAIL:
+            what = "hit the output limit" if item["cause"] == "limit" else "failed"
+            return f"protocol OK, but the model {what} at {item['name']} (model capability)", item["name"]
+    for item in coding:
+        if item["status"] == FAIL:
+            return "protocol OK, but the model failed the coding task (model capability)", item["name"]
     if any(s["status"] == SKIP and s["name"] != "coding task" for s in agent):
         return "not checked", None
     return "works", None
@@ -573,8 +624,15 @@ def run_doctor(config, agents, quick=False, keep=False, endpoint_override=None):
     remote = config.get("remote")
     started = time.time()
     report = {"time": datetime.now().isoformat(timespec="seconds"), "mode": "remote" if remote else "local"}
-    report["server"] = server_stage(config, remote)
-    report["environment"] = environment(config, remote) if report["server"]["status"] == OK else {"hearthwork": __version__, "os": platform.platform()}
+    report["server"], context = server_stage(config, remote)
+    report["environment"] = {"hearthwork": __version__, "os": platform.platform()}
+    if report["server"]["status"] == OK:
+        try:
+            report["environment"] = environment(config, remote)
+        except Exception as error:
+            report["environment"]["error"] = f"could not collect the environment: {type(error).__name__}: {error}"
+    if context:
+        report["environment"].setdefault("runningContext", context)
     selected = [a for a in agents]
     report["protocol"], report["agents"] = {}, {}
     work = tempfile.mkdtemp(prefix="hearthwork-doctor-")
@@ -598,7 +656,7 @@ def run_doctor(config, agents, quick=False, keep=False, endpoint_override=None):
             if report["server"]["status"] != OK:
                 agent = [stage("not run", SKIP, 0, "the model server check failed")]
             else:
-                agent = agent_stages(key, config, remote, work, not quick, report["environment"].get("runningContext"))
+                agent = agent_stages(key, config, remote, work, not quick, context or report["environment"].get("runningContext"))
             protocol = report["protocol"].get(harness["api"], [])
             text, at = verdict(key, report["server"], protocol, agent)
             report["agents"][key] = {"title": harness["title"], "api": harness["api"], "version": None, "stages": agent,
@@ -643,7 +701,7 @@ def format_report(report):
     labels = [("hearthwork", "hearthwork"), ("os", "OS"), ("runtime", "runtime"), ("modelFile", "model file"), ("model", "model"),
               ("quantization", "quantization"), ("architecture", "architecture"), ("trainedContext", "trained context"),
               ("chatTemplate", "template fingerprint"), ("runningContext", "running context"), ("slots", "slots"),
-              ("host", "host"), ("route", "route"), ("hostVersion", "host version")]
+              ("host", "host"), ("route", "route"), ("hostVersion", "host version"), ("error", "environment")]
     lines = ["Hearthwork doctor", ""]
     lines += [f"  {label.ljust(20)} {env[key]:,}" if isinstance(env.get(key), int) and key in ("trainedContext", "runningContext")
               else f"  {label.ljust(20)} {env[key]}" for key, label in labels if env.get(key) not in (None, "")]

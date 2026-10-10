@@ -129,7 +129,7 @@ class VerdictTests(unittest.TestCase):
 
     def agent(self, **status):
         names = ["installed", "configuration", "headless reply", "coding task"]
-        return [doctor.stage(n, status.get(n.replace(" ", "_"), OK)) for n in names]
+        return [doctor.stage(n, status.get(n.replace(" ", "_"), OK), cause="model") for n in names]
 
     def test_works(self):
         self.assertEqual(doctor.verdict("claude", self.server, self.good, self.agent())[0], "works")
@@ -172,3 +172,82 @@ class SecretTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFixTests(unittest.TestCase):
+    good = [doctor.stage(n, OK) for n in doctor.PROTOCOL]
+    server = doctor.stage("server", OK)
+
+    def agent(self, coding=None):
+        found = [doctor.stage(n, OK) for n in ("installed", "configuration", "headless reply")]
+        return found + [coding or doctor.stage("coding task", OK)]
+
+    def with_failure(self, index, cause):
+        stages = [dict(s) for s in self.good]
+        stages[index].update(status=FAIL, cause=cause)
+        return stages
+
+    def test_context_policy_is_the_shared_minimum(self):
+        from hearthwork import context
+        self.assertIs(doctor.MIN_CONTEXT, context.MIN_CONTEXT)
+
+    def test_model_cause_is_capability_not_protocol(self):
+        text = doctor.verdict("claude", self.server, self.with_failure(2, "model"), self.agent())[0]
+        self.assertEqual(text, "protocol OK, but the model failed at tool call (model capability)")
+
+    def test_protocol_cause_is_protocol(self):
+        text = doctor.verdict("claude", self.server, self.with_failure(1, "protocol"), self.agent())[0]
+        self.assertEqual(text, "protocol problem at streaming (Anthropic Messages)")
+
+    def test_wrong_tool_args_and_text_answer_are_model_causes(self):
+        for mode, expected in (("text_call", "protocol"),):
+            stages = by_name(run_against(mode))
+            self.assertEqual(stages["tool call"]["cause"], expected)
+
+    def test_coding_run_error_vs_grader_failure(self):
+        crashed = doctor.stage("coding task", FAIL, 0, "timeout: timed out after 600 s", "x", "agent")
+        self.assertEqual(doctor.verdict("claude", self.server, self.good, self.agent(crashed))[0],
+                         "configuration/connection problem at coding task (timeout)")
+        graded = doctor.stage("coding task", FAIL, 0, "graded", "x", "model")
+        self.assertIn("model capability", doctor.verdict("claude", self.server, self.good, self.agent(graded))[0])
+
+    def test_truncation_detected_per_api(self):
+        self.assertTrue(doctor.truncated("anthropic", {"stop_reason": "max_tokens"}))
+        self.assertTrue(doctor.truncated("openai-chat", {"choices": [{"finish_reason": "length"}]}))
+        self.assertTrue(doctor.truncated("openai-responses", {"status": "incomplete"}))
+        self.assertFalse(doctor.truncated("openai-chat", {"choices": [{"finish_reason": "stop"}]}))
+        with self.assertRaises(doctor.OutputLimit):
+            doctor.parse_reply("openai-chat", {"choices": [{"finish_reason": "length", "message": {"content": "x"}}]})
+        item = doctor.timed("plain reply", lambda: doctor.parse_reply("anthropic", {"stop_reason": "max_tokens", "content": []}))
+        self.assertEqual(item["cause"], "limit")
+        self.assertIn("output limit", item["detail"])
+        text = doctor.verdict("claude", self.server, self.with_failure(0, "limit"), self.agent())[0]
+        self.assertIn("output limit", text)
+
+    def test_think_blocks_are_stripped(self):
+        self.assertEqual(doctor.strip_think("<think>ZEBRA-42 maybe</think>ok"), "ok")
+        self.assertEqual(doctor.strip_think("answer<think>ZEBRA-42 unfinished"), "answer")
+        text, _ = doctor.parse_reply("openai-chat", {"choices": [{"message": {"content": "<think>ZEBRA-42</think>nope"}}]})
+        self.assertNotIn("ZEBRA-42", text)
+
+    def test_remote_never_asks_for_local_context(self):
+        from unittest import mock
+        config = {"remote": {"host": "h", "port": 1, "key": "k"}}
+        with mock.patch("hearthwork.remote.session", return_value=("m", 131072)):
+            item, context = doctor.server_stage(config, config["remote"])
+        self.assertEqual((item["status"], context), (OK, 131072))
+
+    def test_environment_failure_is_recorded_and_run_continues(self):
+        from unittest import mock
+        config = {"server": {"port": 1}}
+        relay = mock.Mock(server_address=("127.0.0.1", 1))
+        with mock.patch.object(doctor, "server_stage", return_value=(doctor.stage("server", OK), None)), \
+                mock.patch.object(doctor, "environment", side_effect=RuntimeError("boom")), \
+                mock.patch.object(doctor, "make_relay", return_value=relay), \
+                mock.patch.object(doctor, "protocol_stages", return_value=[]), \
+                mock.patch.object(doctor, "agent_stages", return_value=[]):
+            report = doctor.run_doctor(config, ["claude"], quick=True)
+        self.assertIn("boom", report["environment"]["error"])
+        with mock.patch.object(doctor, "server_stage", return_value=(doctor.stage("server", FAIL, 0, "x", "y"), None)):
+            report = doctor.run_doctor(config, ["claude"], quick=True)
+        self.assertEqual(report["agents"]["claude"]["verdict"], "configuration/connection problem at server")

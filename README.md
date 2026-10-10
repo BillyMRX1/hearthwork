@@ -224,6 +224,23 @@ Runs every installed agent one after another (never in parallel, which would sta
 | Qwen3.5-35B-A3B-Q4_K_M | Claude Code | 8.0/8 | 3.0 min |
 | Qwen3.5-35B-A3B-Q4_K_M | Codex | 8.0/8 | 3.3 min |
 
+## Compatibility doctor: `hearthwork doctor`
+
+When an agent misbehaves, `hearthwork doctor` tells you which layer is at fault: the connection, the API protocol, the agent's configuration, or the model itself.
+
+```
+hearthwork doctor [--agent NAME | --all] [--quick] [--json] [--keep]
+```
+
+It prints the environment (Hearthwork and llama.cpp versions, model, quantization, architecture, trained and running context, chat template fingerprint), then runs these stages and gives one verdict per agent:
+
+1. **Server**: the model server answers and serves a model (on a remote host, also that the device is still trusted).
+2. **Protocol**, once per API the agents use, through the same relay the agents use: plain reply, streaming (with its end event), a tool call, a tool result round trip, the next turn with the tool history, and a late system message.
+3. **Agent**: installed (with version), its configuration builds, and a headless reply in a disposable folder with its own temporary config (yours is never touched).
+4. **Coding task** (skipped by `--quick`): the agent creates `calc.py` with `add(a, b)`; Hearthwork imports it and checks `add(2, 3) == 5` itself.
+
+Verdicts: `works`, `configuration/connection problem at <stage>`, `protocol problem at <stage> (<API>)`, or `protocol OK, but the model failed the coding task (model capability)`. Failed stages come with numbered, specific suggestions. Aider never calls tools, so the tool stages do not count for it. The exit code is 0 when everything passes. Each run is saved as JSON (no credentials) in `doctor/<timestamp>.json` in the data folder, and `--json` prints it.
+
 ## Agents
 
 `hearthwork agents` shows which are installed (with version), the API each speaks, how Hearthwork connects it, and the install command of the missing ones. Every agent works the same way in `hearthwork <agent> [args]`, the menu, `hearthwork task --agent <agent>`, the MCP tools, remote mode (`share` / `connect`) and `bench`. The context window and output limit each agent is told come from the running server (or the shared one).

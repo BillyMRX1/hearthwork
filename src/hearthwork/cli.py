@@ -21,6 +21,7 @@
   hearthwork model <link>       download a GGUF model from Hugging Face
   hearthwork bench [--agent X]  8 graded coding tasks through an agent, with a scoreboard
   hearthwork bench --all        release check: every installed agent in turn, after a warmup, with a summary table
+  hearthwork doctor [--agent X] [--quick] [--json]   server, API protocol and agent checks; says which layer is at fault
   hearthwork check              is this computer suited, and which models fit
   hearthwork runtime            llama.cpp engines: list, install <name>, use <name>, update, rollback
   hearthwork setup              hardware check, llama.cpp download/update, models folder
@@ -196,6 +197,9 @@ def main(argv=None):
         elif command == "disconnect":
             from . import remote
             sys.exit(remote.disconnect_main())
+        elif command == "doctor":
+            from . import doctor
+            sys.exit(doctor.main(rest))
         elif command == "check":
             from . import check
             check.main(rest)

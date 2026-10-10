@@ -24,7 +24,7 @@ import threading
 import time
 
 from .harnesses import HARNESSES, installed, prepare, preview
-from .procs import kill_tree, new_group_flags, overload_warning, parallel_slots, register_task, running_tasks, setup_stdio, utf8_stream
+from .procs import kill_tree, mark_shared, new_group_flags, overload_warning, parallel_slots, register_task, running_tasks, setup_stdio, shared_since, utf8_stream
 
 SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__"}
 MAX_FILES = 5000
@@ -174,8 +174,12 @@ def dry_run_task(config, task, agent, allow, cwd=None):
 
 
 def other_tasks_in(folder):
-    """True if another Hearthwork task (not this process) is registered as working in `folder`."""
-    return any(pid != os.getpid() for pid in running_tasks(folder=folder))
+    """True if another Hearthwork task (not this process) is registered as working in `folder`; such a sighting is
+    also recorded, so that a task which is still running later can tell that it overlapped with another one."""
+    others = any(pid != os.getpid() for pid in running_tasks(folder=folder))
+    if others:
+        mark_shared(folder)
+    return others
 
 
 def run_task(config, task, agent="claude", allow=(), cwd=None, timeout=900):
@@ -206,13 +210,16 @@ def run_task(config, task, agent="claude", allow=(), cwd=None, timeout=900):
             sys.exit(1)
         command, env = prepared
         log(f"hearthwork task: {HARNESSES[agent]['title']} with {model} ({host}) in {folder}")
-        shared = other_tasks_in(folder)  # snapshots cannot tell apart changes of other tasks in the same folder
+        # snapshots cannot tell apart changes of other tasks in the same folder, so note when others were seen there
+        task_started = time.time()
+        shared = other_tasks_in(folder)
         before = snapshot(folder)
         started = time.time()
         returncode, out, err, timed_out = run_process(command, env, folder, stdin_text, timeout)
         duration = time.time() - started
         after = snapshot(folder)
-        shared = shared or other_tasks_in(folder)
+        marked = shared_since(folder)  # another task seen here at any time since this one started (even if it ended)
+        shared = shared or other_tasks_in(folder) or (marked is not None and marked >= task_started)
         message, error = parse_result(agent, out, err, returncode, last_message)
     finally:
         for path in temporary:

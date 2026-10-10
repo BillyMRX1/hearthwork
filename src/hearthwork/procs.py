@@ -1,15 +1,19 @@
 """Process helpers shared by `hearthwork task` and `hearthwork mcp`: parallel-session limit, a registry of running tasks,
 killing process trees (and, on Windows, a Job Object so children die with the MCP server), UTF-8 console setup."""
 import atexit
+import contextlib
+import hashlib
 import os
 import signal
 import subprocess
 import sys
+import time
 
 from .paths import HOME
 
 DEFAULT_SLOTS = 2
-TASKS_DIR = HOME / "tasks"  # one empty file per running `hearthwork task`, named by PID
+TASKS_DIR = HOME / "tasks"  # one empty file per running `hearthwork task`, named by PID; shared-<hash>.txt markers
+SHARED_MARK_AGE = 24 * 3600  # seconds
 
 
 # ---------- how many tasks may run at once ----------
@@ -74,9 +78,37 @@ def register_task(directory=None, pid=None, folder=None):
         directory.mkdir(parents=True, exist_ok=True)
         path.write_text(_folder_key(folder) if folder else "", encoding="utf-8")
         atexit.register(lambda: path.unlink(missing_ok=True))
+        cutoff = time.time() - SHARED_MARK_AGE
+        for mark in directory.glob("shared-*.txt"):
+            with contextlib.suppress(OSError):
+                if mark.stat().st_mtime < cutoff:
+                    mark.unlink()
     except OSError:
         pass
     return path
+
+
+def _mark_path(folder, directory=None):
+    digest = hashlib.sha256(_folder_key(folder).encode("utf-8")).hexdigest()[:16]
+    return (directory or TASKS_DIR) / f"shared-{digest}.txt"
+
+
+def mark_shared(folder, directory=None):
+    """Record (overwriting) the current time as the last moment another task was seen in `folder`."""
+    path = _mark_path(folder, directory)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(repr(time.time()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def shared_since(folder, directory=None):
+    """Time of the last `mark_shared` for `folder`, or None."""
+    try:
+        return float(_mark_path(folder, directory).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 def running_tasks(directory=None, alive=pid_alive, folder=None):
@@ -90,6 +122,8 @@ def running_tasks(directory=None, alive=pid_alive, folder=None):
         return found
     wanted = _folder_key(folder) if folder else None
     for entry in entries:
+        if entry.name.startswith("shared-"):  # markers of shared folders, not task entries
+            continue
         if entry.name.isdigit() and alive(int(entry.name)):
             if wanted is not None:
                 try:

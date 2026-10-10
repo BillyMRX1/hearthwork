@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -227,6 +228,13 @@ class EncodingTests(unittest.TestCase):
 
 
 class SharedFolderTests(unittest.TestCase):
+    def setUp(self):  # markers must not land in the real registry
+        registry = tempfile.TemporaryDirectory()
+        self.addCleanup(registry.cleanup)
+        patcher = mock.patch.object(procs, "TASKS_DIR", Path(registry.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_other_tasks_in_ignores_own_pid(self):
         with mock.patch.object(task, "running_tasks", return_value=[os.getpid()]) as running:
             self.assertFalse(task.other_tasks_in("/work"))
@@ -252,6 +260,59 @@ class SharedFolderTests(unittest.TestCase):
         text = task.format_report(dict(base, sharedFolder=True))
         self.assertIn(note, text)
         self.assertLess(text.index("created:"), text.index(note))
+
+    def _run_outer_task(self, folder, registry, clock, live, inner):
+        """Run task A (started at clock 100) whose process runs `inner` in the middle; returns A's report."""
+        fake_clock = types.SimpleNamespace(time=lambda: clock[0])
+        def run_process(*args, **kwargs):
+            inner()
+            return (0, "", "", False)
+        with mock.patch.object(procs, "TASKS_DIR", Path(registry)), \
+                mock.patch.object(task, "time", fake_clock), mock.patch.object(procs, "time", fake_clock), \
+                mock.patch.object(task, "installed", return_value=True), \
+                mock.patch.object(task, "model_for_task", return_value=(8080, "m", None, None)), \
+                mock.patch.object(task, "prepare", return_value=(["x"], {})), \
+                mock.patch.object(task, "run_process", side_effect=run_process), \
+                mock.patch.object(task, "parse_result", return_value=("done", None)), \
+                mock.patch.object(task, "running_tasks", side_effect=lambda folder=None: list(live)):
+            return task.run_task({}, "do it", "claude", (), folder)
+
+    def test_nested_short_task_marks_the_outer_one(self):
+        # A starts at 100 with nobody else there; B runs entirely inside A (200 to 250) and sees A.
+        clock, live = [100.0], []
+        with tempfile.TemporaryDirectory() as registry, tempfile.TemporaryDirectory() as folder:
+            def inner_b():
+                clock[0] = 200.0
+                live.append(1001)  # task A, seen from B
+                self.assertTrue(task.other_tasks_in(folder))  # B's start check, marks 200
+                live.clear()  # B has ended
+                clock[0] = 250.0
+            report = self._run_outer_task(folder, registry, clock, live, inner_b)
+            self.assertTrue(report["sharedFolder"])
+            # the marker is not mistaken for a task entry by the registry
+            self.assertEqual(procs.running_tasks(Path(registry), alive=lambda pid: False), [])
+            self.assertEqual(len(list(Path(registry).glob("shared-*.txt"))), 1)
+
+    def test_marker_from_before_this_task_does_not_count(self):
+        clock, live = [100.0], []
+        with tempfile.TemporaryDirectory() as registry, tempfile.TemporaryDirectory() as folder:
+            with mock.patch.object(procs, "TASKS_DIR", Path(registry)), mock.patch.object(procs, "time",
+                                                                                     types.SimpleNamespace(time=lambda: 50.0)):
+                procs.mark_shared(folder)  # written at 50, before A started
+            report = self._run_outer_task(folder, registry, clock, live, lambda: None)
+            self.assertNotIn("sharedFolder", report)
+
+    def test_old_markers_are_cleaned_on_register(self):
+        with tempfile.TemporaryDirectory() as registry, tempfile.TemporaryDirectory() as folder:
+            directory = Path(registry)
+            old = directory / "shared-old.txt"
+            old.write_text("1.0")
+            os.utime(old, (time.time() - 2 * 86400, time.time() - 2 * 86400))
+            fresh = directory / "shared-fresh.txt"
+            fresh.write_text("2.0")
+            procs.register_task(directory, pid=5, folder=folder)
+            self.assertFalse(old.exists())
+            self.assertTrue(fresh.exists())
 
     def test_run_task_flags_shared_folder(self):
         with tempfile.TemporaryDirectory() as folder, \

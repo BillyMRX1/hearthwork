@@ -1,4 +1,5 @@
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from hearthwork import api
@@ -117,6 +118,32 @@ class SwitchTests(unittest.TestCase):
         h = FakeHandler("GET", "/v1/models")
         self.assertTrue(a.intercept(h))
         self.assertEqual(h.sent[1]["data"][0]["id"], "Qwen3.5-35B-A3B-Q4")
+
+
+class SnippetTests(unittest.TestCase):
+    def test_windows_shows_powershell_not_curl(self):
+        text = api.snippets(8080, "KEY", "MODEL", windows=True)
+        self.assertNotIn("curl", text)
+        self.assertNotIn('\\"', text)
+        self.assertIn('$h = @{ Authorization = "Bearer KEY" }', text)
+        self.assertIn('Invoke-RestMethod http://127.0.0.1:8080/v1/chat/completions', text)
+        self.assertIn('model = "MODEL"; messages', text)
+        self.assertIn('$h = @{ "x-api-key" = "KEY" }', text)
+        self.assertIn("max_tokens = 300", text)
+        self.assertIn('Invoke-RestMethod http://127.0.0.1:8080/v1/messages', text)
+        self.assertIn('Where-Object type -eq "text" | Select-Object -ExpandProperty text', text)
+
+    def test_unix_keeps_curl(self):
+        text = api.snippets(8080, None, "MODEL", windows=False)
+        self.assertIn("curl http://127.0.0.1:8080/v1/chat/completions", text)
+        self.assertIn("curl http://127.0.0.1:8080/v1/messages", text)
+        self.assertNotIn("PowerShell", text)
+
+    def test_default_follows_os_name(self):
+        with unittest.mock.patch.object(api.os, "name", "nt"):
+            self.assertIn("PowerShell (OpenAI)", api.snippets(1, None, "M"))
+        with unittest.mock.patch.object(api.os, "name", "posix"):
+            self.assertIn("curl (OpenAI)", api.snippets(1, None, "M"))
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import argparse
 import hmac
 import io
 import json
+import os
 import re
 import threading
 import time
@@ -198,8 +199,28 @@ def start_last_model(config):
 
 # ---------- setup snippets ----------
 
-def snippets(port, key, model):
+def snippets(port, key, model, windows=None):
     base, token = f"http://127.0.0.1:{port}", key or "local"
+    if windows is None:
+        windows = os.name == "nt"
+    if windows:  # curl.exe in Windows PowerShell 5.1 mangles the \" quotes in -d, so show PowerShell instead
+        examples = f"""PowerShell (OpenAI)
+  $h = @{{ Authorization = "Bearer {token}" }}
+  $body = @{{ model = "{model}"; messages = @(@{{ role = "user"; content = "Hello" }}) }} | ConvertTo-Json -Depth 5
+  (Invoke-RestMethod {base}/v1/chat/completions -Method Post -Headers $h -ContentType "application/json" -Body $body).choices[0].message.content
+
+PowerShell (Anthropic)
+  $h = @{{ "x-api-key" = "{token}" }}
+  $body = @{{ model = "{model}"; max_tokens = 300; messages = @(@{{ role = "user"; content = "Hello" }}) }} | ConvertTo-Json -Depth 5
+  (Invoke-RestMethod {base}/v1/messages -Method Post -Headers $h -ContentType "application/json" -Body $body).content | Where-Object type -eq "text" | Select-Object -ExpandProperty text"""
+    else:
+        examples = f"""curl (OpenAI)
+  curl {base}/v1/chat/completions -H "Authorization: Bearer {token}" -H "Content-Type: application/json" \\
+    -d '{{"model": "{model}", "messages": [{{"role": "user", "content": "Hi"}}]}}'
+
+curl (Anthropic)
+  curl {base}/v1/messages -H "x-api-key: {token}" -H "anthropic-version: 2023-06-01" -H "Content-Type: application/json" \\
+    -d '{{"model": "{model}", "max_tokens": 512, "messages": [{{"role": "user", "content": "Hi"}}]}}'"""
     return f"""Hearthwork API: {base}   model: {model}   (this computer only; other devices: `hearthwork share`)
 The model name is free: any name uses the running model{{switch_note}}.
 
@@ -213,13 +234,7 @@ Anthropic Python SDK
   client = Anthropic(base_url="{base}", auth_token="{token}")
   print(client.messages.create(model="{model}", max_tokens=512, messages=[{{"role": "user", "content": "Hi"}}]).content[0].text)
 
-curl (OpenAI)
-  curl {base}/v1/chat/completions -H "Authorization: Bearer {token}" -H "Content-Type: application/json" \\
-    -d '{{"model": "{model}", "messages": [{{"role": "user", "content": "Hi"}}]}}'
-
-curl (Anthropic)
-  curl {base}/v1/messages -H "x-api-key: {token}" -H "anthropic-version: 2023-06-01" -H "Content-Type: application/json" \\
-    -d '{{"model": "{model}", "max_tokens": 512, "messages": [{{"role": "user", "content": "Hi"}}]}}'
+{examples}
 
 Environment variables
   OPENAI_BASE_URL={base}/v1   OPENAI_API_KEY={token}

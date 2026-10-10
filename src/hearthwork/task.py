@@ -173,6 +173,11 @@ def dry_run_task(config, task, agent, allow, cwd=None):
                  + ("on stdin." if prompt == "stdin" else "in a temporary file (<task-file>)."))
 
 
+def other_tasks_in(folder):
+    """True if another Hearthwork task (not this process) is registered as working in `folder`."""
+    return any(pid != os.getpid() for pid in running_tasks(folder=folder))
+
+
 def run_task(config, task, agent="claude", allow=(), cwd=None, timeout=900):
     """Run one task and return the report dict."""
     folder = os.path.abspath(cwd or os.getcwd())
@@ -201,11 +206,13 @@ def run_task(config, task, agent="claude", allow=(), cwd=None, timeout=900):
             sys.exit(1)
         command, env = prepared
         log(f"hearthwork task: {HARNESSES[agent]['title']} with {model} ({host}) in {folder}")
+        shared = other_tasks_in(folder)  # snapshots cannot tell apart changes of other tasks in the same folder
         before = snapshot(folder)
         started = time.time()
         returncode, out, err, timed_out = run_process(command, env, folder, stdin_text, timeout)
         duration = time.time() - started
         after = snapshot(folder)
+        shared = shared or other_tasks_in(folder)
         message, error = parse_result(agent, out, err, returncode, last_message)
     finally:
         for path in temporary:
@@ -217,9 +224,12 @@ def run_task(config, task, agent="claude", allow=(), cwd=None, timeout=900):
     created, modified, deleted = diff_snapshots(before, after)
     if status == "ok" and not (message or "").strip() and not (created or modified or deleted):
         status, error = "no_result", "no result: the agent produced no final message and changed no files"
-    return {"agent": agent, "model": model, "host": host, "cwd": folder, "duration_seconds": round(duration, 1),
-            "status": status, "exit_code": returncode, "error": error, "created": created, "modified": modified,
-            "deleted": deleted, "files_capped": len(before) >= MAX_FILES or len(after) >= MAX_FILES, "message": message or ""}
+    report = {"agent": agent, "model": model, "host": host, "cwd": folder, "duration_seconds": round(duration, 1),
+              "status": status, "exit_code": returncode, "error": error, "created": created, "modified": modified,
+              "deleted": deleted, "files_capped": len(before) >= MAX_FILES or len(after) >= MAX_FILES, "message": message or ""}
+    if shared:
+        report["sharedFolder"] = True
+    return report
 
 
 def format_report(report):
@@ -235,6 +245,8 @@ def format_report(report):
         lines.append(f"error: {report['error']}")
     changes = files("created", report["created"]) + files("modified", report["modified"]) + files("deleted", report["deleted"])
     lines += changes or ["files: no changes"]
+    if report.get("sharedFolder"):
+        lines.append("Note: other Hearthwork tasks ran in this folder at the same time; this list may include their changes.")
     if report.get("files_capped"):
         lines.append(f"(only the first {MAX_FILES} files were compared)")
     lines += ["", "final message:", report["message"] or "(none)"]
@@ -275,7 +287,7 @@ def main(argv):
         warning = overload_warning(len(running_tasks()), parallel_slots(config))
         if warning:
             log(warning)
-    register_task()
+    register_task(folder=os.path.abspath(args.cwd or os.getcwd()))
     report = run_task(config, task, args.agent, args.allow, args.cwd, args.timeout)
     print(json.dumps(report, indent=2, ensure_ascii=not utf8_stream(sys.stdout)) if args.json else format_report(report), flush=True)
     return exit_code(report)

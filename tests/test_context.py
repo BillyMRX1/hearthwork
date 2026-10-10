@@ -2,6 +2,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from hearthwork import context as ctx
 
@@ -183,6 +184,27 @@ class Header(unittest.TestCase):
                 (Path(tmp) / name).write_bytes(data)
                 self.assertIsNone(ctx.model_info(Path(tmp) / name))
             self.assertIsNone(ctx.model_info(Path(tmp) / "missing.gguf"))
+
+
+class FindModels(unittest.TestCase):
+    def test_skips_files_with_readable_metadata_but_no_context_length(self):
+        from hearthwork import onboard
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            chat = root / "Chat-Q4.gguf"
+            speech = root / "Nemotron-3-Diarization.q8_0.gguf"
+            unreadable = root / "Broken.gguf"
+            for path in (chat, speech, unreadable):
+                path.write_bytes(b"")
+            infos = {chat: {"arch": "llama", "modelMax": 8192, "layers": 32, "kvPerToken": 1},
+                     speech: {"arch": "speech", "modelMax": None, "layers": None, "kvPerToken": None}}
+
+            def fake_info(path, kv_type="q8_0"):
+                return infos.get(path)  # None for the unreadable file
+
+            with mock.patch.object(onboard, "model_info", side_effect=fake_info):
+                names = [p.name for p in onboard.find_models(root)]
+        self.assertEqual(names, ["Broken.gguf", "Chat-Q4.gguf"])
 
 
 if __name__ == "__main__":

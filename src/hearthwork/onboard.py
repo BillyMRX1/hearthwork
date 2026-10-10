@@ -23,6 +23,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from .context import model_info
 from .paths import BIN, CONFIG, HOME
 WINDOWS, MAC = os.name == "nt", sys.platform == "darwin"
 SERVER_NAME = "llama-server.exe" if WINDOWS else "llama-server"
@@ -284,11 +285,16 @@ def find_llama(config):
 # ---------- models folder ----------
 
 def find_models(folder):
-    """GGUF models under `folder`. Multi-file models start from their first part; mmproj files are not models."""
+    """GGUF models under `folder`. Multi-file models start from their first part; mmproj files are not models.
+    A file whose readable metadata has no context length is not a chat model (e.g. a speech model) and is skipped;
+    a file whose metadata cannot be read is kept."""
     found = []
     for path in sorted(Path(folder).rglob("*.gguf"), key=lambda p: str(p).lower()):
         name = path.name
         if "mmproj" in name.lower() or (re.search(r"-\d{5}-of-\d{5}", name) and "-00001-of-" not in name):
+            continue
+        info = model_info(path)
+        if info is not None and info["modelMax"] is None:
             continue
         found.append(path)
     return found

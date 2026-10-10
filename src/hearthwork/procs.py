@@ -62,29 +62,41 @@ def pid_alive(pid):
 
 # ---------- registry of running tasks ----------
 
-def register_task(directory=None, pid=None):
-    """Record this process as a running task; the entry is removed again at exit."""
+def _folder_key(folder):
+    return os.path.normcase(os.path.abspath(folder))
+
+
+def register_task(directory=None, pid=None, folder=None):
+    """Record this process as a running task, with the folder it works in; the entry is removed again at exit."""
     directory = directory or TASKS_DIR
     path = directory / str(pid or os.getpid())
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        path.write_text("")
+        path.write_text(_folder_key(folder) if folder else "", encoding="utf-8")
         atexit.register(lambda: path.unlink(missing_ok=True))
     except OSError:
         pass
     return path
 
 
-def running_tasks(directory=None, alive=pid_alive):
-    """PIDs of Hearthwork tasks running now; entries of dead processes are removed."""
+def running_tasks(directory=None, alive=pid_alive, folder=None):
+    """PIDs of Hearthwork tasks running now (only those registered for `folder`, if given);
+    entries of dead processes are removed."""
     directory = directory or TASKS_DIR
     found = []
     try:
         entries = list(directory.iterdir())
     except OSError:
         return found
+    wanted = _folder_key(folder) if folder else None
     for entry in entries:
         if entry.name.isdigit() and alive(int(entry.name)):
+            if wanted is not None:
+                try:
+                    if entry.read_text(encoding="utf-8") != wanted:
+                        continue
+                except OSError:
+                    continue
             found.append(int(entry.name))
         else:
             try:

@@ -226,5 +226,53 @@ class EncodingTests(unittest.TestCase):
             self.assertEqual(buffer.getvalue().decode("utf-8").strip(), "9×9")
 
 
+class SharedFolderTests(unittest.TestCase):
+    def test_other_tasks_in_ignores_own_pid(self):
+        with mock.patch.object(task, "running_tasks", return_value=[os.getpid()]) as running:
+            self.assertFalse(task.other_tasks_in("/work"))
+            running.assert_called_with(folder="/work")
+        with mock.patch.object(task, "running_tasks", return_value=[os.getpid(), 4242]):
+            self.assertTrue(task.other_tasks_in("/work"))
+
+    def test_registry_matches_folder(self):
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as registry:
+            directory = Path(registry)
+            procs.register_task(directory, pid=111, folder=folder)
+            procs.register_task(directory, pid=222, folder=os.path.join(folder, "other"))
+            alive = lambda pid: True
+            self.assertEqual(procs.running_tasks(directory, alive=alive, folder=folder), [111])
+            self.assertEqual(sorted(procs.running_tasks(directory, alive=alive)), [111, 222])
+
+    def test_report_note_only_when_shared(self):
+        base = {"agent": "claude", "model": "m", "host": "local", "duration_seconds": 1, "status": "ok",
+                "exit_code": 0, "error": None, "created": [{"path": "a.txt", "size": 1}], "modified": [],
+                "deleted": [], "files_capped": False, "message": "done", "cwd": "/w"}
+        note = "Note: other Hearthwork tasks ran in this folder at the same time"
+        self.assertNotIn(note, task.format_report(base))
+        text = task.format_report(dict(base, sharedFolder=True))
+        self.assertIn(note, text)
+        self.assertLess(text.index("created:"), text.index(note))
+
+    def test_run_task_flags_shared_folder(self):
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(task, "installed", return_value=True), \
+                mock.patch.object(task, "model_for_task", return_value=(8080, "m", None, None)), \
+                mock.patch.object(task, "prepare", return_value=(["x"], {})), \
+                mock.patch.object(task, "run_process", return_value=(0, "", "", False)), \
+                mock.patch.object(task, "parse_result", return_value=("done", None)), \
+                mock.patch.object(task, "running_tasks", return_value=[4242]):
+            report = task.run_task({}, "do it", "claude", (), folder)
+        self.assertTrue(report["sharedFolder"])
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(task, "installed", return_value=True), \
+                mock.patch.object(task, "model_for_task", return_value=(8080, "m", None, None)), \
+                mock.patch.object(task, "prepare", return_value=(["x"], {})), \
+                mock.patch.object(task, "run_process", return_value=(0, "", "", False)), \
+                mock.patch.object(task, "parse_result", return_value=("done", None)), \
+                mock.patch.object(task, "running_tasks", return_value=[os.getpid()]):
+            report = task.run_task({}, "do it", "claude", (), folder)
+        self.assertNotIn("sharedFolder", report)
+
+
 if __name__ == "__main__":
     unittest.main()

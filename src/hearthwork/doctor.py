@@ -604,7 +604,7 @@ def verdict(key, server, protocol, agent):
             if item["status"] == FAIL:
                 name = item["name"]
                 if item["name"] == "coding task":
-                    run = re.match(r"(timeout|error|no_result)", item["detail"])  # timeout vs error
+                    run = re.match(r"(timeout|error|no_result)(?![a-z])", item["detail"])  # timeout vs error
                     name += f" ({run.group(1)})" if run else ""
                 return text.format(name), item["name"]
     for item in capability:

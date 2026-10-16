@@ -27,9 +27,12 @@
   <text x="270" y="122" font-size="68" font-weight="800" fill="#fff3e2" letter-spacing="1">Hearthwork</text>
   <text x="274" y="162" font-size="22" fill="#f6cf9c">Local models for your coding agents, tuned to your own machine.</text>
   <g font-size="15" font-weight="600">
-    <rect x="274" y="186" width="118" height="32" rx="16" fill="#5a3320" stroke="#c97a3a"/><text x="292" y="207" fill="#ffd9b0">Claude Code</text>
-    <rect x="402" y="186" width="74" height="32" rx="16" fill="#5a3320" stroke="#c97a3a"/><text x="418" y="207" fill="#ffd9b0">Codex</text>
-    <rect x="486" y="186" width="98" height="32" rx="16" fill="#5a3320" stroke="#c97a3a"/><text x="502" y="207" fill="#ffd9b0">llama.cpp</text>
-    <rect x="594" y="186" width="232" height="32" rx="16" fill="#5a3320" stroke="#c97a3a"/><text x="610" y="207" fill="#ffd9b0">Windows · macOS · Linux</text>
+    <rect x="274" y="186" width="124" height="32" rx="16" fill="#5a3320" stroke="#c97a3a"/><text x="290" y="207" fill="#ffd9b0">Claude Code</text>
+    <rect x="408" y="186" width="74" height="32" rx="16" fill="#5a3320" stroke="#c97a3a"/><text x="424" y="207" fill="#ffd9b0">Codex</text>
+    <rect x="492" y="186" width="98" height="32" rx="16" fill="#5a3320" stroke="#c97a3a"/><text x="508" y="207" fill="#ffd9b0">OpenCode</text>
+    <rect x="600" y="186" width="106" height="32" rx="16" fill="#5a3320" stroke="#c97a3a"/><text x="616" y="207" fill="#ffd9b0">Qwen Code</text>
+    <rect x="716" y="186" width="72" height="32" rx="16" fill="#5a3320" stroke="#c97a3a"/><text x="732" y="207" fill="#ffd9b0">Aider</text>
+    <rect x="798" y="186" width="106" height="32" rx="16" fill="#5a3320" stroke="#c97a3a"/><text x="814" y="207" fill="#ffd9b0">llama.cpp</text>
+    <rect x="914" y="186" width="214" height="32" rx="16" fill="#5a3320" stroke="#c97a3a"/><text x="930" y="207" fill="#ffd9b0">Windows · macOS · Linux</text>
   </g>
 </svg>

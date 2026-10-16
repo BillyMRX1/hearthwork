@@ -361,8 +361,13 @@ _CLOSERS = re.compile(r"(?:\s|</tool_call>|</function>|</function_calls>|</tool_
 _BETWEEN = re.compile(r"(?:\s|,|</?(?:tool_call|tool_calls|function_calls|function)>)*\Z")
 
 
+_FENCE_OPEN = re.compile(r"```\w*[ \t]*\n?\Z")
+_FENCED = re.compile(r"```\w*[ \t]*\n(.*?)\n?[ \t]*```\s*\Z", re.S)
+BARE = ("pythonic", "json")  # formats that must be the whole reply: no lead-in
+
+
 def lead_in_ok(lead):
-    lead = _LEFTOVER.sub("", lead)
+    lead = _FENCE_OPEN.sub("", _LEFTOVER.sub("", lead))
     return "```" not in lead and len(lead.strip()) <= MAX_LEAD
 
 
@@ -374,8 +379,12 @@ def find_tool_call(text, tools):
     if not tools or not isinstance(text, str) or not text.strip():
         return None
     text = strip_think(text)
-    if "```" in text:
-        return None
+    prefix = ""
+    if "```" in text:  # exactly one fence is fine when it wraps only the call and ends the reply
+        fenced = _FENCED.search(text) if text.count("```") == 2 else None
+        if not fenced:
+            return None
+        prefix, text = text[:fenced.start()], fenced.group(1)
     try:
         for fmt, detect in _DETECTORS:
             found = detect(text, tools)
@@ -389,11 +398,14 @@ def find_tool_call(text, tools):
                     return None
                 json.dumps(arguments, allow_nan=False)
                 calls.append({"name": name, "arguments": arguments})
-            if not lead_in_ok(text[:spans[0][0]]) or not _CLOSERS.match(text, spans[-1][1]):
+            lead = prefix + text[:spans[0][0]]
+            if not lead_in_ok(lead) or not _CLOSERS.match(text, spans[-1][1]):
+                return None
+            if fmt in BARE and _LEFTOVER.sub("", lead).strip():
                 return None
             if any(not _BETWEEN.match(text, a[1], b[0]) or a[1] > b[0] for a, b in zip(spans, spans[1:])):
                 return None
-            return Repair(calls, _LEFTOVER.sub("", text[:spans[0][0]]).strip(), fmt)
+            return Repair(calls, _LEFTOVER.sub("", lead).strip(), fmt)
     except Exception:  # anything odd in the text: leave the reply alone
         return None
     return None
@@ -450,10 +462,12 @@ def _unclosed(s):
 def can_be_call(t, start, tools):
     """True while `t[start:]` (the held text; `t` is the whole reply so far) could still end as a valid trailing call."""
     tail = t[start:]
-    if len(tail) > MAX_HOLD or "```" in t:
+    if len(tail) > MAX_HOLD or t.count("```") > 2:
         return False
     if find_tool_call(t, tools):
         return True
+    if t.count("```") == 1 and find_tool_call(t.rstrip("`\n ") + "\n```", tools):
+        return True  # the closing fence is still being written
     s = tail.lstrip()
     kind = _candidate(s, tools)
     if not kind:
@@ -473,17 +487,23 @@ def can_be_call(t, start, tools):
     return _unclosed(s)
 
 
+def _bare_start(s):
+    """True when `s` can only be a raw JSON or pythonic call (not a marker or tag format): those start the reply."""
+    return not (s.startswith("<") or any(s.startswith(m) or m.startswith(s) for m in MARKERS))
+
+
 def find_hold_start(t, scan_from, tools):
     """Index in `t` of a line start where a trailing call may begin, among the lines from the one holding `scan_from`
     on; None when there is none (the normal case)."""
-    if "```" in t:
+    if t.count("```") > 2:
         return None
     pos = t.rfind("\n", 0, scan_from) + 1
     while pos <= len(t):
         q = pos
         while q < len(t) and t[q] in " \t":
             q += 1
-        if q >= scan_from and _candidate(t[q:], tools) and lead_in_ok(t[:q]) and can_be_call(t, q, tools):
+        kind = _candidate(t[q:], tools) if q >= scan_from else 0
+        if kind and lead_in_ok(t[:q]) and (not _bare_start(t[q:]) or _FENCE_OPEN.sub("", t[:q]).strip() == "")                 and can_be_call(t, q, tools):
             return q
         end = t.find("\n", pos)
         if end < 0:

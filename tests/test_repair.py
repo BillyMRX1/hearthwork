@@ -62,14 +62,14 @@ class Formats(unittest.TestCase):
 
     def test_pythonic(self):
         self.check('get_secret(name="alpha")', "pythonic")
-        self.check('I will look it up.\n`get_secret(name="alpha")`', "pythonic", rest="I will look it up.")
+        self.check('`get_secret(name="alpha")`', "pythonic")
         found = one("[read_file(path='a.py', limit=3), get_secret(name=\"x)\")]")
         self.assertEqual([c["name"] for c in found.calls], ["read_file", "get_secret"])
         self.assertEqual(found.calls[1]["arguments"], {"name": "x)"})
 
     def test_raw_json(self):
         self.check('{"name": "get_secret", "arguments": {"name": "alpha"}}', "json")
-        self.check('Here you go: {"name": "get_secret", "parameters": {"name": "alpha"}}', "json", rest="Here you go:")
+        self.check('  {"name": "get_secret", "parameters": {"name": "alpha"}}\n', "json")
         self.check('{"name": "get_secret", "arguments": "{\\"name\\": \\"alpha\\"}"}', "json")
         self.check('{"type": "function", "function": {"name": "get_secret", "arguments": {"name": "alpha"}}}', "json")
 
@@ -140,7 +140,31 @@ class Conservative(unittest.TestCase):
         self.none(self.CALL + "\nThat is the format.")
         self.none("Output:\n```\n" + self.CALL + "\n```")
         self.none("<tool_call>" + self.CALL + "</tool_call> is how Qwen writes it, and Mistral writes it differently.")
-        self.none("x" * 400 + "\n" + self.CALL)
+        self.none("x" * 400 + "\n<tool_call>" + self.CALL + "</tool_call>")
+
+    def test_bare_formats_allow_no_lead_in(self):
+        self.none('Example: {"name": "bash", "arguments": {"command": "ls"}}')
+        self.none('I will look it up.\nget_secret(name="alpha")', TOOLS)
+        self.none('Here you go: {"name": "get_secret", "arguments": {"name": "alpha"}}', TOOLS)
+
+    def test_one_fence_around_the_trailing_call(self):
+        for text, fmt in (('```json\n{"name": "get_secret", "arguments": {"name": "alpha"}}\n```', "json"),
+                          ('```\nget_secret(name="alpha")\n```\n', "pythonic"),
+                          ('Checking.\n```\n<tool_call>{"name": "get_secret", "arguments": {"name": "alpha"}}</tool_call>\n```', "tool_call")):
+            found = repair.find_tool_call(text, TOOLS)
+            self.assertEqual((found.format, found.calls[0]["arguments"]), (fmt, {"name": "alpha"}))
+        self.assertIsNone(repair.find_tool_call('```\nx\n```\n```json\n{"name": "get_secret", "arguments": {"name": "a"}}\n```', TOOLS))
+        self.assertIsNone(repair.find_tool_call('```json\n{"name": "get_secret", "arguments": {"name": "a"}}\n```\nDone.', TOOLS))
+        self.assertIsNone(repair.find_tool_call('Look: ```json\n{"name": "get_secret", "arguments": {"name": "a"}}\n```', TOOLS))
+
+    def test_fenced_call_streams_are_repaired(self):
+        tools = repair.request_tools("chat", {"tools": REQUEST_TOOLS["chat"]})
+        text = '```json\n{"name": "get_secret", "arguments": {"name": "alpha"}}\n```'
+        stream = repair.StreamRepair("chat", tools)
+        raw = STREAMS["chat"](text)
+        out = b"".join(stream.feed(e + b"\n\n") for e in raw.split(b"\n\n") if e) + stream.finish()
+        self.assertTrue(stream.repaired)
+        self.assertIn(b"tool_calls", out)
 
     def test_a_short_lead_in_and_closing_markers_are_fine(self):
         found = repair.find_tool_call("Cleaning up.\n<tool_call>" + self.CALL + "</tool_call>\n", self.BASH)
@@ -155,13 +179,15 @@ class Conservative(unittest.TestCase):
     def test_hold_start(self):
         names = TOOLS
         for text in ("Hello there, I will help.", "Use <b>bold</b> text", "mention [TOOL_CALLS] in prose",
-                     "x = read(fd, buf, n);", '{"name": "bob"}', "```\n[TOOL_CALLS]\n```"):
+                     "x = read(fd, buf, n);", '{"name": "bob"}'):
             self.assertIsNone(repair.find_hold_start(text, 0, names), text)
         self.assertEqual(repair.find_hold_start("text\n[TOOL_CALLS]", 0, names), 5)
         self.assertEqual(repair.find_hold_start("text\n[TOOL", 0, names), 5)
-        self.assertEqual(repair.find_hold_start("a\nget_secret(", 0, names), 2)
-        self.assertEqual(repair.find_hold_start("a\nget_sec", 0, names), 2)
-        self.assertEqual(repair.find_hold_start('a\n{"name": "get_secret", "arg', 0, names), 2)
+        self.assertIsNone(repair.find_hold_start("a\nget_secret(", 0, names))  # raw/pythonic only at the very start
+        self.assertIsNone(repair.find_hold_start('a\n{"name": "get_secret", "arg', 0, names))
+        self.assertEqual(repair.find_hold_start("get_secret(", 0, names), 0)
+        self.assertEqual(repair.find_hold_start('```json\n{"name": "get_secret", "arg', 0, names), 8)
+        self.assertEqual(repair.find_hold_start("a\n<tool_call>", 0, names), 2)
         self.assertIsNone(repair.find_hold_start("x" * 400 + "\n[TOOL_CALLS]", 0, names))  # lead-in too long
 
     def test_can_be_call_releases(self):

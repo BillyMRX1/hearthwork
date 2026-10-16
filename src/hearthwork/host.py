@@ -25,13 +25,15 @@ from pathlib import Path
 from . import context as ctx
 from .harnesses import ClientGone, Overloaded, client_gone, make_relay
 from .onboard import GREEN, RED, RESET, WINDOWS, YELLOW
-from .paths import HOME, HOST_FILE, HOST_LOG, LOG, STATE
+from .paths import HOME, HOST_FILE, HOST_LOCK, HOST_LOG, LOG, STATE
 
 DEFAULT_PORT = 8470
 MAX_QUEUE = 16          # requests allowed to wait
 MAX_WAIT = 600          # seconds one may wait
 LOG_LIMIT = 5_000_000   # host.log is rotated (host.log.1) beyond this
 DIM = "\033[2m"
+LOAD_TIMEOUT = 1800     # seconds `ensure` waits for a model to load
+DRAIN_SECONDS = 30      # a stop waits this long for running requests
 GENERATION = ("/messages", "/chat/completions", "/responses", "/completions", "/completion")
 
 
@@ -208,6 +210,14 @@ class Gate:
             self.closing = True
             self.cond.notify_all()
 
+    def wait_idle(self, seconds):
+        """Wait until no request is running (at most `seconds`); True when idle."""
+        end = time.monotonic() + seconds
+        with self.cond:
+            while self.active and time.monotonic() < end:
+                self.cond.wait(0.25)
+            return not self.active
+
     def snapshot(self):
         with self.cond:
             return {"limit": self.limit(), "active": len(self.active), "queued": len(self.queue), "rejected": self.rejected,
@@ -215,6 +225,29 @@ class Gate:
 
 
 # ---------- the host process ----------
+
+_LOCK = None
+
+
+def acquire_lock(path=None):
+    """Take the host lock for the life of this process (OS-level: it vanishes with the process, even if killed).
+    False when another host holds it. Taken before anything else, so a second host never touches llama-server."""
+    global _LOCK
+    handle = open(path or HOST_LOCK, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False
+    _LOCK = handle
+    return True
+
 
 def write_private(path, text):
     """Write a file only the user can read where the OS allows (POSIX mode 600; Windows: the user's own profile folder)."""
@@ -330,7 +363,9 @@ class Host:
     def shutdown(self):
         from . import server
         self.log("Stopping: saving the prompt cache, then the model server")
-        self.gate.close()
+        self.gate.close()  # no new requests; the queued ones get an overload error
+        if not self.gate.wait_idle(DRAIN_SECONDS):
+            self.log(f"{len(self.gate.active)} request(s) still running after {DRAIN_SECONDS} s; stopping anyway")
         self.ready = False
         try:
             server.stop(self.config, quiet=False)
@@ -347,13 +382,16 @@ class Host:
 
 def serve(config, model=None, context=None, adopt=False, console=False):
     """Run the host in this process until stopped; returns the exit code."""
+    if not acquire_lock():
+        print("Another Hearthwork host is already running; this one exits without touching the model.")
+        return 1
     log = Logger(console=sys.stdout if console else None)
     saved = sys.stdout, sys.stderr
     sys.stdout = sys.stderr = log
     host = Host(config, lambda message: print(message, flush=True))
     try:
         try:
-            host.listener = make_relay(host.llama_port, ("127.0.0.1", port(config)), host.control, gate=host.gate)
+            host.listener = make_relay(host.llama_port, ("127.0.0.1", port(config)), host.control, gate=host.gate, exclusive=True)
         except OSError as error:
             print(f"Cannot listen on port {port(config)} (another host running?): {error}")
             return 1
@@ -459,25 +497,43 @@ def spawn(args):
     return subprocess.Popen(cmd, start_new_session=True, **quiet)
 
 
-def _wait_ready(label, process=None):
+def _wait_ready(label, process=None, timeout=LOAD_TIMEOUT):
+    """Wait for the host's model to be ready. Gives up with a message when the host never answers, disappears (e.g.
+    `hearthwork stop` in another terminal), or the model does not load within `timeout` seconds."""
     print(f"{label}", end="", flush=True)
-    started, gone_since = time.time(), None
+    started = time.time()
+    seen, silent, gone_since = False, None, None
     while True:
         info = read_info()
         got = call(info, "status") if info else None
+        now = time.time()
         if got and got.get("error"):
             print(f"\n{RED}The model did not start: {got['error']}{RESET}")
             return False
         if got and got.get("ready"):
             note = f" (restored {got['restored']:,} cached prompt tokens: the first message will be quick)" if got.get("restored") else ""
-            print(f" {GREEN}ready in {time.time() - started:.0f} s{RESET}{note}")
+            print(f" {GREEN}ready in {now - started:.0f} s{RESET}{note}")
             return True
-        if not got and process is not None and process.poll() is not None and not info:
-            gone_since = gone_since or time.time()
-            if time.time() - gone_since > 10:  # our host died (a host started by someone else would have written host.json)
+        seen = seen or bool(info)
+        if got:
+            silent = None
+        elif info:  # a process with that pid, but not answering as a host with this token: dead, reused, or hung
+            silent = silent or now
+            if now - silent > 60:
+                print(f"\n{RED}Process {info['pid']} does not answer as a Hearthwork host (see `hearthwork logs`).{RESET}")
+                return False
+        elif seen:
+            print(f"\n{RED}The host stopped before the model was ready (`hearthwork stop` elsewhere, or a crash: see `hearthwork logs`).{RESET}")
+            return False
+        elif process is not None and process.poll() is not None:
+            gone_since = gone_since or now
+            if now - gone_since > 10:  # our host died (a host started by someone else would have written host.json)
                 print(f"\n{RED}The host stopped while starting (see `hearthwork logs`).{RESET}")
                 _tail(HOST_LOG)
                 return False
+        if now - started > timeout:
+            print(f"\n{RED}The model was not ready after {timeout:.0f} s (see `hearthwork logs --server`).{RESET}")
+            return False
         time.sleep(1)
         print(".", end="", flush=True)
 
@@ -508,7 +564,7 @@ def ensure(config, model=None, context=None, force=False):
             print(f"{YELLOW}Not switching: {busy} request(s) are running or waiting ({got['active']} active, {got['queued']} queued). "
                   f"Wait for them, or use --force to interrupt them.{RESET}")
             return False
-        stop(config, quiet=True)
+        stop(config, quiet=True, force=True)
     elif server.port_open(llama):  # a llama-server of an older Hearthwork (or someone else's) is already there
         name = server.served_model(llama) or server.served_model(llama, timeout=60)
         if not name:
@@ -528,11 +584,20 @@ def ensure(config, model=None, context=None, force=False):
     return _wait_ready(f"Starting {model.name} (logs: `hearthwork logs`)", spawn(args))
 
 
-def stop(config, quiet=False):
-    """Stop the model (saving its prompt cache) and the host. Also stops a llama-server an older Hearthwork started."""
+def stop(config, quiet=False, force=False):
+    """Stop the model (saving its prompt cache) and the host. Also stops a llama-server an older Hearthwork started.
+    With requests active or queued it refuses unless `force`; then it stops admitting requests and waits up to
+    30 s for the running ones. Returns False when it refused."""
     from . import server
     info = read_info()
     if info:
+        got = call(info, "status")
+        if got and got["active"] + got["queued"] and not force:
+            print(f"{YELLOW}Not stopping: {got['active']} request(s) running and {got['queued']} waiting:{RESET}")
+            for line in status_lines(got)[3:]:
+                print(line)
+            print("Wait for them, or use `hearthwork stop --force`.")
+            return False
         call(info, "stop", "POST")
         for _ in range(240):
             if not _alive(info["pid"]):
@@ -551,11 +616,12 @@ def stop(config, quiet=False):
             server.stop(config, quiet=True)  # leftovers of a host that had to be killed
         if not quiet:
             print("Stopped the model and the Hearthwork host.")
-        return
+        return True
     if STATE.exists():
         server.stop(config, quiet=quiet)
     elif not quiet:
         print("No model server started by Hearthwork is running.")
+    return True
 
 
 # ---------- status and logs ----------

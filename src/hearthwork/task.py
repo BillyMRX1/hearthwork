@@ -129,7 +129,9 @@ def model_for_task(config):
     name = served_model(port) or (port_open(port) and served_model(port, timeout=60))  # busy: wait, never restart it
     from . import host
     if name:
-        if not host.ensure(config):  # starts the host in front of it (or adopts it)
+        with contextlib.redirect_stdout(sys.stderr):  # its progress must not reach stdout (`task --json`)
+            fronted = host.ensure(config)  # starts the host in front of it (or adopts it)
+        if not fronted:
             sys.exit("The Hearthwork host did not start; see the messages above.")
         return port, name, agent_context(config), None
     if port_open(port):

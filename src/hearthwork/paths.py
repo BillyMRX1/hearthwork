@@ -31,6 +31,7 @@ STATE = HOME / "server.json"        # the background server: pid, model, port
 LOGS = HOME / "logs"                # host.log (requests, queue, lifecycle) and server.log (llama-server's output)
 LOG = LOGS / "server.log"
 HOST_LOG = LOGS / "host.log"
+HOST_LOCK = HOME / "host.lock"      # held by the running host for its whole life: one host per computer
 HOST_FILE = HOME / "host.json"      # the running host: pid, port, control token, model, start time
 
 HOME.mkdir(parents=True, exist_ok=True)

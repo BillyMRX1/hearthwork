@@ -251,7 +251,8 @@ def warmup(port, model, remote=None):
         t0 = time.time()
         base, key = (f"http://{remote['host']}:{remote['port']}", remote["key"]) if remote else (f"http://127.0.0.1:{port}", "local")
         request = urllib.request.Request(f"{base}{path}", json.dumps(body).encode(),
-                                         {"content-type": "application/json", "x-api-key": key, "authorization": f"Bearer {key}"})
+                                         {"content-type": "application/json", "x-api-key": key, "authorization": f"Bearer {key}",
+                                          "x-hearthwork-client": "bench"})
         try:
             with urllib.request.urlopen(request, timeout=900) as response:
                 response.read()
@@ -362,6 +363,10 @@ def main(argv=None):
     else:
         port = config["server"]["port"]
         model = served_model(port)
+        if model:
+            from . import host
+            if not host.ensure(config):  # the host fronts the model (adopts one an older Hearthwork started)
+                sys.exit(1)
     if not model:
         sys.exit("No model is running. Start one first (hearthwork menu: Start / switch model).")
     agents = [key for key in sorted(HARNESSES) if installed(key)] if args.all else [args.agent]
@@ -373,7 +378,8 @@ def main(argv=None):
     root.mkdir(parents=True)
     if args.all or args.warmup:
         print(f"\n{BOLD}Warmup{RESET}: {model}  {DIM}(~{WARMUP_TOKENS // 1000}K-token prompt on both APIs, not timed){RESET}")
-        warmup(port, model, config.get("remote"))
+        from . import host
+        warmup(None if config.get("remote") else host.port(config), model, config.get("remote"))
     results = [(HARNESSES[agent]["title"], run_agent(agent, config, model, root)) for agent in agents]
     table = summary_table(model, results)
     (root / "summary.md").write_text(table + "\n", encoding="utf-8")

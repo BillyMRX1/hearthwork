@@ -9,7 +9,7 @@
   hearthwork task "TASK"        one coding task for another agent to delegate (no terminal needed); see --help
   hearthwork mcp [install ...]  MCP server so any agent can use the local model as a subagent
   hearthwork start [--model X] [--force]   start the model (under the Hearthwork host, in the background)
-  hearthwork stop               stop the model and the host (saves the prompt cache)
+  hearthwork stop [--force]     stop the model and the host (saves the prompt cache); --force even with requests running
   hearthwork serve [--model X]  run the host in this terminal with its log (Ctrl+C stops it)
   hearthwork logs [--server] [-f]   the host's log (requests, queue); --server: llama-server's output
   hearthwork alias add <name> <agent>   short command for it, e.g. ccl  (also: alias list, alias remove <name>)
@@ -160,7 +160,7 @@ def main(argv=None):
             sys.exit(host.logs_main(rest))
         elif command == "stop":
             from . import host
-            host.stop(load_config())
+            sys.exit(0 if host.stop(load_config(), force="--force" in rest) else 1)
         elif command == "status":
             from . import host
             config = load_config()

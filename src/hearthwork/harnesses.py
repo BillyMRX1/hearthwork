@@ -236,21 +236,28 @@ def overloaded_reply(path, message):
 
 
 def client_gone(sock):
-    """The caller closed its end (the request is read in full, so anything readable is end of stream)."""
-    import select
+    """The caller closed its end: the socket is readable and a peek finds end of stream, or a reset. Anything
+    else (a selector error, an odd errno) means unknown, which counts as not gone. (A client that half-closes after
+    sending its request looks the same as one that left; HTTP clients do not do that.)"""
+    import selectors
     import socket
     try:
-        if not select.select([sock], [], [], 0)[0]:
-            return False
-        return sock.recv(1, socket.MSG_PEEK) == b""
-    except (BlockingIOError, InterruptedError):
-        return False
+        with selectors.DefaultSelector() as selector:  # poll where there is one: no 1024-descriptor limit
+            selector.register(sock, selectors.EVENT_READ)
+            if not selector.select(0):
+                return False
     except (OSError, ValueError):
+        return False
+    try:
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except (ConnectionResetError, ConnectionAbortedError):
         return True
+    except (OSError, ValueError):
+        return False
 
 
 def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_headers=None, gate=None, normalize=True,
-               forward_headers=None):
+               forward_headers=None, exclusive=False):
     """HTTP relay to llama-server (or the host) on `upstream_port`, bound to `address` (not yet serving). `intercept(handler)`,
     when given, runs first for every request and returns True once it has answered it itself: `hearthwork share` uses it
     for the device check and the pairing endpoints. `extra_headers(handler)` returns [(name, value)] added to every
@@ -325,6 +332,8 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                 except ValueError:
                     pass
             ticket = None
+            state = {"outcome": "ok", "sent": False, "link": None}
+            finished = threading.Event()
             if gate and gate.wants(self.command, path):
                 try:
                     ticket = gate.admit(self.connection, gate.client_of(self.headers), path)
@@ -332,88 +341,87 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                     return self._overloaded(path, str(error))
                 except ClientGone:
                     return
-            headers = {k: v for k, v in self.headers.items()
-                       if k.lower() not in ("host", "content-length", "connection", "accept-encoding")}
-            if forward_headers:
-                headers = {k: v for k, v in headers.items() if k.lower() != "x-hearthwork-client"}
-                headers.update(forward_headers(self))
-            if body:
-                headers["content-length"] = str(len(body))
-            upstream = http.client.HTTPConnection("127.0.0.1", upstream_port, timeout=3600)
-            state = {"outcome": "ok", "sent": False, "link": None}
-            finished = threading.Event()
+            try:
+                headers = {k: v for k, v in self.headers.items()
+                           if k.lower() not in ("host", "content-length", "connection", "accept-encoding")}
+                if forward_headers:
+                    headers = {k: v for k, v in headers.items() if k.lower() != "x-hearthwork-client"}
+                    headers.update(forward_headers(self))
+                if body:
+                    headers["content-length"] = str(len(body))
+                upstream = http.client.HTTPConnection("127.0.0.1", upstream_port, timeout=3600)
 
-            def watch():
-                # The caller hung up (queued or not): close the upstream request, so nobody generates for nobody. A
-                # blocked read ends with shutdown; on Windows only closing the socket itself wakes it.
-                while not finished.wait(0.5):
-                    if client_gone(self.connection):
-                        state["outcome"] = "client disconnected"
-                        link = state["link"]
-                        if link is not None:
-                            try:
-                                link.shutdown(socket.SHUT_RDWR)
-                            except OSError:
-                                pass
-                            if os.name == "nt":
+                def watch():
+                    # The caller hung up: shut the upstream connection down, so llama-server sees it close and stops
+                    # generating for nobody; the thread that owns the connection closes it. The slot is free at once.
+                    while not finished.wait(0.5):
+                        if client_gone(self.connection):
+                            state["outcome"] = "client disconnected"
+                            link = state["link"]
+                            if link is not None:
                                 try:
-                                    socket.socket._real_close(link)
+                                    link.shutdown(socket.SHUT_RDWR)
                                 except OSError:
                                     pass
-                        return
+                            if ticket:
+                                ticket.release("client disconnected")
+                            return
 
-            threading.Thread(target=watch, daemon=True).start()
-            try:
-                upstream.request(self.command, self.path, body=body, headers=headers)
-                state["link"] = upstream.sock
-                if state["outcome"] != "ok":  # the caller left before we connected
-                    raise ConnectionAbortedError("the caller left")
-                response = upstream.getresponse()
-                tools = tools if response.status == 200 else {}
-                streaming = "event-stream" in (response.getheader("content-type") or "") or wants_stream
-                fixed = None
-                if tools and not streaming:  # a whole reply: look for a call written as text before sending it on
-                    data = response.read()
-                    fixed = repaired_reply(api, data, tools)
+                threading.Thread(target=watch, daemon=True).start()
+                try:
+                    upstream.request(self.command, self.path, body=body, headers=headers)
+                    state["link"] = upstream.sock
+                    if state["outcome"] != "ok":  # the caller left before we connected
+                        raise ConnectionAbortedError("the caller left")
+                    response = upstream.getresponse()
+                    tools = tools if response.status == 200 else {}
+                    streaming = "event-stream" in (response.getheader("content-type") or "") or wants_stream
+                    fixed = None
+                    if tools and not streaming:  # a whole reply: look for a call written as text before sending it on
+                        data = response.read()
+                        fixed = repaired_reply(api, data, tools)
+                        if fixed:
+                            data = fixed[0]
+                    self.send_response(response.status)
+                    state["sent"] = True
+                    for key, value in response.getheaders():
+                        if key.lower() not in ("transfer-encoding", "content-length", "connection"):
+                            self.send_header(key, value)
                     if fixed:
-                        data = fixed[0]
-                self.send_response(response.status)
-                state["sent"] = True
-                for key, value in response.getheaders():
-                    if key.lower() not in ("transfer-encoding", "content-length", "connection"):
-                        self.send_header(key, value)
-                if fixed:
-                    self.send_header("X-Hearthwork-Repaired", fixed[1].format)
-                    self.send_header("content-length", str(len(data)))
-                self._extra()
-                self.end_headers()
-                if tools and not streaming:
-                    self.wfile.write(data)
-                elif tools:
-                    stream = repair.StreamRepair(api, tools)
-                    while chunk := response.read1(65536):
-                        self.wfile.write(stream.feed(chunk))
+                        self.send_header("X-Hearthwork-Repaired", fixed[1].format)
+                        self.send_header("content-length", str(len(data)))
+                    self._extra()
+                    self.end_headers()
+                    if tools and not streaming:
+                        self.wfile.write(data)
+                    elif tools:
+                        stream = repair.StreamRepair(api, tools)
+                        while chunk := response.read1(65536):
+                            self.wfile.write(stream.feed(chunk))
+                            self.wfile.flush()
+                        self.wfile.write(stream.finish())
                         self.wfile.flush()
-                    self.wfile.write(stream.finish())
-                    self.wfile.flush()
-                    if stream.repaired:
-                        log_repair(stream.repaired)
-                else:
-                    while chunk := response.read1(65536):
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-            except (ConnectionError, OSError, http.client.HTTPException):
-                # the client went away (e.g. Esc in the agent), or the model server did
-                if state["outcome"] == "ok":
-                    state["outcome"] = "caller closed the connection" if state["sent"] else "error"
-                    if not state["sent"]:
-                        try:
-                            self._overloaded(path, "The model server is not answering (loading, or stopped).")
-                        except OSError:
-                            pass
+                        if stream.repaired:
+                            log_repair(stream.repaired)
+                    else:
+                        while chunk := response.read1(65536):
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                except (ConnectionError, OSError, http.client.HTTPException):
+                    # the client went away (e.g. Esc in the agent), or the model server did
+                    if state["outcome"] == "ok":
+                        state["outcome"] = "caller closed the connection" if state["sent"] else "error"
+                        if not state["sent"]:
+                            try:
+                                self._overloaded(path, "The model server is not answering (loading, or stopped).")
+                            except OSError:
+                                pass
+                finally:
+                    finished.set()
+                    upstream.close()
+
             finally:
                 finished.set()
-                upstream.close()
                 if ticket:
                     ticket.release(state["outcome"])
 
@@ -422,7 +430,17 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
         def log_message(self, *args):
             pass
 
-    server = http.server.ThreadingHTTPServer(address, Relay)
+    class Listener(http.server.ThreadingHTTPServer):
+        # `exclusive`: nobody else may bind this port. On Windows SO_REUSEADDR lets a second server bind a port that is
+        # in use, so it is off and SO_EXCLUSIVEADDRUSE on.
+        allow_reuse_address = not (exclusive and os.name == "nt")
+
+        def server_bind(self):
+            if exclusive and os.name == "nt":
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
+    server = Listener(address, Relay)
     server.daemon_threads = True
     return server
 

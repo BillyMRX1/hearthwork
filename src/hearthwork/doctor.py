@@ -687,7 +687,9 @@ def run_doctor(config, agents, quick=False, keep=False, endpoint_override=None):
                 endpoint = Endpoint(remote["host"], remote["port"], remote["key"])
             else:
                 from . import host
-                if not host.ensure(config):
+                with contextlib.redirect_stdout(sys.stderr):  # --json keeps stdout clean
+                    fronted = host.ensure(config)
+                if not fronted:
                     raise RuntimeError("the Hearthwork host is not running; start it with `hearthwork start`")
                 endpoint = Endpoint("127.0.0.1", host.port(config))
             for api in sorted({HARNESSES[a]["api"] for a in selected}):

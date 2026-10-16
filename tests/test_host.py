@@ -19,7 +19,7 @@ class Upstream(http.server.ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), self.Handler)
         self.release, self.go_on = threading.Event(), threading.Event()
         self.arrived, self.bodies, self.headers_seen = [], [], []
-        self.write_failed = threading.Event()
+        self.write_failed, self.closed = threading.Event(), threading.Event()
         threading.Thread(target=self.serve_forever, daemon=True).start()
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -57,7 +57,13 @@ class Upstream(http.server.ThreadingHTTPServer):
                         return
                     time.sleep(0.1)
                 return
-            self.server.release.wait(10)
+            for _ in range(200):  # waiting for the model; a caller that shut the connection down shows as end of stream
+                if self.server.release.is_set():
+                    break
+                if harnesses.client_gone(self.connection):
+                    self.server.closed.set()
+                    return
+                time.sleep(0.05)
             data = json.dumps({"ok": payload.get("n")}).encode()
             self.send_response(200)
             self.send_header("content-type", "application/json")
@@ -219,8 +225,8 @@ class DisconnectTests(Base):
         sock = self.raw(port, "/v1/chat/completions", {"n": 1})
         self.assertTrue(wait_for(lambda: self.gate.snapshot()["active"] == 1))
         sock.close()
-        self.assertTrue(wait_for(lambda: self.gate.snapshot()["active"] == 0))  # upstream closed without waiting for the answer
-        self.upstream.release.set()
+        self.assertTrue(wait_for(lambda: self.gate.snapshot()["active"] == 0))  # the slot is free at once
+        self.assertTrue(self.upstream.closed.wait(8))  # and the model server saw the connection close
 
 
 class AccountingTests(Base):

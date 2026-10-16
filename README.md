@@ -271,6 +271,22 @@ It prints the environment (Hearthwork and llama.cpp versions, model, quantizatio
 
 Verdicts: `works`, `configuration/connection problem at <stage>`, `protocol problem at <stage> (<API>)`, or `protocol OK, but the model failed the coding task (model capability)`. Failed stages come with numbered, specific suggestions. Aider never calls tools, so the tool stages do not count for it. The exit code is 0 when everything passes. Each run is saved as JSON (no credentials) in `doctor/<timestamp>.json` in the data folder, and `--json` prints it.
 
+## Verified setup profiles: `hearthwork profile`
+
+A profile captures a setup that works, together with the proof: model identity (file, size, fingerprint of the first 16 MB, quantization, architecture, chat template), runtime and llama.cpp build, installed agent versions, effective server settings (context, KV type, slots, batch, fit target, any budget preset), a hardware summary, and the latest Doctor and benchmark results with their test-suite version and date. Profiles live in `profiles/` in the data folder.
+
+```
+hearthwork profile save [NAME] [--doctor]  # default name "default"; runs doctor --quick if no report from the last 24 h
+hearthwork profile list | show NAME
+hearthwork profile check [NAME] [--run]    # --run re-runs Doctor; a pass makes the profile verified again
+hearthwork profile apply NAME              # model, context/slots/batch/KV and runtime build; Doctor validates afterwards
+hearthwork profile apply previous          # the settings from before the last apply
+hearthwork profile export NAME FILE        # no credentials, no device keys, paths replaced by placeholders
+hearthwork profile import FILE             # stored as unverified; lists exactly what differs on this computer
+```
+
+A profile is **verified** only when Doctor said "works" for every recorded agent. A changed llama.cpp build, agent version, chat template or model file makes it **needs recheck** until `profile check --run` passes. `hearthwork status` shows `profile: NAME (verified|needs recheck|unverified)`. `apply` saves your current settings as the `previous` profile first and restores them automatically if validation fails. Agents are installed by you, so a version mismatch is only reported, never changed.
+
 ## Agents
 
 `hearthwork agents` shows which are installed (with version), the API each speaks, how Hearthwork connects it, and the install command of the missing ones. Every agent works the same way in `hearthwork <agent> [args]`, the menu, `hearthwork task --agent <agent>`, the MCP tools, remote mode (`share` / `connect`) and `bench`. The context window and output limit each agent is told come from the running server (or the shared one).

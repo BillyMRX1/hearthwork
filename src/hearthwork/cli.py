@@ -27,6 +27,7 @@
   hearthwork bench --all        release check: every installed agent in turn, after a warmup, with a summary table
   hearthwork doctor [--agent X] [--quick] [--json]   server, API protocol and agent checks; says which layer is at fault
   hearthwork check              is this computer suited, and which models fit
+  hearthwork profile save|list|show|check|apply|export|import   verified setup profiles (model, runtime, settings + Doctor proof)
   hearthwork runtime            llama.cpp engines: list, install <name>, use <name>, update, rollback
   hearthwork setup              hardware check, llama.cpp download/update, models folder
   hearthwork update             update Hearthwork itself
@@ -205,6 +206,10 @@ def main(argv=None):
             chosen = runtime.selected(config)
             if chosen:
                 print(f"runtime: {chosen[0]} b{chosen[1]}")
+            from . import setups
+            profile_line = setups.status_line(config)
+            if profile_line:
+                print(profile_line)
             runtime.print_notice(config)
         elif command == "context":
             sys.exit(ctx.main(rest, configured()))
@@ -245,6 +250,9 @@ def main(argv=None):
             setup.main(rest)
         elif command == "runtime":
             sys.exit(runtime.main(rest))
+        elif command == "profile":
+            from . import setups
+            sys.exit(setups.main(rest))
         elif command == "alias":
             from . import aliases
             sys.exit(aliases.main(rest))

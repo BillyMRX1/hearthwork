@@ -1,0 +1,165 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from hearthwork import setups
+
+
+def profile(**kw):
+    p = {"schema": 1, "name": "t", "created": "2026-01-01T00:00:00",
+         "model": {"file": "m.gguf", "sizeBytes": 10, "fingerprint": None, "quantization": "Q4_K_M",
+                   "architecture": "qwen", "chatTemplate": "abc"},
+         "runtime": {"name": "cuda13", "llamaCppBuild": 100}, "agents": {"claude": "1.0"},
+         "settings": {"context": "auto", "kvCacheType": "q8_0", "slots": 2, "batch": 4096, "fitTargetMiB": 1536},
+         "hardware": {"os": "windows", "backend": "cuda", "vramGB": 16, "ramGB": 32, "gpus": ["X"]},
+         "evidence": {"doctor": {"date": "d", "suite": "s", "conditions": {"quick": True},
+                                 "agents": {"claude": {"verdict": "works", "version": "1.0"}}}, "bench": None},
+         "status": "verified"}
+    p.update(kw)
+    return p
+
+
+class SetupsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        patcher = mock.patch.object(setups, "DIR", self.tmp / "profiles")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.models = self.tmp / "models"
+        (self.models / "sub").mkdir(parents=True)
+        self.config = {"modelsDir": str(self.models), "server": {"port": 1}}
+
+    def test_validate(self):
+        setups.validate(profile())
+        with self.assertRaises(ValueError):
+            setups.validate({"schema": 2})
+        bad = profile()
+        del bad["settings"]
+        with self.assertRaises(ValueError):
+            setups.validate(bad)
+        with self.assertRaises(ValueError):
+            setups.validate(profile(name="../x"))
+
+    def test_verified_requires_all_works(self):
+        ok = {"agents": {"a": {"verdict": "works"}, "b": {"verdict": "works"}}}
+        self.assertTrue(setups.is_verified(ok))
+        ok["agents"]["b"]["verdict"] = "fails"
+        self.assertFalse(setups.is_verified(ok))
+        self.assertFalse(setups.is_verified(None))
+        self.assertFalse(setups.is_verified({"agents": {}}))
+
+    def test_export_sanitizes(self):
+        p = profile(extra=f"{self.models}\\sub\\m.gguf", remote={"key": "secret", "apiKey": "x"})
+        p["evidence"]["doctor"]["note"] = f"{Path.home()}/proj Bearer abcdefghijkl"
+        p["_restore"] = {"x": 1}
+        out = json.dumps(setups.export_profile(self.config, p))
+        for forbidden in (str(self.models), "secret", "apiKey", "abcdefghijkl", str(Path.home()).replace("\\", "\\\\"), "_restore"):
+            self.assertNotIn(forbidden, out)
+        self.assertIn("<MODELS_DIR>", out)
+
+    def test_import_resolves_model(self):
+        f = self.models / "sub" / "m.gguf"
+        f.write_bytes(b"x" * 10)
+        data = profile()
+        data["model"]["fingerprint"] = setups.fingerprint(f)
+        hw = {"os": "windows", "backend": "cuda", "vramGB": 16, "ramGB": 32}
+        with mock.patch.object(setups, "runtime_of", return_value={"name": "cuda13", "llamaCppBuild": 100}):
+            p, problems = setups.import_profile(self.config, data, hw=hw, agents={"claude": "1.0"})
+        self.assertFalse([x for x in problems if "model" in x])
+        self.assertEqual(p["status"], "unverified")
+        self.assertEqual(p["recordedStatus"], "verified")
+
+    def test_import_reports_differences(self):
+        hw = {"os": "linux", "backend": "cpu", "vramGB": 8, "ramGB": 16}
+        with mock.patch.object(setups, "runtime_of", return_value={"name": "cpu", "llamaCppBuild": 5}):
+            _, problems = setups.import_profile(self.config, profile(), hw=hw, agents={"claude": "2.0"})
+            text = "\n".join(problems)
+            for needle in ("model not found", "llama.cpp build", "agent claude version differs", "VRAM", "RAM", "backend", "OS differs"):
+                self.assertIn(needle, text)
+            _, problems = setups.import_profile(self.config, profile(), hw=hw, agents={})
+        self.assertIn("agent claude is not installed", "\n".join(problems))
+
+    def test_find_model_wrong_size(self):
+        (self.models / "m.gguf").write_bytes(b"x" * 3)
+        self.assertTrue(setups.find_model(self.config, {"file": "m.gguf", "sizeBytes": 10})[1])
+
+    def test_change_detection(self):
+        p = profile()
+        now = {"model": dict(p["model"]), "runtime": dict(p["runtime"]), "agents": {"claude": "1.0"}}
+        self.assertEqual(setups.differences(p, now), [])
+        now["runtime"]["llamaCppBuild"] = 101
+        now["agents"]["claude"] = "1.1"
+        now["model"]["chatTemplate"] = "zzz"
+        text = "\n".join(setups.differences(p, now))
+        for needle in ("llama.cpp build", "agent claude version", "chat template"):
+            self.assertIn(needle, text)
+        status, changes = setups.check(self.config, p, now=now)
+        self.assertEqual(status, "needs recheck")
+        self.assertEqual(len(changes), 3)
+
+    def test_check_run(self):
+        now = {"model": profile()["model"], "runtime": {"name": "cuda13", "llamaCppBuild": 101}, "agents": {"claude": "1.1"}}
+        good = {"time": "t", "agents": {"claude": {"verdict": "works", "version": "1.1", "stages": []}}}
+        p = profile()
+        status, _ = setups.check(self.config, p, run=True, run_doctor=lambda c, a: good, now=now)
+        self.assertEqual(status, "verified")
+        self.assertEqual(p["runtime"]["llamaCppBuild"], 101)
+        bad = {"agents": {"claude": {"verdict": "fails", "stages": []}}}
+        status, _ = setups.check(self.config, profile(), run=True, run_doctor=lambda c, a: bad, now=now)
+        self.assertEqual(status, "needs recheck")
+
+    def test_doctor_evidence_quick_flag(self):
+        report = {"time": "t", "agents": {"a": {"verdict": "works", "stages": [{"name": "coding task"}]}}}
+        self.assertFalse(setups.doctor_evidence(report)["conditions"]["quick"])
+
+    def test_apply_failure_restores_then_previous(self):
+        f = self.models / "m.gguf"
+        f.write_bytes(b"x" * 10)
+        old = self.models / "old.gguf"
+        old.write_bytes(b"y")
+        config = {"modelsDir": str(self.models), "lastModel": str(old),
+                  "server": {"context": 8192, "slots": 1, "batch": 512, "kvCacheType": "f16", "fitTargetMiB": 100, "port": 1}}
+        data = profile(agents={})
+        data["model"]["fingerprint"] = setups.fingerprint(f)
+        ensured = []
+        stub = {"name": "previous", "settings": {}}
+        with mock.patch.object(setups, "capture", return_value=dict(stub)), \
+                mock.patch("hearthwork.context.choose", return_value=(4096, "x", None)):
+            ok = setups.apply(config, data, lambda c: None, lambda c, m, x: ensured.append(m.name) or True,
+                              validator=lambda c: False, versions={})
+            self.assertFalse(ok)
+            self.assertEqual(config["server"]["slots"], 1)
+            self.assertEqual(config["lastModel"], str(old))
+            self.assertEqual(ensured, ["m.gguf", "old.gguf"])
+            self.assertNotIn("activeProfile", config)
+            ok = setups.apply(config, data, lambda c: None, lambda c, m, x: True, versions={})
+            self.assertTrue(ok)
+            self.assertEqual((config["server"]["slots"], config["activeProfile"]), (2, "t"))
+            # the second apply saved the settings from before it: back to the old model's setup
+            config["server"]["slots"] = 1
+            config["lastModel"] = str(old)
+            self.assertTrue(setups.apply(config, data, lambda c: None, lambda c, m, x: True, versions={}))
+            self.assertTrue(setups.apply_previous(config, lambda c: None, lambda c, m, x: True))
+            self.assertEqual((config["server"]["slots"], config["lastModel"]), (1, str(old)))
+
+    def test_apply_missing_model_refuses(self):
+        msgs = []
+        ok = setups.apply({"modelsDir": str(self.models), "server": {}}, profile(), lambda c: None, lambda *a: True,
+                          say=msgs.append, versions={})
+        self.assertFalse(ok)
+        self.assertIn("model not found", msgs[0])
+
+    def test_status_line(self):
+        setups.store(profile())
+        cfg = {"activeProfile": "t"}
+        with mock.patch.object(setups, "quick_changes", return_value=[]):
+            self.assertEqual(setups.status_line(cfg), "profile: t (verified)")
+        with mock.patch.object(setups, "quick_changes", return_value=["llama.cpp build"]):
+            self.assertEqual(setups.status_line(cfg), "profile: t (needs recheck)")
+        self.assertIsNone(setups.status_line({}))
+
+
+if __name__ == "__main__":
+    unittest.main()

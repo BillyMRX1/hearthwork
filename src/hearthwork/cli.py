@@ -14,6 +14,7 @@
   hearthwork logs [--server] [-f]   the host's log (requests, queue); --server: llama-server's output
   hearthwork alias add <name> <agent>   short command for it, e.g. ccl  (also: alias list, alias remove <name>)
   hearthwork context [model] [N|auto]   context per model: range for this computer; save N for a model
+  hearthwork diagnose [--last N | --since 30m] [--client X] [--json] [--export FILE]   what limited your sessions (measured)
   hearthwork status             host, model, context, slots, and active/queued requests per client
   hearthwork share [--port N]   share the running model on your home network (Ctrl+C stops); a PIN pairs each computer
   hearthwork api [--port N]     OpenAI + Anthropic compatible endpoint on this computer for any tool (--show: setup snippets)
@@ -158,6 +159,9 @@ def main(argv=None):
         elif command == "logs":
             from . import host
             sys.exit(host.logs_main(rest))
+        elif command == "diagnose":
+            from . import diagnostics
+            sys.exit(diagnostics.main(rest))
         elif command == "stop":
             from . import host
             sys.exit(0 if host.stop(load_config(), force="--force" in rest) else 1)
@@ -177,6 +181,9 @@ def main(argv=None):
             if got:
                 for line in host.status_lines(got):
                     print(line)
+                from . import diagnostics
+                info = host.read_info()
+                print(diagnostics.status_line(host.call(info, "diagnostics") if info else None))
             else:
                 from .server import running_context, served_model
                 running = served_model(port)

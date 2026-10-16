@@ -233,6 +233,23 @@ Runs every installed agent one after another (never in parallel, which would sta
 | Qwen3.5-35B-A3B-Q4_K_M | Claude Code | 8.0/8 | 3.0 min |
 | Qwen3.5-35B-A3B-Q4_K_M | Codex | 8.0/8 | 3.3 min |
 
+## Session diagnostics: `hearthwork diagnose`
+
+The host measures every generation request as it passes through (passively: streams are never buffered or delayed) and keeps numbers only, in `logs/requests.jsonl` in the data folder (rotated at about 5 MB): client, API, outcome, queue wait, time to first byte, duration, prompt/cached/generated tokens, speeds, and the request's size against the context. No prompt or response text is recorded, and nothing leaves your computer.
+
+```
+hearthwork diagnose                      # everything recorded
+hearthwork diagnose --since 30m --client opencode
+hearthwork diagnose --last 50 --json
+hearthwork diagnose --export report.json # sanitized: numbers only, no prompts, code, credentials, paths, or device names
+```
+
+The report lists **Observed** findings (backed by the numbers, e.g. "40% of request time was spent waiting in the queue: 3 clients shared 2 slots") separately from **Possible causes** (explanations the numbers are consistent with, labelled as such), each with a suggestion. What the backend does not report is shown as "unavailable": llama-server gives speeds for chat completions and streamed Responses, but only token counts for the Messages API. Model load time, memory use and time spent in agent tools are not measured. `hearthwork status` adds one line with the last five minutes.
+
+A prompt that does not fit the context gets a clear error in the API's own format ("200,010 tokens don't fit the model's 131,072 context ... raise it with `hearthwork context <model> <N>`"). Requests are never truncated.
+
+Opt-in raw capture for debugging: set `HEARTHWORK_CAPTURE=1` before starting the host to also write full request and response bodies (your code and conversations) to `logs/capture.jsonl`. It is a local file, never exported, and off by default; delete it when done.
+
 ## Compatibility doctor: `hearthwork doctor`
 
 When an agent misbehaves, `hearthwork doctor` tells you which layer is at fault: the connection, the API protocol, the agent's configuration, or the model itself.

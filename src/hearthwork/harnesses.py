@@ -19,7 +19,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import paths, repair
+from . import diagnostics, paths, repair
 from .paths import HOME
 
 
@@ -334,12 +334,18 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
             ticket = None
             state = {"outcome": "ok", "sent": False, "link": None}
             finished = threading.Event()
+            probe = diagnostics.NOOP
             if gate and gate.wants(self.command, path):
+                probe = diagnostics.begin(gate.client_of(self.headers), path, body, gate)  # session diagnostics: numbers only
                 try:
                     ticket = gate.admit(self.connection, gate.client_of(self.headers), path)
+                    probe.admitted(ticket)
                 except Overloaded as error:
+                    probe.response(529 if path.rstrip("/").endswith("/messages") else 503)
+                    probe.finish("overloaded")
                     return self._overloaded(path, str(error))
                 except ClientGone:
+                    probe.finish("cancelled")
                     return
             try:
                 headers = {k: v for k, v in self.headers.items()
@@ -374,6 +380,8 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                     if state["outcome"] != "ok":  # the caller left before we connected
                         raise ConnectionAbortedError("the caller left")
                     response = upstream.getresponse()
+                    probe.response(response.status)
+                    error_body = probe.rewrite_error(response.read()) if response.status == 400 else None  # context-exceeded: clearer message
                     tools = tools if response.status == 200 else {}
                     streaming = "event-stream" in (response.getheader("content-type") or "") or wants_stream
                     fixed = None
@@ -390,13 +398,19 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                     if fixed:
                         self.send_header("X-Hearthwork-Repaired", fixed[1].format)
                         self.send_header("content-length", str(len(data)))
+                    elif error_body is not None:
+                        self.send_header("content-length", str(len(error_body)))
                     self._extra()
                     self.end_headers()
-                    if tools and not streaming:
+                    if error_body is not None:
+                        self.wfile.write(error_body)
+                    elif tools and not streaming:
+                        probe.feed(data)
                         self.wfile.write(data)
                     elif tools:
                         stream = repair.StreamRepair(api, tools)
                         while chunk := response.read1(65536):
+                            probe.feed(chunk)
                             self.wfile.write(stream.feed(chunk))
                             self.wfile.flush()
                         self.wfile.write(stream.finish())
@@ -405,6 +419,7 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                             log_repair(stream.repaired)
                     else:
                         while chunk := response.read1(65536):
+                            probe.feed(chunk)
                             self.wfile.write(chunk)
                             self.wfile.flush()
                 except (ConnectionError, OSError, http.client.HTTPException):
@@ -422,6 +437,7 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
 
             finally:
                 finished.set()
+                probe.finish("disconnected" if state["outcome"] in ("client disconnected", "caller closed the connection") else state["outcome"])
                 if ticket:
                     ticket.release(state["outcome"])
 

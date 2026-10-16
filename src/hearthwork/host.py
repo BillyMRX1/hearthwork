@@ -19,10 +19,11 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from . import context as ctx
+from . import context as ctx, diagnostics
 from .harnesses import ClientGone, Overloaded, client_gone, make_relay
 from .onboard import GREEN, RED, RESET, WINDOWS, YELLOW
 from .paths import HOME, HOST_FILE, HOST_LOCK, HOST_LOG, LOG, STATE
@@ -286,6 +287,7 @@ class Host:
         self.process = None
         self.stop_event = threading.Event()
         self.gate = Gate(lambda: self.slots, log)
+        diagnostics.RECORDER.context = lambda: (self.context, self.slots, self.model)
         self.listener = None
 
     def record(self):
@@ -311,6 +313,9 @@ class Host:
             return True
         if path == "/hearthwork/control/status" and handler.command == "GET":
             handler._send_json(200, self.status())
+        elif path == "/hearthwork/control/diagnostics" and handler.command == "GET":  # ?seconds=N (default 300)
+            seconds = int((urllib.parse.parse_qs(handler.path.partition("?")[2]).get("seconds") or ["300"])[0])
+            handler._send_json(200, diagnostics.summarize(diagnostics.RECORDER.recent(seconds)))
         elif path == "/hearthwork/control/stop" and handler.command == "POST":
             handler._send_json(200, {"stopping": True})
             self.stop_event.set()

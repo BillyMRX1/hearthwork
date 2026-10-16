@@ -31,14 +31,12 @@ GREEN, YELLOW, RED, CYAN, RESET = "\033[32m", "\033[33m", "\033[31m", "\033[36m"
 if WINDOWS:
     os.system("")  # ANSI colors in the Windows console
 
-# Suggested when the models folder is empty: the best in Hearthwork's benchmark (bench.py) on the reference PC.
-# `hearthwork model <repo>` lists every file in a repo with its size and whether it fits this computer; hearthwork-check
-# ranks a longer list for this machine.
+# Shown when the models folder is empty and Hugging Face can't be reached; with internet, suggest_models ranks the
+# curated list in models.py for this computer. `hearthwork model <repo>` lists every file in a repo with its size.
 SUGGESTED = [
-    ("unsloth/Qwen3.5-35B-A3B-GGUF", "Qwen3.5-35B-A3B: MoE, fast even partly in RAM. Best in the benchmark (8/8 with "
-     "Claude Code and Codex). Q4_K_M is 20.5 GB; smaller quantizations exist."),
-    ("unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", "Qwen3-Coder-30B-A3B: coding agent, MoE. 8/8 in the benchmark. "
-     "Q4_K_M is 17.3 GB, so a better fit for smaller machines."),
+    ("unsloth/Qwen3.5-35B-A3B-GGUF", "Qwen3.5-35B-A3B: MoE, fast even partly in RAM. Q4_K_M is about 20 GB; smaller quantizations exist."),
+    ("unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", "Qwen3-Coder-30B-A3B: coding agent, MoE. Q4_K_M is about 17 GB, "
+     "so a better fit for smaller machines."),
 ]
 
 
@@ -159,9 +157,8 @@ def dedicated_vram_gb():
 def judge(hw):
     """Is a local model worth it on this computer for Claude Code? -> (verdict, reasons, what to expect).
 
-    Reference, measured: RTX 5060 Ti 16 GB + 22.6 GB RAM runs Qwen3-Coder-30B-A3B Q4_K_M (17 GB; ~20 GB with a
-    64K context) at 18-31 tokens/s and completed real coding tasks. Smaller ~9B models were much weaker with
-    Claude Code's tools. Thresholds for other hardware are estimates from that.
+    A 30B MoE coding model at Q4_K_M needs ~17 GB (~20 GB with a 64K context) and runs well when partly in RAM;
+    smaller ~9B models handle Claude Code's tools poorly. The thresholds below are estimates from that.
     """
     vram, ram, backend = hw.get("vramGB") or 0, hw.get("ramGB", 0), hw.get("backend")
     if backend == "metal":
@@ -181,9 +178,9 @@ def judge(hw):
     if reasons:
         return "not recommended", reasons, ("Too slow or too weak to be useful for coding. Cloud Claude Code is the "
                                             "better choice on this computer.")
-    if big_gpu and usable >= 26:  # the reference PC has ~32 GB usable
+    if big_gpu and usable >= 26:  # 12+ GB of GPU memory and ~32 GB usable in total
         return "recommended", [f"{vram if backend != 'metal' else usable:.0f} GB GPU memory, ~{usable:.0f} GB usable in total"], (
-            "Similar to the reference PC: about 20-30 tokens/s with a 30B coding model, ~30 s for the first message, "
+            "Expect roughly 20-30 tokens/s with a 30B MoE coding model (an estimate), ~30 s for the first message, "
             "then seconds to a minute per step. Fine for small, well-defined coding tasks; weaker than cloud Claude.")
     return "limited", [f"{vram if backend != 'metal' else usable:.0f} GB GPU memory, ~{usable:.0f} GB usable in total: "
                        "a 30B coding model needs a smaller quantization or runs mostly from RAM"], (
@@ -334,12 +331,25 @@ def choose_models_folder(config, reset=False):
 # ---------- onboarding ----------
 
 def suggest_models(hw, settings):
+    from .models import best, describe, gather, rank
     room = (hw.get("vramGB") or 0) + hw.get("ramGB", 0) * 0.7
     print(f"\n{YELLOW}No models yet.{RESET} This computer can hold a model of roughly {room:.0f} GB "
           f"(GPU memory + ~70% of RAM). Suggested:")
-    for repo, about in SUGGESTED:
-        print(f"  {repo}\n    {about}")
-        print(f"    Download:  {CYAN}hearthwork model {repo}{RESET}")
+    candidates = gather()
+    picks = [p for p in rank(candidates, hw, memory_gb()[1], settings) if p["fit"] != "too big" and p["recommended"]][:3]
+    if picks:
+        for p in picks:
+            label, lines = describe(p)
+            print(f"  {p['repo']}\n    {p['name']} {p['quant']} ({p['sizeGB']} GB): {label}")
+            for line in lines:
+                print(f"    {line}")
+            print(f"    Download:  {CYAN}hearthwork model {p['repo']}{RESET}")
+    else:
+        if any(c["files"] is None for c in candidates):
+            print("  (Couldn't reach Hugging Face to rank models for this computer; here are two common choices.)")
+        for repo, about in SUGGESTED:
+            print(f"  {repo}\n    {about}")
+            print(f"    Download:  {CYAN}hearthwork model {repo}{RESET}")
     print("  Any GGUF model with tool-calling support works; pass its Hugging Face link to `hearthwork model`.")
 
 

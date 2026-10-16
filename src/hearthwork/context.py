@@ -12,6 +12,7 @@ GGUF header, computes that, and from the hardware gives a range:
 config.json: server.context is "auto" (default) or a number for all models; contexts[<model file>] overrides it
 for one model; `hearthwork start --context N` overrides both for that start.
 """
+import io
 import json
 import re
 import struct
@@ -136,9 +137,20 @@ def kv_elements_per_token(meta):
     return arch, layers, int(sum(per_layer) * (key + value))  # zero entries (no attention in that layer) add nothing
 
 
+def info_from_bytes(data, kv_type="q8_0"):
+    """model_info for the first bytes of a GGUF file (enough to hold the header), without a file on disk."""
+    try:
+        return info_from_metadata(_read_header(io.BytesIO(data)), kv_type)
+    except (struct.error, ValueError, UnicodeDecodeError, MemoryError):
+        return None
+
+
 def model_info(path, kv_type="q8_0"):
     """{arch, modelMax, layers, kvPerToken (bytes, None if unknown)} for a GGUF file, or None if unreadable."""
-    meta = read_metadata(path)
+    return info_from_metadata(read_metadata(path), kv_type)
+
+
+def info_from_metadata(meta, kv_type="q8_0"):
     arch = meta.get("general.architecture")
     if not arch:
         return None

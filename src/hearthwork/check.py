@@ -6,49 +6,22 @@ Run it without installing anything:
 or, once installed:  hearthwork check      (--json for scripts)
 
 Read-only: it checks the hardware and installed agents, gives the same verdict Hearthwork's setup gives, and
-looks up live file sizes on Hugging Face to pick the best version of each suggested model that fits.
+ranks suggested models for this computer's memory, using live file sizes and model headers from Hugging Face.
 """
 import argparse
 import json
 import platform
-import re
 import shutil
 import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
 from .runtime import recommend
-from .onboard import CYAN, GREEN, RED, RESET, WINDOWS, YELLOW, detect, judge, lmstudio_folders, memory_gb
+from .models import best, describe, gather, rank
+from .onboard import CYAN, GREEN, RED, RESET, WINDOWS, YELLOW, detect, judge, lmstudio_folders, memory_gb, settings_for
 
 BOLD, DIM = "\033[1m", "\033[2m"
 REPO = "https://github.com/BillyMRX1/hearthwork"
-
-# Coding models with tool-calling chat templates (checked on Hugging Face, 2026-10). "moe": only a few experts run
-# per token, so the model stays usable when part of it sits in system RAM. Measured on the reference PC
-# (RTX 5060 Ti 16 GB + 22.6 GB RAM, 64K context): MoE Qwen3-Coder-30B partly in RAM 18-31 tokens/s; dense
-# Qwen3.8-27B partly in RAM ~6 tokens/s.
-# "tested": Hearthwork benchmark (bench.py, 8 graded coding tasks) on the reference PC, Q4_K_M, 2026-10-07.
-MODELS = [
-    {"repo": "unsloth/Qwen3.5-35B-A3B-GGUF", "name": "Qwen3.5-35B-A3B", "moe": True, "tested": True,
-     "note": "best in the benchmark: 8/8 with Codex (2.6 min) and Claude Code (3.6 min)"},
-    {"repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", "name": "Qwen3-Coder-30B-A3B", "moe": True, "tested": True,
-     "note": "8/8 with Claude Code (3.9 min) and Codex (4.2 min); a bit smaller"},
-    {"repo": "unsloth/GLM-4.7-Flash-GGUF", "name": "GLM-4.7-Flash (30B MoE)", "moe": True, "tested": True,
-     "note": "8/8 with Codex (4.5 min), 7.7/8 with Claude Code (missed one bug)"},
-    {"repo": "ggml-org/gpt-oss-20b-GGUF", "name": "gpt-oss-20b", "moe": True, "note": "small and fast; good at tool use"},
-    {"repo": "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF", "name": "Devstral-Small-2-24B", "moe": False,
-     "note": "coding agent (dense: needs to fit the GPU to be fast)"},
-    {"repo": "unsloth/Qwen3.5-27B-GGUF", "name": "Qwen3.5-27B", "moe": False, "note": "dense"},
-    {"repo": "unsloth/Qwen3-Coder-Next-GGUF", "name": "Qwen3-Coder-Next (80B MoE)", "moe": True,
-     "note": "strongest here; needs a big machine"},
-    {"repo": "lmstudio-community/Qwen3.5-9B-GGUF", "name": "Qwen3.5-9B", "moe": False,
-     "note": "small machines only; much weaker with agents' tools"},
-]
-# Best quality first. Below Q3, answers get noticeably worse.
-QUANTS = ["Q4_K_M", "UD-Q4_K_XL", "MXFP4", "Q4_K_S", "Q3_K_M", "UD-Q3_K_XL", "Q3_K_S", "UD-Q2_K_XL", "Q2_K"]
-KV_GB_64K = 3.4  # KV cache for a 64K context at q8_0, measured with Qwen3-Coder-30B (varies by model)
-
 
 def version(binary):
     path = shutil.which(binary)
@@ -59,42 +32,6 @@ def version(binary):
         return out.splitlines()[0] if out else "installed"
     except (OSError, subprocess.SubprocessError):
         return "installed"
-
-
-def quant_sizes(repo):
-    """{quant: GB} from Hugging Face (multi-part files summed); None when offline."""
-    url = f"https://huggingface.co/api/models/{repo}/tree/main?recursive=true"
-    try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "hearthwork-check"}), timeout=20) as r:
-            files = json.load(r)
-    except Exception:
-        return None
-    sizes = {}
-    for f in files:
-        path = f.get("path", "")
-        if not path.endswith(".gguf") or "mmproj" in path.lower():
-            continue
-        name = re.sub(r"-\d{5}-of-\d{5}", "", Path(path).name)
-        for quant in QUANTS:
-            if name.upper().endswith(f"-{quant.upper()}.GGUF") or name.upper().endswith(f"_{quant.upper()}.GGUF"):
-                sizes[quant] = sizes.get(quant, 0) + (f.get("lfs") or {}).get("size", f.get("size", 0)) / 2**30
-    return sizes
-
-
-def place(model, sizes, gpu_room, ram_room):
-    """Best quantization for this machine -> (quant, GB, fit) with fit in fast / good / slow, or None if too big."""
-    if model["moe"]:  # MoE stays fast partly in RAM: best quality that fits at all
-        for quant in QUANTS:
-            if quant in sizes and sizes[quant] <= gpu_room + ram_room:
-                return quant, sizes[quant], "fast" if sizes[quant] <= gpu_room else "good"
-        return None
-    for quant in QUANTS:  # dense: fitting the GPU entirely matters most
-        if quant in sizes and sizes[quant] <= gpu_room:
-            return quant, sizes[quant], "fast"
-    for quant in QUANTS:  # then GPU + RAM
-        if quant in sizes and sizes[quant] <= gpu_room + ram_room:
-            return quant, sizes[quant], "good" if model["moe"] else "slow"
-    return None
 
 
 def main(argv=None):
@@ -109,29 +46,15 @@ def main(argv=None):
     home_disk = shutil.disk_usage(Path.home()).free / 2**30
     agents = {"Claude Code": version("claude"), "Codex": version("codex")}
     vram = hw.get("vramGB") or 0
-    if hw["backend"] == "metal":
-        gpu_room, ram_room = max(0.0, hw["ramGB"] * 0.75 - 1.5 - KV_GB_64K), 0.0
-    else:
-        gpu_room = max(0.0, vram - 1.5 - KV_GB_64K) if hw["backend"] in ("cuda", "vulkan") else 0.0
-        ram_room = max(0.0, hw["ramGB"] - 6)
-
-    picks = []
-    offline = False
-    for model in MODELS:
-        sizes = quant_sizes(model["repo"])
-        if sizes is None:
-            offline = True
-            continue
-        fit = place(model, sizes, gpu_room, ram_room)
-        picks.append({**model, "quant": fit[0] if fit else None, "sizeGB": round(fit[1], 1) if fit else None,
-                      "fit": fit[2] if fit else "too big"})
-    rank = {"fast": 0, "good": 1, "slow": 2, "too big": 3}
-    picks.sort(key=lambda p: (p["fit"] == "too big", not p.get("tested"), rank[p["fit"]], MODELS.index(next(m for m in MODELS if m["repo"] == p["repo"]))))
+    candidates = gather()
+    offline = any(c["files"] is None for c in candidates)
+    picks = rank(candidates, hw, ram_free, settings_for(hw))
+    top = best(picks)
 
     if args.json:
         print(json.dumps({"hardware": hw, "ramFreeGB": round(ram_free, 1), "diskFreeGB": round(home_disk, 1),
                           "runtime": runtime, "runtimeReason": runtime_why, "verdict": verdict, "reasons": reasons, "expect": expect, "agents": agents,
-                          "models": picks, "offline": offline}, indent=2))
+                          "models": picks, "recommended": top["repo"] if top else None, "offline": offline}, indent=2))
         return
 
     print(f"\n{BOLD}Hearthwork check{RESET}  {DIM}(local models for Claude Code / Codex){RESET}\n")
@@ -159,28 +82,26 @@ def main(argv=None):
         print(f"  {YELLOW}Install at least one: Claude Code (https://code.claude.com) or Codex "
               f"(https://developers.openai.com/codex).{RESET}")
 
-    print(f"\n{BOLD}Models for this computer{RESET}  {DIM}(best version that fits; sizes live from Hugging Face){RESET}")
-    labels = {"fast": f"{GREEN}fits the GPU: fast{RESET}", "good": f"{GREEN}GPU + RAM: good (MoE){RESET}",
-              "slow": f"{YELLOW}GPU + RAM: slow (dense){RESET}", "too big": f"{RED}too big{RESET}"}
+    print(f"\n{BOLD}Models for this computer{RESET}  {DIM}(ranked for this computer; sizes live from Hugging Face){RESET}")
+    colors = {"fast": GREEN, "good": GREEN, "slow": YELLOW, "too big": RED}
     for p in picks:
+        label, lines = describe(p)
         size = f"{p['quant']:<10} {p['sizeGB']:5.1f} GB" if p["quant"] else " " * 19
-        tested = f" {CYAN}[tested]{RESET}" if p.get("tested") else ""
-        print(f"  {p['name']:<28} {size}  {labels[p['fit']]}{tested}")
-        print(f"  {DIM}{'':<28} {p['note']}{RESET}")
+        star = f" {CYAN}<- best for this computer{RESET}" if top and p["repo"] == top["repo"] else ""
+        print(f"  {p['name']:<28} {size}  {YELLOW if p.get('lowQuality') else colors[p['fit']]}{label}{RESET}{star}")
+        for line in lines:
+            print(f"  {DIM}{'':<28} {line}{RESET}")
     if offline:
-        print(f"  {YELLOW}Some models could not be looked up (offline?).{RESET}")
-    print(f"  {DIM}Measured on an RTX 5060 Ti 16 GB + 22.6 GB RAM: MoE partly in RAM 18-31 tokens/s, "
-          f"dense partly in RAM ~6 tokens/s.{RESET}")
+        print(f"  {YELLOW}Some models could not be looked up (offline?). Context memory is estimated conservatively.{RESET}")
 
-    best = next((p for p in picks if p["fit"] in ("fast", "good")), None)
     print(f"\n{BOLD}Next step{RESET}")
-    if verdict == "not recommended" or not best:
+    if verdict == "not recommended" or not top:
         print("  A local model would be too slow or too weak for coding on this computer. Cloud Claude Code / Codex is the"
               " better choice here.")
     else:
         print(f"  1. Install Hearthwork:  {CYAN}uv tool install hearthwork{RESET}   (or: pipx install hearthwork)")
-        print(f"  2. Download a model:    {CYAN}hearthwork model {best['repo']}{RESET}   "
-              f"(pick {best['quant']}, {best['sizeGB']} GB)")
+        print(f"  2. Download a model:    {CYAN}hearthwork model {top['repo']}{RESET}   "
+              f"(pick {top['quant']}, {top['sizeGB']} GB)")
         print(f"  3. From your project folder, run {CYAN}hearthwork{RESET}: setup takes a minute, then pick your agent.")
     print()
 

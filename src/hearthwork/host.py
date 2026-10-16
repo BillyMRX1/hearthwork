@@ -123,9 +123,11 @@ class Ticket:
         self.gate, self.entry, self.done = gate, entry, False
 
     def release(self, outcome="ok"):
-        if not self.done:
+        with self.gate.cond:  # the stream thread and the disconnect watcher may both release (cond is an RLock)
+            if self.done:
+                return
             self.done = True
-            self.gate._release(self.entry, outcome)
+        self.gate._release(self.entry, outcome)
 
 
 class Gate:

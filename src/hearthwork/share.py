@@ -418,7 +418,9 @@ class Share:
             else:
                 handler._send_json(404, {"error": {"message": "not found"}})
             return True
-        if self.authenticate(handler):
+        device = self.authenticate(handler)
+        if device:
+            handler.hearthwork_client = f"share:{device['name']}"[:60]  # the host's queue and status name the device
             return False
         handler._send_json(401, {"type": "error", "error": {
             "type": "authentication_error",
@@ -454,7 +456,9 @@ def share_main(argv):
         return 1
     share = Share(config, args.port, args.tailscale, lan_ok, tailscale)
     try:
-        server = make_relay(config["server"]["port"], ("0.0.0.0", args.port), share.intercept)
+        from . import host
+        server = make_relay(host.port(config), ("0.0.0.0", args.port), share.intercept, normalize=False,
+                            forward_headers=lambda handler: {"X-Hearthwork-Client": getattr(handler, "hearthwork_client", "share")})
     except OSError as error:
         print(f"{RED}Cannot listen on port {args.port}: {error}{RESET}")
         return 1

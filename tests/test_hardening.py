@@ -151,11 +151,20 @@ def api_headers(values):
 
 
 class ServerCwdTests(unittest.TestCase):
-    def test_background_server_cwd_is_the_data_dir(self):
-        with mock.patch.object(server.subprocess, "Popen") as popen:
-            server.popen_server(["llama-server"])
-        self.assertEqual(popen.call_args.kwargs["cwd"], str(server.HOME))
+    def spawn(self, **patches):
+        log = Path(tempfile.gettempdir()) / "hw-test-server.log"
+        with mock.patch.object(server, "LOG", log), mock.patch.object(server.subprocess, "Popen", **patches) as popen:
+            server.spawn_server(["llama-server"])
+        return popen
 
+    def test_background_server_cwd_is_the_data_dir(self):
+        self.assertEqual(self.spawn().call_args.kwargs["cwd"], str(server.HOME))
+
+    @unittest.skipUnless(os.name == "nt", "Windows flags")
+    def test_windows_server_has_no_console_window(self):
+        self.assertTrue(self.spawn().call_args.kwargs["creationflags"] & server.subprocess.CREATE_NO_WINDOW)
+
+    @unittest.skipUnless(os.name == "nt", "Windows branch")
     def test_breakaway_falls_back(self):
         calls = []
 
@@ -164,22 +173,13 @@ class ServerCwdTests(unittest.TestCase):
             if len(calls) == 1:
                 raise PermissionError("no breakaway")
             return mock.Mock()
-        with mock.patch.object(server.subprocess, "Popen", side_effect=fake):
-            server.popen_server(["llama-server"])
+        self.spawn(side_effect=fake)
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[1]["cwd"], str(server.HOME))
 
     @unittest.skipIf(os.name == "nt", "POSIX branch")
     def test_posix_branch(self):
-        config = {"server": {"port": 1, "slots": 1}}
-        with mock.patch.object(server, "stop"), mock.patch.object(server.ctx, "choose", return_value=(1, "s", None)), \
-                mock.patch.object(server.ctx, "describe", return_value=""), mock.patch.object(server, "command", return_value=["x"]), \
-                mock.patch.object(server, "WINDOWS", False), mock.patch.object(server, "ready", return_value=True), \
-                mock.patch.object(server, "restore_slots", return_value=0), mock.patch.object(server, "STATE"), \
-                mock.patch.object(server, "LOG", Path(tempfile.gettempdir()) / "hw-test.log"), \
-                mock.patch.object(server.subprocess, "Popen") as popen:
-            server.start_background(config, Path("m.gguf"))
-        self.assertEqual(popen.call_args.kwargs["cwd"], str(server.HOME))
+        self.assertTrue(self.spawn().call_args.kwargs["start_new_session"])
 
 
 class ResultTests(unittest.TestCase):

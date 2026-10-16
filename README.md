@@ -80,7 +80,7 @@ The first run sets things up (see below). After that you get one menu:
 ```
 
 - **Picking an agent** starts the model if none is running: you pick it (the last used is highlighted, Enter keeps it), it loads in the background, and then the agent opens in this terminal, in your project folder. Exit the agent to come back to the menu.
-- **The model server keeps running** between agent sessions, so switching between Claude Code and Codex is instant. Both can use it at the same time. On Windows it runs in its own window, which shows its log; on macOS/Linux the log is `server.log` in the data folder.
+- **One host per computer.** `hearthwork start` (or any command that needs the model) starts the Hearthwork host in the background: it owns llama-server and the single relay every client goes through (agents, `task`/MCP, `hearthwork api`, `hearthwork share`). It listens on `127.0.0.1:8470`; each agent session identifies itself with a token like `local-claude-ab12`. The host runs at most as many requests at once as the model has slots (2 by default); the rest wait in one first-come queue (16 waiting, 10 minutes at most). When it is full the caller gets an overload error in its own API format (Anthropic `overloaded_error`, HTTP 529; OpenAI-style 503 with `Retry-After`). A caller that disconnects leaves the queue, or its upstream request is closed. The model keeps running between agent sessions; nothing opens a window. `hearthwork logs` shows the host's log (`--server`: llama-server's own output, `-f` follows); `hearthwork stop` saves the prompt cache and stops both. A model started by an older Hearthwork is adopted, not restarted.
 - **On quit** it asks whether to stop the server.
 - **Skip the menu:** `hearthwork claude` / `hearthwork codex`.
 
@@ -89,14 +89,15 @@ The first run sets things up (see below). After that you get one menu:
 | `hearthwork` | The menu above. |
 | `hearthwork claude [args]` | Claude Code with the local model; starts a model first if none is running. Extra arguments go to `claude`. |
 | `hearthwork opencode\|aider\|qwen [args]` | OpenCode, Aider or Qwen Code with the local model (see Agents). Extra arguments go to the agent, e.g. `hearthwork opencode run "..."`, `hearthwork aider --message "..."`. |
-| `hearthwork <agent> --dry-run` | Prints the exact command, the environment variables Hearthwork sets (keys and tokens masked) and the files it generates, without starting the model, the relay or the agent. Must be the first argument. |
+| `hearthwork <agent> --dry-run` | Prints the exact command, the environment variables Hearthwork sets (keys and tokens masked) and the files it generates, without starting the model or the agent. Must be the first argument. |
 | `hearthwork agents` | Lists the supported agents: installed (and version), the API each uses, how Hearthwork connects it, and the install command of the missing ones. |
 | `hearthwork codex [args]` | Codex with the local model; starts a model first if none is running. Extra arguments go to `codex`, e.g. `hearthwork codex exec "..."`. |
 | `hearthwork start [--model X]` | Starts the model server in the background. |
-| `hearthwork stop` | Stops the background model server. |
-| `hearthwork serve [--model X]` | Runs the model server in this terminal; Ctrl+C stops it. |
+| `hearthwork stop` | Saves the prompt cache, then stops the model and the host. |
+| `hearthwork logs [--server] [-f]` | Shows the host's log (requests, queue, start/stop); `--server` shows llama-server's output instead; `-f` keeps printing new lines. |
+| `hearthwork serve [--model X]` | Runs the host (and the model) in this terminal with its log; Ctrl+C stops it. |
 | `hearthwork context [model] [N\|auto]` | Shows the context range for each model on this computer; with `N` (e.g. `96K`) saves it for that model, `auto` clears it. |
-| `hearthwork status` | Shows what is running, with the context the server really runs with. |
+| `hearthwork status` | Shows the host, the model with the context it really runs with, its slots, and the active and queued requests per client (each agent session, `api`, each shared device). |
 | `hearthwork share [--port 8484] [--allow-public] [--tailscale]` | Shares the running model on your home network (starts one if needed); Ctrl+C stops. `--tailscale` also makes it usable from anywhere through Tailscale. A PIN shows here when another computer asks to connect. |
 | `hearthwork devices [remove <name>]` | Lists the computers allowed to use your model; `remove` revokes one at once. |
 | `hearthwork connect [host[:port]]` | Uses the model of a computer that is sharing: finds it on the local network and among your Tailscale computers (or give its address), pairs with the PIN. |
@@ -198,7 +199,7 @@ Some models write their tool call as plain text in a format the server's chat te
 
 Formats, tried in this order: Mistral `[TOOL_CALLS]`; `[Calling tool: f({...})]`; `<tool_call>{json}</tool_call>`; `<function=name><parameter=x>..</parameter></function>` (or JSON inside); XML-style tags (`<invoke name=..>`, `<tool_name>..</tool_name>`); pythonic `f(a=1, b="x")`; raw JSON `{"name": .., "arguments": ..}`. Several calls in one reply work, and `<think>` blocks are ignored.
 
-A call is only accepted when the tool exists in the request and its arguments are an object that satisfies the schema's required keys and basic types; otherwise the reply goes through untouched. Nothing is repaired when the request had no tools. Streams are not delayed unless the text starts to look like a call (`[TOOL_CALLS]`, `<tool_call>`, `<function=`, a tool name followed by `(`, ...); only then is the text held back until the reply ends. Each repair prints `repaired a tool call written as text (<format>, <name>)` on stderr of the process that owns the relay, and `hearthwork doctor` reports it as "repaired by Hearthwork". Turn it off with `HEARTHWORK_TOOL_REPAIR=0`.
+A call is only accepted when the tool exists in the request and its arguments are an object that satisfies the schema's required keys and basic types; otherwise the reply goes through untouched. Nothing is repaired when the request had no tools. Streams are not delayed unless the text starts to look like a call (`[TOOL_CALLS]`, `<tool_call>`, `<function=`, a tool name followed by `(`, ...); only then is the text held back until the reply ends. Each repair logs `repaired a tool call written as text (<format>, <name>)` in the host's log (`hearthwork logs`), and `hearthwork doctor` reports it as "repaired by Hearthwork". Turn it off with `HEARTHWORK_TOOL_REPAIR=0`.
 
 ## Benchmark
 
@@ -261,7 +262,7 @@ Verdicts: `works`, `configuration/connection problem at <stage>`, `protocol prob
 | Aider (`aider`) | `uv tool install --python 3.12 aider-chat` | OpenAI Chat Completions | `OPENAI_API_BASE` / `OPENAI_API_KEY` env vars, `--model openai/<model>`, a generated `--model-metadata-file` (context) and `--model-settings-file` (`max_tokens`); `--no-show-model-warnings --no-check-update --no-analytics` | Not an agent loop: it edits files from a reply format and cannot read or run anything on its own, so `hearthwork task` switches its shell commands off and `hearthwork bench` scores it low (1.7/8 on Qwen3.5-35B-A3B). It keeps its own git behaviour (creates a repo, commits, adds `.aider*` to `.gitignore`). Install with Python 3.12: `uv tool install aider-chat` fails to build `scipy` on 3.13+ on Windows. Hearthwork sets `PYTHONUTF8=1` so its console does not crash on Windows code pages. |
 | Qwen Code (`qwen`) | `npm i -g @qwen-code/qwen-code` | OpenAI Chat Completions | `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL` env vars and a generated settings file (`contextWindowSize`, `max_tokens`) given through `QWEN_CODE_SYSTEM_SETTINGS_PATH`; `~/.qwen/settings.json` is not changed | Headless: `qwen "prompt"`; `hearthwork task` uses `--approval-mode auto-edit` plus `--allowed-tools` for the `--allow` commands. It also runs a background memory extraction that makes extra requests. |
 
-- **Every agent goes through a small relay** inside Hearthwork (`src/hearthwork/harnesses.py`). It reshapes requests so any model's chat template accepts them, for all three APIs.
+- **Every agent goes through the host's relay** (`src/hearthwork/harnesses.py`, run by `src/hearthwork/host.py`). It reshapes requests so any model's chat template accepts them, for all three APIs.
 - **Why the relay is needed:** strict templates (e.g. Qwen3.5/3.8) reject a second system/developer message, unknown roles, or two user messages in a row, and these agents send them. Without the relay, Claude Code and Codex requests failed on Qwen3.8 with "System message must be at the beginning".
 - **Your own config is never edited.** Each agent gets environment variables, command-line flags, or a generated file in the data folder. They write their own state (history, caches) where they always do.
 - **`--dry-run`** shows all of it without starting anything:
@@ -271,7 +272,7 @@ hearthwork opencode --dry-run      # the command, the environment (keys masked),
 hearthwork task --agent qwen --dry-run "fix the failing test"
 ```
 
-It prints the placeholder `http://127.0.0.1:<relay-port>` for the relay, which gets a free port at launch. Put `--dry-run` first: everything after it goes to the agent as usual (Aider has a `--dry-run` of its own, which still works after another argument).
+It shows the host's address `http://127.0.0.1:8470`; the token is `local-<agent>-<id>`, with a new id each session. Put `--dry-run` first: everything after it goes to the agent as usual (Aider has a `--dry-run` of its own, which still works after another argument).
 - **Adding another agent** means adding one entry to `HARNESSES` in `src/hearthwork/harnesses.py`: names, version command, install hint, which API it speaks, a function that builds its command and environment, and how to run it headless and read its final message. Menu, `agents`, `task`, MCP and `bench` pick it up from there.
 - **Not yet supported:** Goose (environment variables look possible: `GOOSE_PROVIDER`, `OPENAI_HOST`, `GOOSE_MODEL`, but not verified), Crush, Kilo Code CLI, OpenHands (needs Docker or its own runtime) and Hermes. A clean, non-invasive way to point each at a custom endpoint was not verified, so they are left out rather than guessed. Until then, `hearthwork api --show` gives setup snippets for tools without a launcher.
 
@@ -282,7 +283,7 @@ It prints the placeholder `http://127.0.0.1:<relay-port>` for the relay, which g
 - **`permissions.defaultMode: "default"`**: Claude Code's ask-before-risky-actions mode ("manual" in its UI). Newer Claude Code versions start in auto mode, where the local model checks every command first; see the measurement below. Shift+Tab still switches modes.
 - **A status line** such as `local · Qwen3.5-35B-A3B-Q4_K_M · 64K`, so a local session is never mistaken for cloud Claude. It runs the hidden command `hearthwork statusline <model> <context>` with the same Python that runs Hearthwork.
 - **Your overrides:** if `~/.claude/settings-hearthwork.json` exists it is merged on top (nested objects are merged, other values replace). Use it for your own permissions, hooks, status line, or even `"defaultMode": "auto"` (Hearthwork then reminds you about the slow checks). A file with invalid JSON is ignored with a warning. `HEARTHWORK_CLAUDE_OVERRIDES` points to a different file.
-- The connection (relay address, model names, token limits) stays in environment variables of the Claude Code process, not in the file: the relay port is new each session.
+- The connection (host address, session token, model names, token limits) stays in environment variables of the Claude Code process, not in the file: the token is new each session.
 
 ### Short commands: `hearthwork alias`
 

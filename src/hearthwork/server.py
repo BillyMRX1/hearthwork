@@ -1,4 +1,4 @@
-"""The llama.cpp server: build its command, start it in the foreground or background, check and stop it."""
+"""The llama.cpp server: build its command, start it (the host does, see host.py), check and stop it."""
 import json
 import os
 import signal
@@ -178,50 +178,29 @@ def _alive(pid):
         return False
 
 
-def popen_server(cmd):
-    """Windows: start llama-server in its own console, with the data folder as its cwd (it would otherwise lock
-    whatever folder the caller was in, e.g. a worktree, so Windows could not delete it) and outside any job object
-    of the caller (an MCP task's Job Object must not take the shared model server down with it)."""
-    flags = subprocess.CREATE_NEW_CONSOLE
+def spawn_server(cmd):
+    """Start llama-server for the host: no console window (Windows), output in logs/server.log, the data folder as
+    its cwd (it would otherwise lock whatever folder the caller was in) and outside any job object of the caller (an MCP
+    task's Job Object must not take the shared model server down with it)."""
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    log = open(LOG, "wb")
     try:
-        return subprocess.Popen(cmd, creationflags=flags | 0x01000000, cwd=str(HOME))  # CREATE_BREAKAWAY_FROM_JOB
-    except OSError:  # the caller's job does not allow breakaway
-        return subprocess.Popen(cmd, creationflags=flags, cwd=str(HOME))
-
-
-def start_background(config, model, context=None):
-    """Start the server in its own window (Windows) or in the background with a log file; wait until ready."""
-    stop(config, quiet=True)
-    context, source, rng = ctx.choose(config, model, context)
-    print(f"{DIM}{ctx.describe(context, source, rng)}{RESET}")
-    cmd = command(config, model, context)
-    if WINDOWS:  # its own console window shows the server log; closing that window stops the server
-        process = popen_server(cmd)
-        where = "its own window"
-    else:
-        log = open(LOG, "w")
-        process = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True, cwd=str(HOME))
-        where = str(LOG)
-    STATE.write_text(json.dumps({"pid": process.pid, "model": str(model), "port": config["server"]["port"]}))
-    print(f"Starting {model.name} (log: {where})", end="", flush=True)
-    started = time.time()
-    while not ready(config["server"]["port"]):
-        if process.poll() is not None:
-            print(f"\n{RED}The server stopped while loading (exit code {process.returncode}).{RESET}")
-            if not WINDOWS and LOG.exists():
-                print("\n".join(LOG.read_text(errors="replace").splitlines()[-15:]))
-            STATE.unlink(missing_ok=True)
-            return False
-        time.sleep(1)
-        print(".", end="", flush=True)
-    restored = restore_slots(config["server"]["port"], config["server"]["slots"])
-    note = f" (restored {restored:,} cached prompt tokens: the first message will be quick)" if restored else ""
-    print(f" {GREEN}ready in {time.time() - started:.0f} s{RESET}{note}")
-    return True
+        if WINDOWS:
+            flags = subprocess.CREATE_NO_WINDOW
+            try:
+                return subprocess.Popen(cmd, creationflags=flags | 0x01000000, cwd=str(HOME), stdin=subprocess.DEVNULL,
+                                        stdout=log, stderr=subprocess.STDOUT)  # CREATE_BREAKAWAY_FROM_JOB
+            except OSError:  # the caller's job does not allow breakaway
+                return subprocess.Popen(cmd, creationflags=flags, cwd=str(HOME), stdin=subprocess.DEVNULL,
+                                        stdout=log, stderr=subprocess.STDOUT)
+        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                                cwd=str(HOME))
+    finally:
+        log.close()
 
 
 def stop(config, quiet=False):
-    """Stop the server this tool started in the background (not one started with `hearthwork serve`)."""
+    """Stop the llama-server Hearthwork started (server.json: pid, model, port), saving its prompt caches first."""
     try:
         state = json.loads(STATE.read_text())
     except (OSError, ValueError):
@@ -245,29 +224,6 @@ def stop(config, quiet=False):
         if not quiet:
             print(f"Stopped {Path(state['model']).name}.")
     STATE.unlink(missing_ok=True)
-
-
-def run_foreground(config, model, context=None):
-    """`hearthwork serve`: run the server in this terminal until Ctrl+C. Saved prompt caches are restored once it is up."""
-    import threading
-    context, source, rng = ctx.choose(config, model, context)
-    print(f"{DIM}{ctx.describe(context, source, rng)}{RESET}")
-
-    def restore_when_ready():
-        for _ in range(600):
-            if ready(config["server"]["port"]):
-                restored = restore_slots(config["server"]["port"], config["server"]["slots"])
-                if restored:
-                    print(f"\n{GREEN}Restored {restored:,} cached prompt tokens: the first message will be quick.{RESET}\n",
-                          flush=True)
-                return
-            time.sleep(1)
-
-    threading.Thread(target=restore_when_ready, daemon=True).start()
-    try:
-        sys.exit(subprocess.call(command(config, model, context), cwd=str(HOME)))
-    except KeyboardInterrupt:
-        pass
 
 
 def choose_and_remember(config, model_hint=None):

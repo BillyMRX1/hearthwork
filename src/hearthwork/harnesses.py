@@ -11,10 +11,12 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from . import paths, repair
@@ -218,11 +220,44 @@ def repaired_reply(api, data, tools):
     return body, result[1]
 
 
-def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_headers=None):
-    """HTTP relay to llama-server on `upstream_port`, bound to `address` (not yet serving). `intercept(handler)`, when
-    given, runs first for every request and returns True once it has answered it itself: `hearthwork share` uses it
-    for the device check and the pairing endpoints, and everything else goes through the same normalization.
-    `extra_headers(handler)` returns [(name, value)] added to every response (CORS in `hearthwork api`)."""
+class Overloaded(Exception):
+    """The host's queue is full, the wait ran out, or it is shutting down."""
+
+
+class ClientGone(Exception):
+    """The caller hung up while its request waited in the queue."""
+
+
+def overloaded_reply(path, message):
+    """(status, headers, body) of the overload error in the caller's own API format."""
+    if path.rstrip("/").endswith("/messages"):  # Anthropic: HTTP 529 overloaded_error
+        return 529, [], {"type": "error", "error": {"type": "overloaded_error", "message": message}}
+    return 503, [("Retry-After", "10")], {"error": {"message": message, "type": "server_error", "code": "overloaded"}}
+
+
+def client_gone(sock):
+    """The caller closed its end (the request is read in full, so anything readable is end of stream)."""
+    import select
+    import socket
+    try:
+        if not select.select([sock], [], [], 0)[0]:
+            return False
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except (BlockingIOError, InterruptedError):
+        return False
+    except (OSError, ValueError):
+        return True
+
+
+def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_headers=None, gate=None, normalize=True,
+               forward_headers=None):
+    """HTTP relay to llama-server (or the host) on `upstream_port`, bound to `address` (not yet serving). `intercept(handler)`,
+    when given, runs first for every request and returns True once it has answered it itself: `hearthwork share` uses it
+    for the device check and the pairing endpoints. `extra_headers(handler)` returns [(name, value)] added to every
+    response (CORS in `hearthwork api`). `gate` (host.Gate) admits generation requests (queue, overload errors) and counts
+    them. `normalize=False` forwards requests untouched: api/share forward to the host, which normalizes once.
+    `forward_headers(handler)` returns {name: value} set on the forwarded request (the client id for the host).
+    Whoever hangs up, queued or running, the upstream request is closed."""
 
     class Relay(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"  # the body ends when the connection closes: simple, works for streams
@@ -244,12 +279,24 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
             length = int(self.headers.get("content-length") or 0)
             return self.rfile.read(min(length, limit) if limit else length)
 
+        def _overloaded(self, path, message):
+            status, headers, payload = overloaded_reply(path, message)
+            data = json.dumps(payload).encode()
+            self.send_response(status)
+            for name, value in headers:
+                self.send_header(name, value)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(data)))
+            self._extra()
+            self.end_headers()
+            self.wfile.write(data)
+
         def _relay(self):
             if intercept and intercept(self):
                 return
             body = self.rfile.read(int(self.headers.get("content-length") or 0)) or None
             path = self.path.split("?")[0]
-            if self.command == "GET" and path.rstrip("/").endswith("/models"):
+            if normalize and self.command == "GET" and path.rstrip("/").endswith("/models"):
                 # llama.cpp's list also carries an Ollama-style "models" array that Codex tries (and fails) to
                 # read as its own model catalogue; an empty catalogue keeps Codex quiet, "data" serves the rest.
                 try:
@@ -259,7 +306,7 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                 except Exception as error:
                     return self._send_json(502, {"error": {"message": str(error)}})
             api, tools, wants_stream = None, {}, False
-            if body and self.command == "POST":
+            if normalize and body and self.command == "POST":
                 try:
                     payload = json.loads(body)
                     raw = payload
@@ -277,13 +324,50 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                     wants_stream = bool(payload.get("stream"))
                 except ValueError:
                     pass
+            ticket = None
+            if gate and gate.wants(self.command, path):
+                try:
+                    ticket = gate.admit(self.connection, gate.client_of(self.headers), path)
+                except Overloaded as error:
+                    return self._overloaded(path, str(error))
+                except ClientGone:
+                    return
             headers = {k: v for k, v in self.headers.items()
                        if k.lower() not in ("host", "content-length", "connection", "accept-encoding")}
+            if forward_headers:
+                headers = {k: v for k, v in headers.items() if k.lower() != "x-hearthwork-client"}
+                headers.update(forward_headers(self))
             if body:
                 headers["content-length"] = str(len(body))
             upstream = http.client.HTTPConnection("127.0.0.1", upstream_port, timeout=3600)
+            state = {"outcome": "ok", "sent": False, "link": None}
+            finished = threading.Event()
+
+            def watch():
+                # The caller hung up (queued or not): close the upstream request, so nobody generates for nobody. A
+                # blocked read ends with shutdown; on Windows only closing the socket itself wakes it.
+                while not finished.wait(0.5):
+                    if client_gone(self.connection):
+                        state["outcome"] = "client disconnected"
+                        link = state["link"]
+                        if link is not None:
+                            try:
+                                link.shutdown(socket.SHUT_RDWR)
+                            except OSError:
+                                pass
+                            if os.name == "nt":
+                                try:
+                                    socket.socket._real_close(link)
+                                except OSError:
+                                    pass
+                        return
+
+            threading.Thread(target=watch, daemon=True).start()
             try:
                 upstream.request(self.command, self.path, body=body, headers=headers)
+                state["link"] = upstream.sock
+                if state["outcome"] != "ok":  # the caller left before we connected
+                    raise ConnectionAbortedError("the caller left")
                 response = upstream.getresponse()
                 tools = tools if response.status == 200 else {}
                 streaming = "event-stream" in (response.getheader("content-type") or "") or wants_stream
@@ -294,6 +378,7 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                     if fixed:
                         data = fixed[0]
                 self.send_response(response.status)
+                state["sent"] = True
                 for key, value in response.getheaders():
                     if key.lower() not in ("transfer-encoding", "content-length", "connection"):
                         self.send_header(key, value)
@@ -317,10 +402,20 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                     while chunk := response.read1(65536):
                         self.wfile.write(chunk)
                         self.wfile.flush()
-            except (ConnectionError, OSError):
-                pass  # the client went away (e.g. Esc in the agent)
+            except (ConnectionError, OSError, http.client.HTTPException):
+                # the client went away (e.g. Esc in the agent), or the model server did
+                if state["outcome"] == "ok":
+                    state["outcome"] = "caller closed the connection" if state["sent"] else "error"
+                    if not state["sent"]:
+                        try:
+                            self._overloaded(path, "The model server is not answering (loading, or stopped).")
+                        except OSError:
+                            pass
             finally:
+                finished.set()
                 upstream.close()
+                if ticket:
+                    ticket.release(state["outcome"])
 
         do_GET = do_POST = do_OPTIONS = _relay
 
@@ -330,6 +425,11 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
     server = http.server.ThreadingHTTPServer(address, Relay)
     server.daemon_threads = True
     return server
+
+
+def host_port():
+    from . import host
+    return host.port()
 
 
 def start_relay(upstream_port):
@@ -757,7 +857,7 @@ def installed(key):
 
 
 def prepare(key, port, name, context, max_output=4096, args=(), extra_env=None, remote=None, clean=False):
-    """(command, env) to run harness `key` against the server on `port` (starts the local relay), or None when the
+    """(command, env) to run harness `key` against the server on `port` (the Hearthwork host; `port` is llama-server's, unused), or None when the
     agent is not installed. With `remote` (config["remote"]: a model shared by another computer) the agent talks to that
     computer directly: no local relay (the host normalizes). With `clean`, the environment of a parent Claude Code /
     Codex session is dropped (see clean_env)."""
@@ -769,7 +869,8 @@ def prepare(key, port, name, context, max_output=4096, args=(), extra_env=None, 
     if remote:
         base_url, token = f"http://{url_host(remote['host'])}:{remote['port']}", remote["key"]
     else:
-        base_url, token = f"http://127.0.0.1:{start_relay(port)}", None
+        from . import host  # one host per computer owns the relay; the token tells it which session asks
+        base_url, token = f"http://127.0.0.1:{host.port()}", f"local-{key}-{uuid.uuid4().hex[:4]}"
     global _remote
     _remote = remote
     try:
@@ -799,7 +900,7 @@ def preview(key, name, context, max_output=4096, args=(), extra_env=None, remote
     global _preview, _remote
     harness = HARNESSES[key]
     base_url, token = ((f"http://{url_host(remote['host'])}:{remote['port']}", remote["key"]) if remote
-                       else ("http://127.0.0.1:<relay-port>", None))
+                       else (f"http://127.0.0.1:{host_port()}", f"local-{key}-<id>"))
     binary = installed(key) or harness["binary"]
     _preview, _remote = [], remote
     try:
@@ -831,8 +932,8 @@ def preview(key, name, context, max_output=4096, args=(), extra_env=None, remote
         print(f"  {path}\n" + "\n".join("    " + line for line in text.splitlines()))
     if not files:
         print("  (none)")
-    print("\nHearthwork starts a relay on a free local port " + ("(not used: the model is on another computer)" if remote else
-          "in front of the model server; <relay-port> stands for it") + ".")
+    print("\n" + ("The model is on another computer: no local host is used." if remote else
+          "The agent talks to the Hearthwork host on this computer (one queue for every client); the token names this session."))
     if note:
         print(note)
 
@@ -901,6 +1002,4 @@ def launch(key, port, name, context, max_output=4096, args=(), capture=False, cw
     except KeyboardInterrupt:
         return 130
     finally:
-        if not capture and not remote:
-            from .server import save_slots  # the session's prompt cache makes the next start's first message quick
-            save_slots(port)
+        pass  # the prompt cache is saved by the host when it stops

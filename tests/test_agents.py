@@ -139,7 +139,7 @@ class DryRunTests(unittest.TestCase):
 
     def test_preview_uses_placeholder_relay(self):
         text = self.preview("qwen")
-        self.assertIn("OPENAI_BASE_URL=http://127.0.0.1:<relay-port>/v1", text)
+        self.assertIn("OPENAI_BASE_URL=http://127.0.0.1:8470/v1", text)
         self.assertIn("OPENAI_API_KEY=********", text)
         self.assertIn("qwen-settings-model-x.json", text)
         self.assertIn('"contextWindowSize": 65536', text)

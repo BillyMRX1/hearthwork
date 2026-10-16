@@ -127,12 +127,14 @@ def model_for_task(config):
     port = config["server"]["port"]
     from .server import port_open
     name = served_model(port) or (port_open(port) and served_model(port, timeout=60))  # busy: wait, never restart it
+    from . import host
     if name:
+        if not host.ensure(config):  # starts the host in front of it (or adopts it)
+            sys.exit("The Hearthwork host did not start; see the messages above.")
         return port, name, agent_context(config), None
     if port_open(port):
         raise SystemExit(f"Port {port} is in use but no model answers; run `hearthwork stop` first.")
     from .onboard import find_models
-    from .server import start_background
     models = find_models(config["modelsDir"])
     last = config.get("lastModel")
     chosen = next((m for m in models if str(m) == last), None) or (models[0] if len(models) == 1 else None)
@@ -141,7 +143,7 @@ def model_for_task(config):
                  "(it asks which model), then try again." if models else
                  "No model is running and there are no models yet. Download one first: `hearthwork model <link>`.")
     with contextlib.redirect_stdout(sys.stderr):  # the start-up chatter must not reach stdout
-        ok = start_background(config, chosen)
+        ok = host.ensure(config, chosen)
     name = served_model(port) if ok else None
     if not name:
         sys.exit("The model server did not start; see the messages above.")

@@ -8,11 +8,13 @@
   hearthwork <agent> --dry-run  show the command, environment and generated files, start nothing (also: task --dry-run)
   hearthwork task "TASK"        one coding task for another agent to delegate (no terminal needed); see --help
   hearthwork mcp [install ...]  MCP server so any agent can use the local model as a subagent
-  hearthwork start [--model X]  start the model in the background     hearthwork stop
-  hearthwork serve [--model X]  run the model server in this terminal (Ctrl+C stops it)
+  hearthwork start [--model X] [--force]   start the model (under the Hearthwork host, in the background)
+  hearthwork stop               stop the model and the host (saves the prompt cache)
+  hearthwork serve [--model X]  run the host in this terminal with its log (Ctrl+C stops it)
+  hearthwork logs [--server] [-f]   the host's log (requests, queue); --server: llama-server's output
   hearthwork alias add <name> <agent>   short command for it, e.g. ccl  (also: alias list, alias remove <name>)
   hearthwork context [model] [N|auto]   context per model: range for this computer; save N for a model
-  hearthwork status             what is running
+  hearthwork status             host, model, context, slots, and active/queued requests per client
   hearthwork share [--port N]   share the running model on your home network (Ctrl+C stops); a PIN pairs each computer
   hearthwork api [--port N]     OpenAI + Anthropic compatible endpoint on this computer for any tool (--show: setup snippets)
   hearthwork devices            trusted devices (devices remove <name> revokes one)
@@ -130,26 +132,37 @@ def main(argv=None):
             from .menu import run_agent
             sys.exit(run_agent(configured(remote_ok=True), command, rest, back_to_menu=False))
         elif command in ("start", "serve"):
-            from .server import choose_and_remember, run_foreground, start_background
-            args = model_args(rest, command)
+            from . import host
+            from .server import choose_and_remember
+            force = "--force" in rest
+            args = model_args([a for a in rest if a != "--force"], command)
             config = configured()
+            if command == "serve" and host.running():
+                print("The Hearthwork host is already running. `hearthwork status` shows it; `hearthwork stop` stops it first.")
+                sys.exit(1)
             model = choose_and_remember(config, args.model)
             if not model:
                 sys.exit(1)
             if command == "start":
-                ok = start_background(config, model, args.context)
+                ok = host.ensure(config, model, args.context, force=force)
                 if ok:
                     print(f"{CYAN}Now run `hearthwork claude` or `hearthwork codex` from your project.{RESET}")
                 sys.exit(0 if ok else 1)
-            print(f"\nStarting {model.name}   port: {config['server']['port']}")
-            print(f"{CYAN}When it says 'listening on', run `hearthwork claude` or `hearthwork codex` "
-                  f"from your project.{RESET}\n", flush=True)
-            run_foreground(config, model, args.context)
+            print(f"\nStarting {model.name}   host: 127.0.0.1:{host.port(config)}   model server: {config['server']['port']}")
+            print(f"{CYAN}When the log says 'Model ready', run `hearthwork claude` or `hearthwork codex` from your "
+                  f"project. Ctrl+C stops the host and the model.{RESET}\n", flush=True)
+            sys.exit(host.serve(config, model, args.context, console=True))
+        elif command == "host":  # hidden: the host process itself, started by host.ensure()
+            from . import host
+            sys.exit(host.host_main(rest))
+        elif command == "logs":
+            from . import host
+            sys.exit(host.logs_main(rest))
         elif command == "stop":
-            from .server import stop
-            stop(load_config())
+            from . import host
+            host.stop(load_config())
         elif command == "status":
-            from .server import running_context, served_model
+            from . import host
             config = load_config()
             port = config.get("server", {}).get("port", 8001)
             print(f"hearthwork {__version__}   data: {HOME}")
@@ -160,10 +173,18 @@ def main(argv=None):
                 for line in status_lines(config, got):
                     print(line)
                 sys.exit(0 if got else 1)
-            running = served_model(port)
-            n_ctx = running_context(port) if running else None
-            print(f"model: {GREEN + running + RESET if running else 'not running'}"
-                  + (f"  (port {port}, context {n_ctx:,} = {ctx.format_k(n_ctx)})" if n_ctx else f"  (port {port})" if running else ""))
+            got = host.status()
+            if got:
+                for line in host.status_lines(got):
+                    print(line)
+            else:
+                from .server import running_context, served_model
+                running = served_model(port)
+                n_ctx = running_context(port) if running else None
+                print("host: not running" + (f"  (a model server from an older Hearthwork answers on port {port}: any command that needs "
+                                             "the model adopts it)" if running else ""))
+                print(f"model: {GREEN + running + RESET if running else 'not running'}"
+                      + (f"  (port {port}, context {n_ctx:,} = {ctx.format_k(n_ctx)})" if n_ctx else f"  (port {port})" if running else ""))
             print(f"models folder: {config.get('modelsDir', '-')}")
             chosen = runtime.selected(config)
             if chosen:

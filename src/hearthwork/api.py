@@ -18,7 +18,8 @@ from pathlib import Path
 from . import context as ctx
 from .harnesses import make_relay
 from .onboard import CYAN, GREEN, RED, RESET, YELLOW, find_models, save_config
-from .server import DIM, agent_context, port_open, served_model, start_background
+from . import host
+from .server import DIM, agent_context, port_open, served_model
 from .share import request_key
 
 DEFAULT_PORT = 8080
@@ -106,6 +107,7 @@ class Api:
     def __init__(self, config, port, key=None, allow_switch=False):
         self.config, self.port, self.key, self.allow_switch = config, port, key, allow_switch
         self.model_port = config["server"]["port"]
+        self.host_port = host.port(config)  # requests are forwarded there: it normalizes, queues and counts them
         self.lock = threading.Lock()  # one model switch at a time
         self.models = lambda: find_models(config["modelsDir"])
 
@@ -114,7 +116,7 @@ class Api:
         if served_model(self.model_port, timeout=5) == model_id(model):
             return True
         print(f"\n{YELLOW}Switching to {model.name} (a request asked for it)...{RESET}", flush=True)
-        ok = start_background(self.config, model)
+        ok = host.ensure(self.config, model, force=True)  # --allow-switch interrupts others, as before (step 2: drain)
         if ok:
             self.config["lastModel"] = str(model)
             save_config(self.config)
@@ -175,7 +177,7 @@ class Api:
             if problem:
                 handler._send_json(*problem)
                 return True
-        if not port_open(self.model_port):
+        if not port_open(self.host_port):
             handler._send_json(503, error_body("api_error", "The model server is not running. Start it with `hearthwork start`."))
             return True
         return False
@@ -186,7 +188,7 @@ def start_last_model(config):
     port = config["server"]["port"]
     name = served_model(port) or (port_open(port) and served_model(port, timeout=60))
     if name:
-        return name
+        return name if host.ensure(config) else None
     if port_open(port):
         print(f"{RED}Port {port} is in use but no model answers. Stop it with `hearthwork stop` first.{RESET}")
         return None
@@ -194,7 +196,7 @@ def start_last_model(config):
     if not last or not Path(last).is_file():
         print(f"{RED}No last-used model is configured. Run `hearthwork start` once and pick one, then try again.{RESET}")
         return None
-    return served_model(port) if start_background(config, Path(last)) else None
+    return served_model(port) if host.ensure(config, Path(last)) else None
 
 
 # ---------- setup snippets ----------
@@ -289,8 +291,9 @@ def api_main(argv):
         return 1
     api = Api(config, args.port, args.api_key, args.allow_switch)
     try:
-        server = make_relay(api.model_port, ("127.0.0.1", args.port), api.intercept,
-                            lambda handler: cors_headers(handler.headers.get("Origin"), api.key))
+        server = make_relay(api.host_port, ("127.0.0.1", args.port), api.intercept,
+                            lambda handler: cors_headers(handler.headers.get("Origin"), api.key),
+                            normalize=False, forward_headers=lambda handler: {"X-Hearthwork-Client": "api"})
     except OSError as error:
         print(f"{RED}Cannot listen on port {args.port}: {error}{RESET}")
         return 1

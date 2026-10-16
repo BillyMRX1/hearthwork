@@ -28,6 +28,10 @@ SLOTS = HOME / "cache" / "slots"    # saved prompt caches
 BENCH = HOME / "bench"              # benchmark runs and scoreboard
 TEMPLATES = HOME / "templates"      # optional fixed chat templates: <model file name>.jinja
 STATE = HOME / "server.json"        # the background server: pid, model, port
-LOG = HOME / "server.log"           # its output on macOS/Linux (Windows shows it in its own window)
+LOGS = HOME / "logs"                # host.log (requests, queue, lifecycle) and server.log (llama-server's output)
+LOG = LOGS / "server.log"
+HOST_LOG = LOGS / "host.log"
+HOST_FILE = HOME / "host.json"      # the running host: pid, port, control token, model, start time
 
 HOME.mkdir(parents=True, exist_ok=True)
+LOGS.mkdir(parents=True, exist_ok=True)

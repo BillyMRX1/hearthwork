@@ -1,7 +1,7 @@
 """The `hearthwork` menu: pick a coding agent, and it starts the local model for you.
 
 Run `hearthwork` from the project you want the agent to work on (`hearthwork claude` / `hearthwork codex` skip the
-menu). The model server runs in the background (its own window on Windows) and stays up between agent sessions
+menu). The model runs in the background under the Hearthwork host (no window; `hearthwork logs`) and stays up between agent sessions
 until you stop it from the menu or on quit.
 """
 import os
@@ -10,9 +10,10 @@ from . import runtime
 from .context import format_k
 from .harnesses import HARNESSES, installed, launch
 from .onboard import CYAN, GREEN, RED, RESET, YELLOW, ask, find_models, onboard, yes
-from .paths import BENCH, STATE
+from .paths import BENCH
 from .remote import disconnect_main
-from .server import agent_context, choose_and_remember, port_open, running_context, served_model, start_background, stop
+from . import host
+from .server import agent_context, choose_and_remember, port_open, running_context, served_model
 
 BOLD, DIM = "\033[1m", "\033[2m"
 
@@ -48,8 +49,8 @@ def ensure_server(config):
     """The running model's name, starting one (after picking a model) if none is running."""
     port = config["server"]["port"]
     name = served_model(port) or (port_open(port) and served_model(port, timeout=60))
-    if name:
-        return name
+    if name:  # running: make sure the host fronts it (starts one, or adopts a server an older Hearthwork started)
+        return name if host.ensure(config) else None
     if port_open(port):
         print(f"{YELLOW}Port {port} is in use but no model answers. Stop it with `hearthwork stop` first.{RESET}")
         return None
@@ -58,7 +59,7 @@ def ensure_server(config):
               f"`hearthwork model <Hugging Face link>`.{RESET}")
         return None
     model = choose_and_remember(config)
-    if not model or not start_background(config, model):
+    if not model or not host.ensure(config, model):
         return None
     return served_model(port)
 
@@ -85,7 +86,7 @@ def run_agent(config, key, args=(), back_to_menu=True):
 def switch_model(config):
     model = choose_and_remember(config)
     if model:
-        start_background(config, model)
+        host.ensure(config, model)
 
 
 def download_model():
@@ -133,7 +134,7 @@ def main(config):
         else:
             options += [("Start / switch model", lambda: switch_model(config)),
                         ("Download a model", download_model),
-                        ("Stop the model server" + ("" if running else f"  {DIM}(not running){RESET}"), lambda: stop(config)),
+                        ("Stop the model server" + ("" if running else f"  {DIM}(not running){RESET}"), lambda: host.stop(config)),
                         ("Benchmark the model: 8 graded coding tasks + scoreboard", lambda: benchmark(config)),
                         ("Setup: hardware check, llama.cpp update, models folder", lambda: config.update(onboard(config)))]
         print()
@@ -150,5 +151,5 @@ def main(config):
                 pass
         else:
             print(f"{RED}Type a number from the list, or q.{RESET}")
-    if not config.get("remote") and STATE.exists() and served_model(config["server"]["port"]) and yes("Stop the model server?", default=True):
-        stop(config)
+    if not config.get("remote") and host.running() and yes("Stop the model server?", default=True):
+        host.stop(config)

@@ -259,7 +259,7 @@ class ReviewFixTests(unittest.TestCase):
         relay = mock.Mock(server_address=("127.0.0.1", 1))
         with mock.patch.object(doctor, "server_stage", return_value=(doctor.stage("server", OK), None)), \
                 mock.patch.object(doctor, "environment", side_effect=RuntimeError("boom")), \
-                mock.patch.object(doctor, "make_relay", return_value=relay), \
+                mock.patch("hearthwork.host.ensure", return_value=True), \
                 mock.patch.object(doctor, "protocol_stages", return_value=[]), \
                 mock.patch.object(doctor, "agent_stages", return_value=[]):
             report = doctor.run_doctor(config, ["claude"], quick=True)

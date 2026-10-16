@@ -686,9 +686,10 @@ def run_doctor(config, agents, quick=False, keep=False, endpoint_override=None):
             elif remote:
                 endpoint = Endpoint(remote["host"], remote["port"], remote["key"])
             else:
-                relay = make_relay(config["server"]["port"])
-                threading.Thread(target=relay.serve_forever, daemon=True).start()
-                endpoint = Endpoint("127.0.0.1", relay.server_address[1])
+                from . import host
+                if not host.ensure(config):
+                    raise RuntimeError("the Hearthwork host is not running; start it with `hearthwork start`")
+                endpoint = Endpoint("127.0.0.1", host.port(config))
             for api in sorted({HARNESSES[a]["api"] for a in selected}):
                 found = protocol_error_hint(protocol_stages(api, endpoint, model))
                 report["protocol"][api] = found

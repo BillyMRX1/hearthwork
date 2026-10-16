@@ -9,6 +9,7 @@ which llama.cpp's --fit maximises at start time on any machine; so the context i
 Claude Code needs: its own prompt is ~20K tokens) instead of growing it, which would push model layers off the GPU.
 How large exactly depends on the model and the computer: see context.py.
 """
+import copy
 import argparse
 import ctypes
 import json
@@ -19,6 +20,8 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -42,15 +45,133 @@ SUGGESTED = [
 
 # ---------- config ----------
 
+class ConfigError(ValueError):
+    """config.json exists but cannot be read; nothing is overwritten."""
+
+
+class Config(dict):
+    """The config as it was read (`_orig`), so save_config writes only what the caller changed."""
+    _orig = None
+
+
+def _freeze(config):
+    out = Config(config)
+    out._orig = copy.deepcopy(dict(config))
+    return out
+
+
 def load_config():
-    try:
-        return json.loads(CONFIG.read_text(encoding="utf-8-sig"))
-    except (FileNotFoundError, ValueError):
-        return {}
+    """config.json as a Config. {} when there is none yet; ConfigError when it is unreadable (never a silent {})."""
+    last = None
+    for _ in range(20):
+        try:
+            return _freeze(json.loads(CONFIG.read_text(encoding="utf-8-sig")))
+        except FileNotFoundError:
+            return _freeze({})
+        except ValueError as error:
+            last = error
+            time.sleep(0.05)  # a writer may be replacing the file right now
+        except PermissionError as error:
+            last = error
+            time.sleep(0.05)
+    raise ConfigError(f"{CONFIG} cannot be read ({last}). Fix or delete it (`hearthwork setup` writes a new one).")
+
+
+_LOCK_DEPTH = threading.local()
+_THREAD_LOCK = threading.RLock()
+
+
+class _FileLock:
+    """Cross-process lock on HOME/config.lock (msvcrt on Windows, flock elsewhere)."""
+
+    def __enter__(self):
+        _THREAD_LOCK.acquire()
+        depth = getattr(_LOCK_DEPTH, "n", 0)
+        _LOCK_DEPTH.n = depth + 1
+        self.fd = None
+        if depth == 0:
+            LOCK = CONFIG.with_name("config.lock")
+            LOCK.parent.mkdir(parents=True, exist_ok=True)
+            self.fd = os.open(str(LOCK), os.O_RDWR | os.O_CREAT)
+            if os.name == "nt":
+                import msvcrt
+                while True:
+                    try:
+                        os.lseek(self.fd, 0, 0)
+                        msvcrt.locking(self.fd, msvcrt.LK_LOCK, 1)  # waits up to ~10 s per call
+                        break
+                    except OSError:
+                        time.sleep(0.02)
+            else:
+                import fcntl
+                fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self.fd is not None:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(self.fd, 0, 0)
+                    try:
+                        msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                os.close(self.fd)
+        finally:
+            _LOCK_DEPTH.n -= 1
+            _THREAD_LOCK.release()
+
+
+def _write_atomic(data):
+    tmp = CONFIG.with_name(f"config.{os.getpid()}.{threading.get_ident()}.tmp")
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=2))
+        f.flush()
+        os.fsync(f.fileno())
+    for attempt in range(40):
+        try:
+            os.replace(tmp, CONFIG)
+            return
+        except PermissionError:  # Windows: a reader has the file open for a moment
+            if attempt == 39:
+                raise
+            time.sleep(0.05)
+
+
+def update_config(change):
+    """Under a cross-process lock: re-read config.json, apply change(config) to the fresh copy, write it atomically.
+    Returns the new config. Raises ConfigError on an unreadable file instead of overwriting it."""
+    with _FileLock():
+        fresh = load_config()
+        change(fresh)
+        _write_atomic(dict(fresh))
+        return _freeze(fresh)
+
+
+def _merge_changes(fresh, old, new):
+    """Apply what `new` changed relative to `old` onto `fresh` (dicts recursively; lists and values as a whole)."""
+    for key in list(old):
+        if key not in new:
+            fresh.pop(key, None)
+    for key, value in new.items():
+        if key not in old:
+            fresh[key] = copy.deepcopy(value)
+        elif isinstance(value, dict) and isinstance(old[key], dict) and isinstance(fresh.get(key), dict):
+            _merge_changes(fresh[key], old[key], value)
+        elif value != old[key]:
+            fresh[key] = copy.deepcopy(value)
 
 
 def save_config(config):
-    CONFIG.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    """Write only this caller's changes (config minus what it was loaded as) into the current file, so another
+    process's changes in the meantime survive. A plain dict that was not loaded sets its keys (no deletions)."""
+    orig = getattr(config, "_orig", None)
+    result = update_config(lambda fresh: _merge_changes(fresh, orig if orig is not None else {}, config))
+    if isinstance(config, Config):
+        config._orig = copy.deepcopy(dict(config))
+    return result
 
 
 def ask(prompt, default=""):

@@ -8,7 +8,7 @@
   hearthwork <agent> --dry-run  show the command, environment and generated files, start nothing (also: task --dry-run)
   hearthwork task "TASK"        one coding task for another agent to delegate (no terminal needed); see --help
   hearthwork mcp [install ...]  MCP server so any agent can use the local model as a subagent
-  hearthwork start [--model X] [--force]   start the model (under the Hearthwork host, in the background)
+  hearthwork start [--model X] [--force] [--over-budget]   start the model (under the Hearthwork host); --force interrupts running requests, --over-budget starts even if the memory estimate exceeds the budget
   hearthwork idle [30|off]      unload the model after N idle minutes (off by default); the next request loads it
   hearthwork budget [show|use dedicated|balanced|work|set vram=10GB ram=12GB slots=1 threads=8 idle=20m|reset]   resource budget
   hearthwork stop [--force]     stop the model and the host (saves the prompt cache); --force even with requests running
@@ -39,7 +39,7 @@ import sys
 
 from . import __version__, context as ctx, runtime
 from .harnesses import HARNESSES
-from .onboard import CYAN, GREEN, RESET, load_config, offer_import, onboard, save_config, setup_complete
+from .onboard import ConfigError, CYAN, GREEN, RESET, load_config, offer_import, onboard, save_config, setup_complete
 from .paths import HOME
 
 REPO = "git+https://github.com/BillyMRX1/hearthwork"
@@ -139,7 +139,8 @@ def main(argv=None):
             from . import host
             from .server import choose_and_remember
             force = "--force" in rest
-            args = model_args([a for a in rest if a != "--force"], command)
+            over_budget = "--over-budget" in rest
+            args = model_args([a for a in rest if a not in ("--force", "--over-budget")], command)
             config = configured()
             if command == "serve" and host.running():
                 print("The Hearthwork host is already running. `hearthwork status` shows it; `hearthwork stop` stops it first.")
@@ -148,7 +149,7 @@ def main(argv=None):
             if not model:
                 sys.exit(1)
             if command == "start":
-                ok = host.ensure(config, model, args.context, force=force)
+                ok = host.ensure(config, model, args.context, force=force, over_budget=over_budget)
                 if ok:
                     print(f"{CYAN}Now run `hearthwork claude` or `hearthwork codex` from your project.{RESET}")
                 sys.exit(0 if ok else 1)
@@ -278,6 +279,9 @@ def main(argv=None):
     except KeyboardInterrupt:
         print()
         sys.exit(130)
+    except ConfigError as error:
+        print(f"hearthwork: {error}")
+        sys.exit(1)
 
 
 def check_main():

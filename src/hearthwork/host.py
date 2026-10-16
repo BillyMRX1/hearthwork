@@ -406,7 +406,7 @@ class Host:
     def __init__(self, config, log):
         self.config, self.log = config, log
         self.llama_port = config["server"]["port"]
-        self.slots = int(config["server"].get("slots") or 2)
+        self.slots = int(budgets.effective(config)["slots"] or 2)
         self.token = secrets.token_urlsafe(24)
         self.started = time.time()
         self.model = self.context = self.error = None
@@ -417,7 +417,7 @@ class Host:
         diagnostics.RECORDER.context = lambda: (self.context, self.slots, self.model)
         self.listener = None
         self.state = "starting"       # starting, loading, ready, switching, unloaded, recovering, failed
-        self.model_path = self.load_context = None
+        self.model_path = self.load_context = self.started_settings = None
         self.tlock = threading.Lock()  # one transition (switch, unload, load, recovery) at a time
         self.transition = None
         self.switch_error = None
@@ -458,7 +458,7 @@ class Host:
         if self.ready:
             idle_for = 0 if self.gate.active or self.gate.queue else time.monotonic() - self.gate.last_activity
         now = time.monotonic()
-        return {"pid": os.getpid(), "port": port(self.config), "model": self.model, "context": self.context, "requestedContext": self.load_context,
+        return {"pid": os.getpid(), "port": port(self.config), "model": self.model, "context": self.context, "requestedContext": self.load_context, "settings": self.started_settings,
                 "ready": self.ready, "error": self.error, "adopted": self.adopted, "restored": self.restored,
                 "serverPort": self.llama_port, "started": self.started, "uptime": time.time() - self.started,
                 "slots": self.slots, "state": self.state, "transition": transition, "switchError": self.switch_error,
@@ -560,6 +560,10 @@ class Host:
             self.kill_server()  # never leave a llama-server behind holding the GPU
             raise
         self.model_path, self.load_context = model, requested
+        eff = budgets.effective(self.config)
+        self.started_settings = {"fitTargetMiB": eff["fitTargetMiB"], "slots": eff["slots"], "threads": eff["threads"],
+                                 "kvCacheType": self.config["server"].get("kvCacheType"), "batch": self.config["server"].get("batch"), "context": context,
+                                 "server": cmd[0], "modelPath": str(model), "requested": requested}
         self.restored = server.restore_slots(self.llama_port, self.config["server"]["slots"])
         self.log(f"Model ready in {time.time() - started:.0f} s" + (f", restored {self.restored:,} cached prompt tokens" if self.restored else ""))
         self.model = server.served_model(self.llama_port, timeout=30) or model.stem
@@ -1074,7 +1078,33 @@ def wait_switch(timeout=LOAD_TIMEOUT):
     return False
 
 
-def ensure(config, model=None, context=None, force=False, drain=False):
+def apply_pending(config, info, got, force=False, drain=False, over_budget=False):
+    """The model is the right one; settings changed since it started (budget, profile, KV type...) apply now through the
+    switch path when nothing is running, else they stay pending (shown by `status`). The idle setting applies live."""
+    wanted = budgets.effective(config)["idleMinutes"]
+    if wanted != got.get("idleMinutes"):
+        call(info, "idle", "POST", payload={"minutes": wanted})
+    diffs = budgets.pending(config, got)
+    if not diffs:
+        return True
+    busy = got["active"] + got["queued"]
+    if busy and not force and not drain:
+        print(f"{YELLOW}Settings waiting for the model to be idle ({'; '.join(diffs)}): {busy} request(s) running or waiting. "
+              f"Run `hearthwork start` again later, or `hearthwork start --force` to interrupt them.{RESET}")
+        return True
+    model = Path((got.get("settings") or {})["modelPath"])
+    if not budgets.guard(config, model, (got.get("settings") or {}).get("requested"), {"ramGB": budgets.measure().get("ramGB") or 0.0}, over_budget):
+        return False
+    answer = call(info, "switch", "POST", timeout=10, errors=True,
+                  payload={"model": str(model), "context": (got.get("settings") or {}).get("requested"), "force": force}) or {}
+    if answer.get("error"):
+        print(f"{YELLOW}Settings not applied now: {answer['error'].get('message')}. They stay pending.{RESET}")
+        return True
+    print(f"Applying new settings ({'; '.join(diffs)}) to {model.name} (logs: `hearthwork logs`)", end="", flush=True)
+    return wait_switch()
+
+
+def ensure(config, model=None, context=None, force=False, drain=False, over_budget=False):
     """Make sure the host runs the model. Starts the host (and llama-server) when needed; adopts a llama-server an older
     Hearthwork started. A different `model` or `context` than the running one restarts the host's server, but refuses
     while requests are active unless `force` or `drain` (then the switch waits for them, up to 2 minutes, while new
@@ -1095,13 +1125,15 @@ def ensure(config, model=None, context=None, force=False, drain=False):
     if got:
         same = model is None or (got.get("model") == model.stem and (context is None or got.get("context") == context))
         if same:
-            return True if got.get("ready") else _wait_ready("Waiting for the model")
+            if not got.get("ready"):
+                return _wait_ready("Waiting for the model")
+            return apply_pending(config, info, got, force, drain, over_budget)
         busy = got["active"] + got["queued"]
         if busy and not force and not drain:
             print(f"{YELLOW}Not switching: {busy} request(s) are running or waiting ({got['active']} active, {got['queued']} queued). "
                   f"Wait for them, or use --force to interrupt them.{RESET}")
             return False
-        if not budgets.guard(config, model, context, {"ramGB": budgets.measure().get("ramGB") or 0.0}, force):
+        if not budgets.guard(config, model, context, {"ramGB": budgets.measure().get("ramGB") or 0.0}, over_budget):
             return False
         if not got.get("adopted"):
             answer = call(info, "switch", "POST", timeout=10, errors=True,
@@ -1127,7 +1159,7 @@ def ensure(config, model=None, context=None, force=False, drain=False):
     if model is None:
         print(f"{YELLOW}No model to start.{RESET}")
         return False
-    if not budgets.guard(config, model, context, force=force):
+    if not budgets.guard(config, model, context, over_budget=over_budget):
         return False
     args = ["--model", str(model)] + (["--context", str(context)] if context else [])
     return _wait_ready(f"Starting {model.name} (logs: `hearthwork logs`)", spawn(args))
@@ -1218,6 +1250,8 @@ def idle_main(argv):
         print("Usage: hearthwork idle [minutes|off]")
         return 2
     config.setdefault("host", {})["idleUnloadMinutes"] = minutes
+    if (config.get("budget") or {}).get("base"):  # a preset/custom budget owns the idle setting: keep this as its override
+        config["budget"].setdefault("custom", {})["idle"] = minutes
     save_config(config)
     info = read_info()
     if info:

@@ -24,8 +24,9 @@ SCHEMA = 1
 DIR = HOME / "profiles"
 FINGERPRINT_BYTES = 16 * 1024 * 1024
 DOCTOR_MAX_AGE = 24 * 3600
-SERVER_KEYS = ("context", "kvCacheType", "slots", "batch", "fitTargetMiB")
-EXTRA_KEYS = ("budget", "budgets", "preset", "budgetPreset")  # written by the resource-budget feature, kept opaque
+SERVER_KEYS = ("context", "kvCacheType", "batch")
+MIRRORED = ("slots", "fitTargetMiB", "threads")  # derived from the budget (budgets.apply); restored with it, never stored raw
+EXTRA_KEYS = ("budgets", "preset", "budgetPreset")  # older/other names, kept opaque
 SECRET_KEY = re.compile(r"key|token|secret|password|credential|bearer", re.I)
 VERIFIED, RECHECK, UNVERIFIED = "verified", "needs recheck", "unverified"
 
@@ -139,6 +140,8 @@ def settings_of(config, model_file):
     override = (config.get("contexts") or {}).get(model_file)
     if override:
         out["modelContext"] = override
+    st = config.get("budget") or {}
+    out["budget"] = {"preset": st.get("preset", "balanced"), "custom": copy.deepcopy(st.get("custom") or {})}
     extra = {k: config[k] for k in EXTRA_KEYS if k in config}
     if extra:
         out["extra"] = extra
@@ -393,20 +396,39 @@ def check(config, profile, run=False, run_doctor=None, now=None):
 # ---------- apply ----------
 
 def snapshot(config):
-    """The managed parts of the config, enough to put them back."""
+    """The managed parts of the config, enough to put them back. The budget is ONE unit: preset, overrides, the setup's
+    own values it replaced, and what it derived (slots, VRAM headroom, threads, idle)."""
     from . import runtime
     st = runtime.state(copy.deepcopy(config))
-    return {"server": {k: (config.get("server") or {}).get(k) for k in SERVER_KEYS}, "contexts": copy.deepcopy(config.get("contexts") or {}),
+    server = config.get("server") or {}
+    return {"server": {k: server.get(k) for k in SERVER_KEYS + MIRRORED}, "contexts": copy.deepcopy(config.get("contexts") or {}),
+            "budget": copy.deepcopy(config.get("budget")), "idle": (config.get("host") or {}).get("idleUnloadMinutes"),
             "lastModel": config.get("lastModel"), "selected": st.get("selected"), "active": dict(st["active"]),
             "extra": {k: copy.deepcopy(config[k]) for k in EXTRA_KEYS if k in config}}
 
 
 def restore_snapshot(config, snap):
+    """Put the managed keys back exactly (a key that was absent is removed); everything else is untouched."""
     from . import runtime
-    config.setdefault("server", {}).update({k: v for k, v in snap["server"].items() if v is not None})
+    server = config.setdefault("server", {})
+    for key, value in snap["server"].items():
+        if value is None:
+            server.pop(key, None)
+        else:
+            server[key] = value
     config["contexts"] = snap["contexts"]
+    if snap.get("budget") is None:
+        config.pop("budget", None)
+    else:
+        config["budget"] = copy.deepcopy(snap["budget"])
+    if snap.get("idle") is None:
+        (config.get("host") or {}).pop("idleUnloadMinutes", None)
+    else:
+        config.setdefault("host", {})["idleUnloadMinutes"] = snap["idle"]
     if snap.get("lastModel"):
         config["lastModel"] = snap["lastModel"]
+    else:
+        config.pop("lastModel", None)
     for key in EXTRA_KEYS:
         config.pop(key, None)
     config.update(snap["extra"])
@@ -425,6 +447,16 @@ def apply_settings(config, profile, model_path):
     for key in SERVER_KEYS:
         if s.get(key) is not None:
             config.setdefault("server", {})[key] = s[key]
+    from . import budgets
+    unit = s.get("budget") or (s.get("extra") or {}).get("budget")
+    if unit is not None:  # the whole budget at once: slots, VRAM headroom, threads and idle all follow from it
+        budgets.set_preset(config, unit.get("preset", "balanced") if unit.get("preset") in budgets.PRESETS else "balanced",
+                           copy.deepcopy(unit.get("custom") or {}))
+    else:  # a profile from before budgets: its raw numbers, with the default budget
+        budgets.set_preset(config, "balanced")
+        for key in ("slots", "fitTargetMiB"):
+            if s.get(key) is not None:
+                config["server"][key] = s[key]
     if model_path:
         contexts = config.setdefault("contexts", {})
         if s.get("modelContext"):
@@ -433,7 +465,8 @@ def apply_settings(config, profile, model_path):
             contexts.pop(model_path.name, None)
         config["lastModel"] = str(model_path)
     for key, value in (s.get("extra") or {}).items():
-        config[key] = value
+        if key != "budget":
+            config[key] = value
     rec = profile.get("runtime") or {}
     if rec.get("name") and rec.get("llamaCppBuild") is not None:
         name, build = rec["name"], rec["llamaCppBuild"]
@@ -457,7 +490,13 @@ def running_state(config):
     got = host.status()
     if not got or not got.get("ready"):
         return None
-    return {"model": got.get("model"), "context": got.get("context"), "slots": got.get("slots")}
+    return {"model": got.get("model"), "context": got.get("context"), "slots": got.get("slots"),
+            "requested": got.get("requestedContext")}
+
+
+def unit_of(snap):
+    b = snap.get("budget") or {}
+    return (b.get("preset", "balanced"), b.get("custom") or {})
 
 
 def settings_changes(old, new):
@@ -467,14 +506,14 @@ def settings_changes(old, new):
         out.append("model file")
     if old["contexts"] != new["contexts"]:
         out.append("model context")
-    if old["extra"] != new["extra"]:
+    if old["extra"] != new["extra"] or unit_of(old) != unit_of(new):
         out.append("budget")
     if (old["selected"], old["active"]) != (new["selected"], new["active"]):
         out.append("runtime build")
     return out
 
 
-def apply(config, profile, save_config, ensure, validator=None, restore=True, say=print, versions=None, running=None):
+def apply(config, profile, save_config, ensure, validator=None, restore=True, say=print, versions=None, running=None, pending=None):
     """Apply `profile`. The previous settings are stored as profile 'previous' first; if applying or validating fails
     they are restored. All side effects (save_config, ensure(config, model, context), validator(config)) are injected."""
     model_path, problems = find_model(config, profile["model"]) if profile.get("model") else (None, [])
@@ -487,6 +526,7 @@ def apply(config, profile, save_config, ensure, validator=None, restore=True, sa
         previous["autoSaved"] = f"before applying {profile['name']}"
         previous["_restore"] = snapshot(before)
         store(previous)
+    live0 = (running or running_state)(config) if model_path else None
     notes, context = apply_settings(config, profile, model_path)
     for note in notes:
         say("  " + note)
@@ -498,7 +538,8 @@ def apply(config, profile, save_config, ensure, validator=None, restore=True, sa
                 "(externally managed, not changed)")
     changed = settings_changes(snapshot(before), snapshot(config))
     live = (running or running_state)(config) if model_path else None
-    if not changed and live and live.get("model") == model_path.stem and live.get("context") == context             and live.get("slots") in (None, config.get("server", {}).get("slots")):
+    left = (pending or still_pending)(config)
+    if not changed and live and live.get("model") == model_path.stem and live.get("context") == context and not left:
         say("already active: the running model already has these settings")
         config["activeProfile"] = profile["name"]
         save_config(config)
@@ -506,6 +547,11 @@ def apply(config, profile, save_config, ensure, validator=None, restore=True, sa
     if changed:
         say("  changed: " + ", ".join(changed))
     ok = ensure(config, model_path, context) if model_path else True
+    if ok:
+        left = (pending or still_pending)(config)
+        if left:  # saved, but the running server does not have them yet (busy): not "applied"
+            say("Saved, not running yet: " + "; ".join(left) + ". `hearthwork start` applies it when nothing is running.")
+            return False
     if ok and validator:
         ok = validator(config)
     if ok:
@@ -514,13 +560,19 @@ def apply(config, profile, save_config, ensure, validator=None, restore=True, sa
         return True
     say("Validation failed after applying." + (" Restoring the previous settings." if restore else ""))
     if restore:
-        config.clear()
-        config.update(before)
+        restore_snapshot(config, snapshot(before))  # only the managed keys; save_config writes just that difference
         save_config(config)
         old = Path(before["lastModel"]) if before.get("lastModel") else None
         if old and old.is_file():
-            ensure(config, old, None)
+            ensure(config, old, (live0 or {}).get("requested"))
     return False
+
+
+def still_pending(config):
+    """Settings the config wants that the running server does not have yet (empty without a host)."""
+    from . import budgets, host
+    got = host.status()
+    return budgets.pending(config, got) if got else []
 
 
 def apply_previous(config, save_config, ensure, say=print):

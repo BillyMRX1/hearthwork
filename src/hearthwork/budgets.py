@@ -11,6 +11,7 @@ with the budget and with the memory that is free now. Nothing is shrunk silently
 """
 import csv
 import json
+from pathlib import Path
 import subprocess
 import sys
 
@@ -74,7 +75,7 @@ def effective(config):
     idle = custom["idle"] if "idle" in custom else (p["idle"] if p["idle"] is not None else base["idle"])
     return {"preset": preset, "custom": bool(custom), "fitTargetMiB": fit,
             "vramGB": round(max(0.0, vram_total - fit / 1024), 1) if vram_total else 0.0,
-            "ramGB": ram, "slots": custom.get("slots", p["slots"] or base["slots"]),
+            "ramGB": ram, "ramEnforced": preset != "balanced" or "ramGB" in custom, "slots": custom.get("slots", p["slots"] or base["slots"]),
             "threads": custom.get("threads", threads), "idleMinutes": idle}
 
 
@@ -140,7 +141,7 @@ def check(config, need, context, details, eff=None):
     eff, hw = eff or effective(config), hw_of(config)
     problems = []
     over = need["ramGB"] - eff["ramGB"]
-    if over > 0.05:
+    if over > 0.05 and eff.get("ramEnforced", True):
         label = "RAM budget" if not unified(hw) else "memory budget (unified memory)"
         problems.append(f"{label}: {eff['ramGB']:.1f} GB, the model needs about {need['ramGB']:.1f} GB in RAM "
                         f"({over:.1f} GB too much)")
@@ -159,6 +160,15 @@ def warnings(need, free_ram, reclaim_ram=0.0):
     if need["ramGB"] > available + 0.05:
         return [f"Warning: free RAM now is {available:.1f} GB and the model needs about {need['ramGB']:.1f} GB "
                 f"({need['ramGB'] - available:.1f} GB short). Close other apps if loading is slow or fails."]
+    return []
+
+
+def soft_warnings(need, eff):
+    """The default (balanced) budget never refuses on RAM, only says so; presets and ram= are enforced."""
+    over = need["ramGB"] - eff["ramGB"]
+    if over > 0.05 and not eff.get("ramEnforced", True):
+        return [f"Warning: the model needs about {need['ramGB']:.1f} GB of RAM, {over:.1f} GB more than the default budget "
+                f"({eff['ramGB']:.1f} GB). Starting anyway; `hearthwork budget set ram=<GB>` makes a limit binding."]
     return []
 
 
@@ -195,28 +205,33 @@ def explain(config, model, problems, need, context, details, eff):
     return lines + options(config, problems, need, context, details, eff)
 
 
-def guard(config, model, context=None, reclaim=None, force=False):
-    """Before a start or switch: True when `model` can run under the budget. Prints the explanation when not."""
-    eff = effective(config)
-    got = model_need(config, model, context, eff)
-    if not got:
-        return True  # unreadable file: llama-server will say what is wrong
-    need, chosen, details = got
-    free = memory_gb()[1]
-    reclaim_ram = (reclaim or {}).get("ramGB", 0.0)
-    for w in warnings(need, free, reclaim_ram):
+def guard(config, model, context=None, reclaim=None, over_budget=False):
+    """Before a start or switch: True when `model` can run under the budget. Prints the explanation when not.
+    An estimate that cannot be made (unreadable model header) only warns."""
+    try:
+        eff = effective(config)
+        got = model_need(config, model, context, eff)
+        if not got:
+            return True  # unreadable file: llama-server will say what is wrong
+        need, chosen, details = got
+        free = memory_gb()[1]
+        warns = warnings(need, free, (reclaim or {}).get("ramGB", 0.0)) + soft_warnings(need, eff)
+        problems = check(config, need, chosen, details, eff=eff)
+        lines = explain(config, model, problems, need, chosen, details, eff) if problems else []
+    except Exception as error:  # corrupt GGUF (struct.error, ValueError...), odd config: never block a start on the estimate
+        print(f"{YELLOW}Memory estimate unavailable ({type(error).__name__}: {error}); starting without the budget check.{RESET}")
+        return True
+    for w in warns:
         print(f"{YELLOW}{w}{RESET}")
-    problems = check(config, need, chosen, details, eff=eff)
     if not problems:
         return True
-    lines = explain(config, model, problems, need, chosen, details, eff)
     for line in lines:
         print(line)
     log_refusal(f"{model.name}: " + "; ".join(problems))
-    if force:
-        print(f"{YELLOW}--force: starting anyway.{RESET}")
+    if over_budget:
+        print(f"{YELLOW}--over-budget: starting anyway.{RESET}")
         return True
-    print("(`--force` starts anyway.)")
+    print("(`--over-budget` starts anyway.)")
     return False
 
 
@@ -328,6 +343,9 @@ def table(config, got=None, measured=None):
     if model and need:
         lines.append(f"  need for {model.name}: weights + KV cache for the context + {OVERHEAD_GB:.1f} GB runtime")
     lines.append("  " + ENFORCED)
+    waiting = pending(config, got)
+    if waiting:
+        lines.append(f"  {YELLOW}pending (saved, not running yet): {'; '.join(waiting)}. `hearthwork start` applies it when idle.{RESET}")
     return lines
 
 
@@ -340,6 +358,29 @@ def summary(config, got=None):
 
 
 # ---------- command ----------
+
+def pending(config, got):
+    """Settings the config wants that the running server was not started with: list of 'name: running -> wanted'.
+    Only what Hearthwork itself passed to llama-server is compared (never what the engine reports)."""
+    started = (got or {}).get("settings")
+    if not got or got.get("adopted") or not got.get("ready") or got.get("transition") or not started:
+        return []
+    try:
+        from .runtime import selected_server
+        eff = effective(config)
+        model = Path(started["modelPath"])
+        wanted_context = ctx.choose(config, model, started.get("requested"))[0]
+        pairs = (("VRAM headroom (MiB)", started.get("fitTargetMiB"), eff["fitTargetMiB"]), ("slots", started.get("slots"), eff["slots"]),
+                 ("threads", started.get("threads"), eff["threads"]), ("KV cache", started.get("kvCacheType"), config["server"].get("kvCacheType")),
+                 ("batch", started.get("batch"), config["server"].get("batch")), ("context", started.get("context"), wanted_context),
+                 ("llama.cpp build", started.get("server"), selected_server(config) or config.get("llamaServer")))
+    except Exception:
+        return []
+    return [f"{name}: {old if old is not None else 'default'} -> {new if new is not None else 'default'}" for name, old, new in pairs if old != new]
+
+
+budget_pending = pending
+
 
 def parse_gb(text):
     t = text.lower().replace("gib", "").replace("gb", "").replace("g", "").strip()
@@ -383,19 +424,18 @@ def parse_set(args):
 
 
 USAGE = ("Usage: hearthwork budget [show] | use dedicated|balanced|work | set vram=10GB ram=12GB slots=1 threads=8 idle=20m | reset"
-         "  [--force]")
+         "  [--force] [--over-budget]")
 
 
 def main(argv):
     from . import host
-    force = "--force" in argv
-    argv = [a for a in argv if a != "--force"]
+    force, over_budget = "--force" in argv, "--over-budget" in argv
+    argv = [a for a in argv if a not in ("--force", "--over-budget")]
     config = load_config()
     if not config.get("server"):
         print("Run `hearthwork setup` first.")
         return 1
     action = argv[0].lower() if argv else "show"
-    old_eff = effective(config)
     if action == "show":
         got = host.status()
         for line in table(config, got):
@@ -418,28 +458,24 @@ def main(argv):
     got = host.status()
     model = current_model(config, got) if got else None
     if got and model and got.get("ready") and not got.get("adopted"):
-        if not guard(config, model, got.get("requestedContext"), {"ramGB": (measure().get("ramGB") or 0.0)}, force):
+        if not guard(config, model, got.get("requestedContext"), {"ramGB": (measure().get("ramGB") or 0.0)}, over_budget):
             print("Budget not changed.")
             return 1
     save_config(config)
     print(f"Budget: {new['preset']}" + (" + custom numbers" if new["custom"] else "")
           + f": VRAM headroom {new['fitTargetMiB']} MiB, {new['slots']} slot(s), threads {new['threads'] or 'default'}, "
             f"idle unload {str(new['idleMinutes']) + ' min' if new['idleMinutes'] else 'off'}.")
+    if got and model and got.get("ready") and not got.get("adopted"):
+        before = len(budget_pending(config, got))
+        ok = host.apply_pending(config, host.read_info(), got, force, True, True)
+        if before and ok:
+            after = host.status()
+            left = budget_pending(config, after) if after else []
+            if left:
+                print(f"{YELLOW}Saved, still pending: {'; '.join(left)}.{RESET}")
+                return 1
+        return 0 if ok else 1
     if got:
         host.call(host.read_info(), "idle", "POST", payload={"minutes": new["idleMinutes"]})
-    restart_keys = ("fitTargetMiB", "slots", "threads")
-    if got and model and got.get("ready") and any(new[k] != old_eff[k] for k in restart_keys):
-        busy = got["active"] + got["queued"]
-        print(f"Applying to {model.name}: " + (f"waiting for {busy} request(s) to finish" if busy and not force
-                                              else "restarting the model server") + " (logs: `hearthwork logs`)", end="", flush=True)
-        answer = host.call(host.read_info(), "switch", "POST", timeout=10, errors=True,
-                           payload={"model": str(model), "context": got.get("requestedContext"), "force": force}) or {}
-        if answer.get("error"):
-            print(f"\n{YELLOW}Not applied now: {answer['error'].get('message')}. The budget is saved and applies at the next start.{RESET}")
-            return 1
-        return 0 if host.wait_switch() else 1
-    if got:
-        print("Applies at the next model start." if not got.get("ready") else "No restart needed.")
-    else:
-        print("Applies at the next model start.")
+    print("Applies at the next model start.")
     return 0

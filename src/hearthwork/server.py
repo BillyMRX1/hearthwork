@@ -64,15 +64,17 @@ def slot_dir(config, model, context=None):
 
 def command(config, model, context=None, slot_path=None):
     from .runtime import selected_server
+    from . import budgets
     s = config["server"]
+    eff = budgets.effective(config)  # slots, VRAM headroom and threads come from the budget
     context = context or ctx.choose(config, model)[0]
     cmd = [selected_server(config) or config["llamaServer"], "-m", str(model), "-c", str(context), "-fa", "on", "--jinja",
-           "--fit", "on", "--fit-target", str(s["fitTargetMiB"]), "--load-mode", "none",
-           "-ctk", s["kvCacheType"], "-ctv", s["kvCacheType"], "-np", str(s["slots"]), "-kvu",
+           "--fit", "on", "--fit-target", str(eff["fitTargetMiB"]), "--load-mode", "none",
+           "-ctk", s["kvCacheType"], "-ctv", s["kvCacheType"], "-np", str(eff["slots"]), "-kvu",
            "-b", str(s["batch"]), "-ub", str(s["batch"]), "--host", "127.0.0.1", "--port", str(s["port"]),
            "--slot-save-path", str(slot_path or slot_dir(config, model, context))]
-    if s.get("threads"):  # CPU threads budget (hearthwork budget)
-        cmd += ["-t", str(s["threads"])]
+    if eff["threads"]:  # CPU threads budget (hearthwork budget)
+        cmd += ["-t", str(eff["threads"])]
     # Escape hatch for a chat template broken in a way the relay (harnesses.py) doesn't cover.
     template = TEMPLATES / f"{model.stem}.jinja"
     if template.is_file():

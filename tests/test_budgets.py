@@ -49,10 +49,10 @@ class Presets(unittest.TestCase):
 
     def test_threads_reach_the_command(self):
         c = cfg()
-        c["server"]["threads"] = 6
+        budgets.set_preset(c, "balanced", {"threads": 6})
         cmd = server.command(c, Path("m.gguf"), 4096, slot_path="x")
         self.assertEqual(cmd[cmd.index("-t") + 1], "6")
-        del c["server"]["threads"]
+        budgets.set_preset(c, "balanced")
         self.assertNotIn("-t", server.command(c, Path("m.gguf"), 4096, slot_path="x"))
 
 
@@ -107,7 +107,7 @@ class Estimates(unittest.TestCase):
             out = io.StringIO()
             with redirect_stdout(out):
                 self.assertFalse(budgets.guard(c, Path("m.gguf"), 131072))
-                self.assertTrue(budgets.guard(c, Path("m.gguf"), 131072, force=True))
+                self.assertTrue(budgets.guard(c, Path("m.gguf"), 131072, over_budget=True))
         self.assertIn("Not starting m.gguf", out.getvalue())
         self.assertIn("128K", out.getvalue())
 

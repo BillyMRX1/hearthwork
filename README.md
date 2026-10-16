@@ -403,8 +403,8 @@ hearthwork model https://huggingface.co/<org>/<repo>/blob/main/<file>.gguf      
 - `budget use dedicated | balanced | work`: *dedicated* keeps 0.5 GB of VRAM free for other programs and gives the AI the most; *balanced* (default) is the setup's own settings; *work* (gaming / work) keeps ~5 GB of VRAM free, uses 1 slot and half the CPU threads, and unloads the model after 15 idle minutes.
 - `budget set vram=10GB ram=12GB slots=1 threads=8 idle=20m`: your own numbers on top of the current preset. `budget reset` goes back to balanced.
 - What is enforced: slots (`-np`), threads (`-t`) and idle unload are flags/host settings; the VRAM budget becomes llama.cpp's `--fit-target` (best effort); the RAM budget cannot be capped by the OS, so Hearthwork estimates the need before every start or switch and compares it with the budget and the RAM free now (the memory of the model being replaced counts as free).
-- An impossible start is refused with the numbers and options (smaller quantization, an explicit smaller context, another preset). The context is never shrunk silently. `--force` starts anyway. On unified memory (Apple silicon) memory is counted once.
-- Changing the budget while a model runs restarts it through the host's switch path: new requests wait, running ones finish first (`--force` interrupts them).
+- An impossible start is refused with the numbers and options (smaller quantization, an explicit smaller context, another preset). The context is never shrunk silently. `--over-budget` starts anyway (`--force` is separate: it interrupts running requests). On unified memory (Apple silicon) memory is counted once.
+- Changing the budget while a model runs restarts it through the host's switch path: new requests wait, running ones finish first (`--force` interrupts them). `status` shows `pending: ...` when the saved settings differ from the running server; `hearthwork start` applies them when nothing is running. The default (balanced) budget only warns about RAM; presets and an explicit `ram=` are binding.
 
 ## Models
 

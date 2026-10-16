@@ -20,6 +20,8 @@ import time
 from .paths import LOGS
 
 RING = 500
+SOURCES = ("server", "relay-stream", "relay-total")
+SOURCE_LABEL = {"server": "", "relay-stream": " (relay-measured)", "relay-total": " (relay-measured, includes prompt processing)"}
 ROTATE_AT = 5_000_000
 HEAD, TAIL = 4096, 16384
 CAPTURE_LIMIT = 2_000_000
@@ -170,13 +172,15 @@ class Probe:
         n_ctx, slots, model = recorder.context()
         self.record = {"ts": round(time.time(), 3), "client": client, "api": path, "model": os.path.basename(model.replace("\\", "/")) if model else None,
                        "outcome": None, "status": None, "wait_ms": None, "ttfb_ms": None, "total_ms": None, "prompt_tokens": None,
-                       "cached_tokens": None, "gen_tokens": None, "prompt_tps": None, "gen_tps": None, "n_ctx": n_ctx, "slots": slots,
+                       "cached_tokens": None, "gen_tokens": None, "prompt_tps": None, "gen_tps": None, "gen_tps_source": None, "n_ctx": n_ctx, "slots": slots,
                        "max_output": requested_output(body) if body else None, "active": None,
                        "queued_at_arrival": len(gate.queue) if gate else None, "capacity_error": False}
         self.arrived = time.monotonic()
         self.started = None
         self.head, self.tail = bytearray(), bytearray()
         self.seen = 0
+        self.first_at = None
+        self.streams = bool(re.search(rb'"stream"\s*:\s*true', body or b""))
         self.capture = os.environ.get("HEARTHWORK_CAPTURE") == "1"
         self.request_body = bytes(body or b"") if self.capture else None
         self.everything = bytearray() if self.capture else None
@@ -194,6 +198,8 @@ class Probe:
     def feed(self, chunk):
         if not chunk:
             return
+        if self.first_at is None:
+            self.first_at = time.monotonic()
         if self.record["ttfb_ms"] is None:
             self.record["ttfb_ms"] = round((time.monotonic() - (self.started or self.arrived)) * 1000)
         if self.seen < HEAD:
@@ -230,6 +236,12 @@ class Probe:
                                                             + bytes(self.tail[-TAIL:]).decode("utf-8", "replace"))
             prompt, cached, gen, prompt_tps, gen_tps = extract(text)
             record.update(prompt_tokens=prompt, cached_tokens=cached, gen_tokens=gen, prompt_tps=prompt_tps, gen_tps=gen_tps)
+            record["gen_tps_source"] = "server" if gen_tps is not None else None
+            if gen_tps is None and gen and status == 200:  # no server timings: the relay's own clock and the usage token counts
+                if self.streams and self.first_at is not None and time.monotonic() - self.first_at > 0.05:
+                    record.update(gen_tps=gen / (time.monotonic() - self.first_at), gen_tps_source="relay-stream")
+                elif not self.streams and record["total_ms"]:
+                    record.update(gen_tps=gen / (record["total_ms"] / 1000), gen_tps_source="relay-total")
         self.recorder.add(record)
         if self.capture:
             self._write_capture()
@@ -305,6 +317,12 @@ def summarize(records):
     for r in records:
         if _num(r.get("prompt_tokens")) is not None and _num(r.get("n_ctx")):
             pressure.append((r["prompt_tokens"] + (r.get("max_output") or 0)) / r["n_ctx"])
+    gen_median = (None, None)
+    for source in SOURCES:  # never mix sources: the best source that has values
+        values = [r["gen_tps"] for r in records if r.get("gen_tps_source") == source and r.get("gen_tps") is not None]
+        if values:
+            gen_median = (percentile(values, 50), source)
+            break
     waits, totals = sum(_vals(records, "wait_ms")), sum(_vals(ran, "total_ms"))
     return {
         "requests": len(records),
@@ -316,7 +334,8 @@ def summarize(records):
         "queue_wait_ms": {"p50": percentile(_vals(records, "wait_ms"), 50), "p95": percentile(_vals(records, "wait_ms"), 95)},
         "ttfb_ms": {"p50": percentile(_vals(records, "ttfb_ms"), 50), "p95": percentile(_vals(records, "ttfb_ms"), 95)},
         "prompt_tps_median": percentile(_vals(records, "prompt_tps"), 50),
-        "gen_tps_median": percentile(_vals(records, "gen_tps"), 50),
+        "gen_tps_median": gen_median[0], "gen_tps_source": gen_median[1],
+        "gen_tps_by_source": {k: percentile([r["gen_tps"] for r in records if r.get("gen_tps_source") == k and r.get("gen_tps") is not None], 50) for k in SOURCES},
         "cache": {"requests_measured": len(prompt_known), "prompt_tokens": prompt_sum, "cached_tokens": cached_sum,
                   "hit_ratio": cached_sum / prompt_sum if prompt_sum else None},
         "context": {"requests_measured": len(pressure), "share_above_80pct": sum(1 for p in pressure if p > PRESSURE) / len(pressure) if pressure else None,
@@ -326,7 +345,8 @@ def summarize(records):
                        "slots": max(_vals(records, "slots"), default=None),
                        "queue_time_share": waits / (waits + totals) if (waits + totals) and _vals(records, "wait_ms") else None},
         "unavailable": {"prompt_tokens": sum(1 for r in records if r.get("prompt_tokens") is None and not r.get("capacity_error") and r.get("outcome") == "ok"),
-                        "speeds": sum(1 for r in records if r.get("outcome") == "ok" and r.get("gen_tps") is None)},
+                        "speeds": sum(1 for r in records if r.get("outcome") == "ok" and r.get("gen_tps") is None),
+                        "server_timings": sum(1 for r in records if r.get("outcome") == "ok" and r.get("gen_tps_source") != "server")},
     }
 
 
@@ -371,7 +391,7 @@ def findings(summary):
             add("possible", "Possible cause of the slow first bytes: large prompts being processed again because the cache was not reused.",
                 "Fix the cache hits first (above).")
     g = s["gen_tps_median"]
-    if g is not None and g < 10:
+    if g is not None and g < 10 and s["gen_tps_source"] != "relay-total":
         add("observed", f"Median generation speed is {g:.1f} tokens/s.",
             "A smaller or more compressed model, or a shorter context, generates faster; `hearthwork check` shows what fits.")
         add("possible", "Possible cause of the slow generation: the model does not fully fit the GPU memory, or other programs use the GPU.",
@@ -383,7 +403,7 @@ def unavailable_notes(summary):
     notes = ["Not measured: model load time, memory use, and time spent in tools (the host only sees requests, not what agents do between them)."]
     u = summary["unavailable"]
     if u["speeds"]:
-        notes.append(f"Speeds are unavailable for {u['speeds']} request(s): the backend gave no timings for them (the Messages and non-streaming Responses APIs report token counts only).")
+        notes.append(f"Speeds are unavailable for {u['speeds']} request(s): not even token counts were available.")
     if u["prompt_tokens"]:
         notes.append(f"Token counts are unavailable for {u['prompt_tokens']} request(s).")
     return notes
@@ -437,7 +457,7 @@ def format_report(rep):
     lines = [f"Requests: {s['requests']} ({o}) from {len(s['clients'])} client(s)",
              f"Queue wait:  p50 {_ms(s['queue_wait_ms']['p50'])}, p95 {_ms(s['queue_wait_ms']['p95'])}",
              f"First byte:  p50 {_ms(s['ttfb_ms']['p50'])}, p95 {_ms(s['ttfb_ms']['p95'])}",
-             f"Speed (median): prompt {_rate(s['prompt_tps_median'])}, generation {_rate(s['gen_tps_median'])}",
+             f"Speed (median): prompt {_rate(s['prompt_tps_median'])}, generation {_rate(s['gen_tps_median'])}{SOURCE_LABEL.get(s['gen_tps_source'], '')}",
              f"Cache hit ratio: {_pct(s['cache']['hit_ratio'])}",
              f"Context pressure: {_pct(s['context']['share_above_80pct'])} of requests above 80% of capacity"
              + (f" (context {s['context']['n_ctx']:,})" if s["context"]["n_ctx"] else ""),
@@ -457,7 +477,7 @@ def format_report(rep):
 def status_line(summary):
     if not summary or not summary.get("requests"):
         return "last 5 min: no requests"
-    return (f"last 5 min: {summary['requests']} requests, median generation {_rate(summary['gen_tps_median'])}, "
+    return (f"last 5 min: {summary['requests']} requests, median generation {_rate(summary['gen_tps_median'])}{SOURCE_LABEL.get(summary['gen_tps_source'], '')}, "
             f"queue wait p95 {_ms(summary['queue_wait_ms']['p95'])}")
 
 

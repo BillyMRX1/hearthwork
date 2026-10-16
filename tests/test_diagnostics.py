@@ -71,7 +71,7 @@ class Numbers(unittest.TestCase):
 
 def rec(**kw):
     base = {"ts": time.time(), "client": "local-opencode-1", "api": "/v1/chat/completions", "model": "m.gguf", "outcome": "ok", "status": 200, "wait_ms": 0,
-            "ttfb_ms": 500, "total_ms": 3000, "prompt_tokens": 1000, "cached_tokens": 900, "gen_tokens": 50, "prompt_tps": 500.0, "gen_tps": 30.0,
+            "ttfb_ms": 500, "total_ms": 3000, "prompt_tokens": 1000, "cached_tokens": 900, "gen_tokens": 50, "prompt_tps": 500.0, "gen_tps": 30.0, "gen_tps_source": "server",
             "n_ctx": 32768, "slots": 2, "max_output": 1024, "active": 1, "queued_at_arrival": 0, "capacity_error": False}
     base.update(kw)
     return base
@@ -106,6 +106,41 @@ class Findings(unittest.TestCase):
         text = d.format_report(d.report([rec(gen_tps=None)]))
         self.assertIn("unavailable", text)
         self.assertIn("time spent in tools", text)  # says what it does not measure
+
+
+class RelaySpeeds(unittest.TestCase):
+    def test_medians_never_mix_sources(self):
+        s = d.summarize([rec(gen_tps=30.0), rec(gen_tps=50.0), rec(gen_tps=5.0, gen_tps_source="relay-total")])
+        self.assertEqual((s["gen_tps_median"], s["gen_tps_source"]), (40.0, "server"))
+        self.assertEqual(s["gen_tps_by_source"]["relay-total"], 5.0)
+        s = d.summarize([rec(gen_tps=5.0, gen_tps_source="relay-total")])
+        self.assertEqual(s["gen_tps_source"], "relay-total")
+        self.assertIn("relay-measured, includes prompt processing", d.format_report(d.report([rec(gen_tps=5.0, gen_tps_source="relay-total")])))
+        self.assertFalse([f for f in d.findings(s) if "generation speed" in f["text"]])  # not judged: includes prompt time
+
+    def probe(self, body, chunks, delay, status=200):
+        recorder = d.Recorder(Path(tempfile.mkdtemp()) / "r.jsonl")
+        p = d.begin("api", "/v1/messages", body, recorder=recorder)
+        p.started = time.monotonic()
+        p.response(status)
+        for c in chunks:
+            p.feed(c)
+            time.sleep(delay)
+        p.finish("ok")
+        return recorder.recent()[0]
+
+    def test_anthropic_stream_uses_relay_clock(self):
+        chunks = [b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"cache_read_input_tokens":7,"input_tokens":4,"output_tokens":0}}}\n\n',
+                  b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":40}}\n\n']
+        r = self.probe(b'{"stream": true}', chunks, 0.2)
+        self.assertEqual((r["prompt_tokens"], r["gen_tokens"], r["gen_tps_source"]), (11, 40, "relay-stream"))
+        self.assertTrue(50 < r["gen_tps"] < 250)  # 40 tokens over ~0.2 s
+
+    def test_nonstream_is_total_and_server_timings_win(self):
+        r = self.probe(b"{}", [b'{"usage":{"input_tokens":4,"output_tokens":20,"cache_read_input_tokens":0}}'], 0.2)
+        self.assertEqual(r["gen_tps_source"], "relay-total")
+        r = self.probe(b'{"stream": true}', [json.dumps({"usage": CHAT_USAGE, "timings": TIMINGS}).encode()], 0.1)
+        self.assertEqual((r["gen_tps_source"], r["gen_tps"]), ("server", 35.8))
 
 
 class Capacity(unittest.TestCase):

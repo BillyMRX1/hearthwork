@@ -17,7 +17,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import paths
+from . import paths, repair
 from .paths import HOME
 
 
@@ -197,6 +197,27 @@ def url_host(host):
     return f"[{host}]" if ":" in host and not host.startswith("[") else host
 
 
+REPAIR_APIS = {"messages": "anthropic", "completions": "chat", "responses": "responses"}
+
+
+def log_repair(found):
+    print(f"repaired a tool call written as text ({found.format}, {', '.join(c['name'] for c in found.calls)})",
+          file=sys.stderr, flush=True)
+
+
+def repaired_reply(api, data, tools):
+    """(new body bytes, Repair) when the JSON reply `data` holds a tool call written as text, else None."""
+    try:
+        result = repair.repair_response(api, json.loads(data), tools)
+        if not result:
+            return None
+        body = json.dumps(result[0]).encode()
+    except Exception:  # whatever is odd about the reply, it goes through as it came
+        return None
+    log_repair(result[1])
+    return body, result[1]
+
+
 def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_headers=None):
     """HTTP relay to llama-server on `upstream_port`, bound to `address` (not yet serving). `intercept(handler)`, when
     given, runs first for every request and returns True once it has answered it itself: `hearthwork share` uses it
@@ -237,6 +258,7 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                     return self._send_json(200, {"object": "list", "data": data, "models": []})
                 except Exception as error:
                     return self._send_json(502, {"error": {"message": str(error)}})
+            api, tools, wants_stream = None, {}, False
             if body and self.command == "POST":
                 try:
                     payload = json.loads(body)
@@ -249,6 +271,10 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                         payload = normalize_responses(payload)
                     body = json.dumps(payload).encode()
                     dump_request(raw, payload)
+                    api = REPAIR_APIS.get(path.rsplit("/", 1)[-1])
+                    if api and repair.enabled():
+                        tools = repair.request_tools(api, payload)
+                    wants_stream = bool(payload.get("stream"))
                 except ValueError:
                     pass
             headers = {k: v for k, v in self.headers.items()
@@ -259,15 +285,38 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
             try:
                 upstream.request(self.command, self.path, body=body, headers=headers)
                 response = upstream.getresponse()
+                tools = tools if response.status == 200 else {}
+                streaming = "event-stream" in (response.getheader("content-type") or "") or wants_stream
+                fixed = None
+                if tools and not streaming:  # a whole reply: look for a call written as text before sending it on
+                    data = response.read()
+                    fixed = repaired_reply(api, data, tools)
+                    if fixed:
+                        data = fixed[0]
                 self.send_response(response.status)
                 for key, value in response.getheaders():
                     if key.lower() not in ("transfer-encoding", "content-length", "connection"):
                         self.send_header(key, value)
+                if fixed:
+                    self.send_header("X-Hearthwork-Repaired", fixed[1].format)
+                    self.send_header("content-length", str(len(data)))
                 self._extra()
                 self.end_headers()
-                while chunk := response.read1(65536):
-                    self.wfile.write(chunk)
+                if tools and not streaming:
+                    self.wfile.write(data)
+                elif tools:
+                    stream = repair.StreamRepair(api, tools)
+                    while chunk := response.read1(65536):
+                        self.wfile.write(stream.feed(chunk))
+                        self.wfile.flush()
+                    self.wfile.write(stream.finish())
                     self.wfile.flush()
+                    if stream.repaired:
+                        log_repair(stream.repaired)
+                else:
+                    while chunk := response.read1(65536):
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
             except (ConnectionError, OSError):
                 pass  # the client went away (e.g. Esc in the agent)
             finally:

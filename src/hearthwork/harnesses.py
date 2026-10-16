@@ -209,12 +209,13 @@ def repaired_reply(api, data, tools):
     """(new body bytes, Repair) when the JSON reply `data` holds a tool call written as text, else None."""
     try:
         result = repair.repair_response(api, json.loads(data), tools)
-    except ValueError:
-        return None
-    if not result:
+        if not result:
+            return None
+        body = json.dumps(result[0]).encode()
+    except Exception:  # whatever is odd about the reply, it goes through as it came
         return None
     log_repair(result[1])
-    return json.dumps(result[0]).encode(), result[1]
+    return body, result[1]
 
 
 def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_headers=None):

@@ -294,7 +294,7 @@ def _literal(node):
         return {"true": True, "false": False, "null": None}[node.id]
     try:
         return ast.literal_eval(node)
-    except (ValueError, SyntaxError):
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
         raise _Bad()
 
 
@@ -355,67 +355,141 @@ _DETECTORS = (("mistral", _mistral), ("calling-tool", _calling_tool), ("tool_cal
 _LEFTOVER = re.compile(r"</?(?:tool_call|tool_calls|function_calls)>|```(?:json)?\s*```")
 
 
+MAX_LEAD = 300    # characters of prose allowed before a call
+MAX_HOLD = 4096   # characters a stream holds back while waiting to see whether a call follows
+_CLOSERS = re.compile(r"(?:\s|</tool_call>|</function>|</function_calls>|</tool_calls>|</invoke>|<\|im_end\|>|<\|eot_id\|>|</s>|\[/TOOL_CALLS\])*\Z")
+_BETWEEN = re.compile(r"(?:\s|,|</?(?:tool_call|tool_calls|function_calls|function)>)*\Z")
+
+
+def lead_in_ok(lead):
+    lead = _LEFTOVER.sub("", lead)
+    return "```" not in lead and len(lead.strip()) <= MAX_LEAD
+
+
 def find_tool_call(text, tools):
-    """Repair(calls, text, format) when `text` holds valid tool calls written as plain text, else None.
-    `tools` is {name: schema} (see request_tools). Calls are validated against it; any invalid one means None."""
+    """Repair(calls, text, format) when `text` is (a short lead-in and) valid tool calls written as plain text, else None.
+    `tools` is {name: schema} (see request_tools). Deliberately conservative: the calls must end the reply (only closing
+    markers may follow), the lead-in is short and has no code fence, nothing inside a ``` fence counts, and every call
+    must be valid, or the reply stays as it is."""
     if not tools or not isinstance(text, str) or not text.strip():
         return None
     text = strip_think(text)
-    for fmt, detect in _DETECTORS:
-        try:
+    if "```" in text:
+        return None
+    try:
+        for fmt, detect in _DETECTORS:
             found = detect(text, tools)
             if not found:
                 continue
             raw, spans = found
+            spans = sorted(spans)
             calls = []
             for name, arguments in raw:
                 if not valid_call(name, arguments, tools):
                     return None
+                json.dumps(arguments, allow_nan=False)
                 calls.append({"name": name, "arguments": arguments})
-        except _Bad:
-            return None
-        outside, last = [], 0
-        for start, end in sorted(spans):
-            outside.append(text[last:start])
-            last = end
-        outside.append(text[last:])
-        return Repair(calls, _LEFTOVER.sub("", "".join(outside)).strip(), fmt)
+            if not lead_in_ok(text[:spans[0][0]]) or not _CLOSERS.match(text, spans[-1][1]):
+                return None
+            if any(not _BETWEEN.match(text, a[1], b[0]) or a[1] > b[0] for a, b in zip(spans, spans[1:])):
+                return None
+            return Repair(calls, _LEFTOVER.sub("", text[:spans[0][0]]).strip(), fmt)
+    except Exception:  # anything odd in the text: leave the reply alone
+        return None
     return None
 
 
-# ---------- streaming: when does text look like the start of a call? ----------
+# ---------- streaming: could the text so far still turn out to be a trailing call? ----------
 
 MARKERS = ("[TOOL_CALLS]", "[Calling tool:", "<tool_call>", "<function=", "<invoke ")
-NO, MAYBE, YES = 0, 1, 2
+_CALL_KEYS = ("name", "function", "type", "arguments", "parameters", "input", "args")
+_FIRST_NAME = re.compile(r'(?:^\{|<tool_call>\s*\{|\[TOOL_CALLS\]\s*\[?\s*\{)\s*"name"\s*:\s*"([^"]*)"')
+_NAME_CHECKS = (re.compile(r"<function=([^>\s]+)>"), re.compile(r"\[Calling tool:\s*([\w.\-]+)\s*\("),
+                re.compile(r"<invoke\s+name=[\"']([^\"']+)[\"']"), re.compile(r"<name>([^<]*)</name>"),
+                re.compile(r"\[TOOL_CALLS\]\s*([\w.\-]+)\s*\[ARGS\]"))
 
 
-def hold_state(text, names, window=0):
-    """YES when `text` contains the start of a call, MAYBE when it ends in what could become one, NO otherwise.
-    `window`: only look at the last `window` characters (aligned to a line start)."""
-    if window and len(text) > window:
-        text = text[text.rfind("\n", 0, len(text) - window) + 1:]
-    if any(m in text for m in MARKERS):
-        return YES
-    for name in names:
-        if f"<{name}>" in text:
-            return YES
-    if names and re.search(rf"(?m)^[ \t]*`*\[?[ \t]*(?:{_names(names)})[ \t]*\(", text):
-        return YES
-    for match in re.finditer(r"(?m)^[ \t]*\{", text):
-        rest = text[match.start():]
-        if '"name"' in rest:
-            return YES
-    state = NO
-    for marker in MARKERS + tuple(f"<{n}>" for n in names):
-        if any(text.endswith(marker[:k]) for k in range(1, len(marker))):
-            state = MAYBE
-    last_line = text.rsplit("\n", 1)[-1].strip().lstrip("`[").strip()
-    if last_line and any(n.startswith(last_line) for n in names):
-        state = MAYBE
-    brace = [m.start() for m in re.finditer(r"(?m)^[ \t]*\{", text)]
-    if brace and len(text) - brace[-1] < 400:
-        state = MAYBE
-    return state
+def _candidate(s, names):
+    """0: `s` does not begin like a call; 1: it does; 2: it is too short to say yet (the start of a marker or name)."""
+    if not s:
+        return 0
+    if s[0] == "{" or any(s.startswith(m) for m in MARKERS) or any(s.startswith(f"<{n}>") for n in names):
+        return 1
+    if names and re.match(rf"`*\[?\s*(?:{_names(names)})\s*\(", s):
+        return 1
+    if any(m.startswith(s) for m in MARKERS + tuple(f"<{n}>" for n in names)):
+        return 2
+    word = s.strip("`[ \t")
+    if re.fullmatch(r"`*\[?\s*\w*\s*", s) and word and any(n.startswith(word) for n in names):
+        return 2
+    return 0
+
+
+def _unclosed(s):
+    depth, quote, escape = 0, False, False
+    for c in s:
+        if quote:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                quote = False
+        elif c == '"':
+            quote = True
+        elif c in "{[(":
+            depth += 1
+        elif c in "}])":
+            depth -= 1
+    if quote or depth > 0:
+        return True
+    return any(s.count(a) > s.count(b) for a, b in (("<tool_call>", "</tool_call>"), ("<function=", "</function>"),
+                                                    ("<invoke ", "</invoke>")))
+
+
+def can_be_call(t, start, tools):
+    """True while `t[start:]` (the held text; `t` is the whole reply so far) could still end as a valid trailing call."""
+    tail = t[start:]
+    if len(tail) > MAX_HOLD or "```" in t:
+        return False
+    if find_tool_call(t, tools):
+        return True
+    s = tail.lstrip()
+    kind = _candidate(s, tools)
+    if not kind:
+        return False
+    if kind == 2:
+        return True
+    named = _FIRST_NAME.search(s)
+    if named and named.group(1) not in tools:
+        return False
+    if any((m := rx.search(s)) and m.group(1) not in tools for rx in _NAME_CHECKS):
+        return False
+    key = re.match(r'\{\s*"([^"]*)"', s)
+    if key and key.group(1) not in _CALL_KEYS:
+        return False
+    if s.startswith("[TOOL_CALLS]") and "{" not in s:
+        return True
+    return _unclosed(s)
+
+
+def find_hold_start(t, scan_from, tools):
+    """Index in `t` of a line start where a trailing call may begin, among the lines from the one holding `scan_from`
+    on; None when there is none (the normal case)."""
+    if "```" in t:
+        return None
+    pos = t.rfind("\n", 0, scan_from) + 1
+    while pos <= len(t):
+        q = pos
+        while q < len(t) and t[q] in " \t":
+            q += 1
+        if q >= scan_from and _candidate(t[q:], tools) and lead_in_ok(t[:q]) and can_be_call(t, q, tools):
+            return q
+        end = t.find("\n", pos)
+        if end < 0:
+            return None
+        pos = end + 1
+    return None
 
 
 # ---------- rewriting whole replies ----------
@@ -477,12 +551,12 @@ def _function_call_items(found, status="completed"):
              "name": c["name"], "arguments": json.dumps(c["arguments"])} for c in found.calls]
 
 
-def responses_output(output, found, items=None):
+def responses_output(output, found, items=None, keep=None):
     """`output` (Responses items) with the message text replaced by what is outside the calls, and the calls added."""
     out, placed = [], False
     for item in output:
         if isinstance(item, dict) and item.get("type") == "message":
-            if not placed and found.text:
+            if not placed and (found.text if keep is None else keep):
                 parts = [{**p, "text": found.text} if isinstance(p, dict) and p.get("type") == "output_text" else p
                          for p in item.get("content") or ()]
                 out.append({**item, "content": parts})
@@ -505,20 +579,24 @@ _BOUNDARY = re.compile(rb"\r?\n\r?\n")
 class StreamRepair:
     """Filter for a streamed reply: `feed(bytes)` returns the bytes to send on, `finish()` the rest.
 
-    Events pass through byte for byte until the assistant text looks like the start of a call; from then on the events
-    that carry text (and, for Anthropic and Responses, everything after them) are held back. At the end of the reply,
-    valid held text becomes proper tool-call events; anything else is released unchanged. `repaired` is then the
-    Repair. A structured tool call from the server switches the filter off."""
+    Events pass through byte for byte. Text is held back only from a line start where the rest of the reply could still be
+    a trailing call (see `can_be_call`), and released as soon as it cannot; at the end of the reply valid held text
+    becomes proper tool-call events. `repaired` is then the Repair. A structured tool call from the server, or any
+    internal error, switches the filter off (everything held is sent as it was)."""
 
     def __init__(self, api, tools):
         self.api, self.tools = api, tools
         self.buffer = b""
         self.text = ""
         self.mode = "pass"      # pass | hold | off
-        self.state = NO
-        self.queue = []         # [(raw bytes, text delta or None, event object)]
+        self.queue = []         # held [(raw bytes, text delta or None, event object)]
+        self.pending = []       # events that open a text container, waiting for its first text
+        self.hold_pos = 0       # where the held text starts, in the visible text
         self.held_from = 0      # length of the text already sent on when holding began
+        self.no_hold_before = 0  # text before this was released: no new hold starts there
         self.top_index = -1     # highest Anthropic content block index seen
+        self.next_output = 0    # Responses: index of the next output item
+        self.seq = None         # Responses: last sequence_number seen
         self.template = {}      # last Chat chunk: id, model, ... for the chunks we make
         self.repaired = None
 
@@ -528,28 +606,37 @@ class StreamRepair:
         out = []
         while (match := _BOUNDARY.search(self.buffer)):
             raw, self.buffer = self.buffer[:match.end()], self.buffer[match.end():]
-            out.append(self._event(raw))
+            out.append(self._safe(raw))
         return b"".join(out)
 
     def finish(self):
-        out = [self._event(self.buffer)] if self.buffer else []
+        out = [self._safe(self.buffer)] if self.buffer else []
         self.buffer = b""
         out.append(self._flush())
         return b"".join(out)
 
+    def _safe(self, raw):
+        try:
+            return self._event(raw)
+        except Exception:  # never lose a reply over a repair: send what we hold and stop filtering
+            self.mode = "off"
+            out = b"".join(r for r, _, _ in self.pending + self.queue) + raw
+            self.pending, self.queue = [], []
+            return out
+
     def _flush(self):
-        out = b"".join(raw for raw, _, _ in self.queue)
-        self.queue = []
+        out = b"".join(raw for raw, _, _ in self.pending + self.queue)
+        self.pending, self.queue = [], []
         if self.mode == "hold":
             self.mode = "pass"
         return out
 
+    def _visible(self):
+        return strip_think(self.text) if "think>" in self.text else self.text
+
     # --- one event
     def _parse(self, raw):
-        data = []
-        for line in raw.decode("utf-8", "replace").splitlines():
-            if line.startswith("data:"):
-                data.append(line[5:].strip())
+        data = [line[5:].strip() for line in raw.decode("utf-8", "replace").splitlines() if line.startswith("data:")]
         joined = "\n".join(data)
         try:
             obj = json.loads(joined)
@@ -558,22 +645,33 @@ class StreamRepair:
         return obj if isinstance(obj, dict) else {"_raw": joined}
 
     def _classify(self, obj):
-        """("structured" | "text" | "final" | "other", text delta)."""
+        """("structured" | "container" | "text" | "final" | "other", text delta)."""
         if "_raw" in obj:
             return ("final" if self.api == "chat" and obj["_raw"] == "[DONE]" else "other"), None
         kind = obj.get("type")
         if self.api == "anthropic":
-            if "index" in obj and isinstance(obj["index"], int):
+            if isinstance(obj.get("index"), int):
                 self.top_index = max(self.top_index, obj["index"])
-            if kind == "content_block_start" and (obj.get("content_block") or {}).get("type") == "tool_use":
-                return "structured", None
+            block = obj.get("content_block") or {}
+            if kind == "content_block_start":
+                return ("structured" if block.get("type") == "tool_use" else
+                        "container" if block.get("type") == "text" else "other"), None
             delta = obj.get("delta") or {}
             if kind == "content_block_delta" and delta.get("type") == "text_delta":
                 return "text", delta.get("text") or ""
             return ("final" if kind in ("message_delta", "message_stop") else "other"), None
         if self.api == "responses":
-            if kind == "response.output_item.added" and (obj.get("item") or {}).get("type") == "function_call":
-                return "structured", None
+            if isinstance(obj.get("sequence_number"), int):
+                self.seq = max(self.seq or 0, obj["sequence_number"])
+            item = obj.get("item") or {}
+            if kind == "response.output_item.added":
+                self.next_output = max(self.next_output, obj["output_index"] + 1) if isinstance(
+                    obj.get("output_index"), int) else self.next_output + 1
+                if item.get("type") == "function_call":
+                    return "structured", None
+                return ("container" if item.get("type") == "message" else "other"), None
+            if kind == "response.content_part.added":
+                return "container", None
             if kind == "response.output_text.delta":
                 return "text", obj.get("delta") or ""
             return ("final" if kind in ("response.completed", "response.incomplete", "response.failed") else "other"), None
@@ -586,28 +684,38 @@ class StreamRepair:
             return "text", delta["content"]
         return ("final" if choice.get("finish_reason") else "other"), None
 
+    def _take_pending(self):
+        out = b"".join(raw for raw, _, _ in self.pending)
+        self.pending = []
+        return out
+
     def _event(self, raw):
         if self.mode == "off":
             return raw
         obj = self._parse(raw)
+        before = len(self._visible())
         kind, delta = self._classify(obj)
         if kind == "structured":
             out = self._flush() + raw
             self.mode = "off"
             return out
+        if kind == "container":
+            (self.pending if self.mode == "pass" else self.queue).append((raw, None, obj))
+            return b""
         if kind == "text":
             self.text += delta
+            t = self._visible()
             if self.mode == "pass":
-                self.state = hold_state(self.text, self.tools, window=len(delta) + 500)
-                if self.state == NO:
-                    return raw
-                self.mode, self.held_from = "hold", len(self.text) - len(delta)
-            elif self.state != YES:
-                self.state = hold_state(self.text, self.tools)
-                if self.state == NO:
-                    self.queue.append((raw, delta, obj))
-                    return self._flush()
+                start = find_hold_start(t, max(before, self.no_hold_before), self.tools)
+                if start is None:
+                    return self._take_pending() + raw
+                self.mode, self.hold_pos, self.held_from = "hold", start, len(self.text) - len(delta)
+                self.queue, self.pending = self.pending + [(raw, delta, obj)], []
+                return b""
             self.queue.append((raw, delta, obj))
+            if len(t) < self.hold_pos or not can_be_call(t, self.hold_pos, self.tools):
+                self.no_hold_before = len(t)
+                return self._flush()
             return b""
         if self.mode == "hold":
             if kind == "final":
@@ -616,18 +724,25 @@ class StreamRepair:
                 return raw  # reasoning and role chunks do not wait
             self.queue.append((raw, None, obj))
             return b""
-        return raw
+        return self._take_pending() + raw
 
     # --- the end of the reply: repair or release
     def _finish_reply(self, raw, obj):
-        found = find_tool_call(self.text, self.tools) if self._normal_end(obj) else None
-        if not found:
-            return self._flush() + raw
-        queue, self.queue, self.mode = self.queue, [], "off"
-        self.repaired = found
-        sent = strip_think(self.text[:self.held_from]).strip()
-        extra = found.text[len(sent):] if found.text.startswith(sent) else ""
-        return getattr(self, "_emit_" + self.api)(found, queue, extra, raw, obj)
+        held = b"".join(r for r, _, _ in self.queue)
+        queue, self.queue = self.queue, []
+        try:
+            found = find_tool_call(self.text, self.tools) if self._normal_end(obj) else None
+            if not found:
+                self.mode = "pass"
+                return held + raw
+            sent = strip_think(self.text[:self.held_from]).strip()
+            extra = found.text[len(sent):] if found.text.startswith(sent) else ""
+            out = getattr(self, "_emit_" + self.api)(found, queue, extra, raw, obj)
+        except Exception:
+            self.mode = "off"
+            return held + raw
+        self.mode, self.repaired = "off", found
+        return out
 
     def _normal_end(self, obj):
         """False for a reply cut short (token limit, failure): its text may be an unfinished call."""
@@ -639,27 +754,24 @@ class StreamRepair:
             return True
         return obj["choices"][0].get("finish_reason") == "stop"
 
-    def _kept(self, queue, extra, make_text_event):
-        """The held events without their text deltas; `extra` (text before the call that was not sent yet) takes the
-        place of the first of them."""
-        out, put = [], not extra
-        for raw, delta, obj in queue:
-            if delta is None:
-                out.append(raw)
-            elif not put:
-                out.append(make_text_event(obj, extra))
-                put = True
-        return out
-
     def _emit_anthropic(self, found, queue, extra, raw, obj):
         def text_event(old, text):
             return _sse("anthropic", "content_block_delta", {**old, "delta": {"type": "text_delta", "text": text}})
-        out = self._kept(queue, extra, text_event)
-        if obj.get("type") == "message_delta":
-            final, end = obj, None
-        else:  # message_stop without a message_delta
-            final, end = None, raw
-        index = self.top_index
+        # a text block that would end up empty is dropped altogether (its start was held back for this)
+        starts = [ev for _, _, ev in queue if ev.get("type") == "content_block_start"
+                  and (ev.get("content_block") or {}).get("type") == "text"]
+        dropped = starts[0]["index"] if starts and not found.text else None
+        out, put = [], not extra
+        for held, delta, ev in queue:
+            if delta is not None:
+                if not put:
+                    out.append(text_event(ev, extra))
+                    put = True
+            elif dropped is not None and ev.get("index") == dropped and ev.get("type") in ("content_block_start", "content_block_stop"):
+                continue
+            else:
+                out.append(held)
+        index = (dropped if dropped is not None else self.top_index + 1) - 1
         for call in found.calls:
             index += 1
             block = {"type": "tool_use", "id": "toolu_hw_" + _hex(), "name": call["name"], "input": {}}
@@ -667,72 +779,80 @@ class StreamRepair:
             out.append(_sse("anthropic", "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
                 "type": "input_json_delta", "partial_json": json.dumps(call["arguments"])}}))
             out.append(_sse("anthropic", "content_block_stop", {"type": "content_block_stop", "index": index}))
-        if final is not None:
-            delta = {**(final.get("delta") or {}), "stop_reason": "tool_use"}
-            out.append(_sse("anthropic", "message_delta", {**final, "delta": delta}))
-        else:
+        if obj.get("type") == "message_delta":
+            delta = {**(obj.get("delta") or {}), "stop_reason": "tool_use"}
+            out.append(_sse("anthropic", "message_delta", {**obj, "delta": delta}))
+        else:  # message_stop without a message_delta
             out.append(_sse("anthropic", "message_delta", {"type": "message_delta", "delta": {
                 "stop_reason": "tool_use", "stop_sequence": None}, "usage": {"output_tokens": 0}}))
-            out.append(end)
+            out.append(raw)
         return b"".join(out)
 
-    def _chunk(self, delta, finish=None, base=None):
+    def _chunk(self, delta, finish=None):
         return _sse("chat", "", {**self.template, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
 
     def _emit_chat(self, found, queue, extra, raw, obj):
         out = [self._chunk({"content": extra})] if extra else []
-        if "_raw" in obj:  # [DONE] without a finish chunk
-            tail, finish = raw, None
-        else:
-            finish = obj
         for number, call in enumerate(found.calls):
             out.append(self._chunk({"tool_calls": [{"index": number, "id": "call_hw_" + _hex(), "type": "function",
                                                     "function": {"name": call["name"], "arguments": json.dumps(call["arguments"])}}]}))
-        if finish is not None:
-            choice = {**finish["choices"][0], "finish_reason": "tool_calls"}
-            out.append(_sse("chat", "", {**finish, "choices": [choice] + finish["choices"][1:]}))
-        else:
+        if "_raw" in obj:  # [DONE] without a finish chunk
             out.append(self._chunk({}, "tool_calls"))
-            out.append(tail)
+            out.append(raw)
+        else:
+            choice = {**obj["choices"][0], "finish_reason": "tool_calls"}
+            out.append(_sse("chat", "", {**obj, "choices": [choice] + obj["choices"][1:]}))
         return b"".join(out)
 
     def _emit_responses(self, found, queue, extra, raw, obj):
         text = found.text
+        message_events = ("response.content_part.added", "response.output_text.delta", "response.output_text.done",
+                          "response.content_part.done")
+        # the message item would end up empty: drop all of it (its start was held back for this)
+        dropped = not text and any(ev.get("type") == "response.output_item.added" and (ev.get("item") or {}).get("type") == "message"
+                                   for _, _, ev in queue)
 
-        def text_event(old, value):
-            return _sse("responses", "response.output_text.delta", {**old, "delta": value})
-        out = []
-        put = not extra
+        def number(event):
+            if self.seq is not None:
+                self.seq += 1
+                event["sequence_number"] = self.seq
+            return event
+
+        out, put = [], not extra
         for held, delta, event in queue:
             kind = event.get("type")
+            is_message = (event.get("item") or {}).get("type") == "message"
+            if dropped and (kind in message_events or (kind in ("response.output_item.added", "response.output_item.done") and is_message)):
+                continue
             if delta is not None:
                 if not put:
-                    out.append(text_event(event, extra))
+                    out.append(_sse("responses", kind, {**event, "delta": extra}))
                     put = True
             elif kind == "response.output_text.done":
                 out.append(_sse("responses", kind, {**event, "text": text}))
             elif kind == "response.content_part.done":
                 out.append(_sse("responses", kind, {**event, "part": {**(event.get("part") or {}), "text": text}}))
-            elif kind == "response.output_item.done" and (event.get("item") or {}).get("type") == "message":
+            elif kind == "response.output_item.done" and is_message:
                 parts = [{**p, "text": text} if isinstance(p, dict) and p.get("type") == "output_text" else p
                          for p in event["item"].get("content") or ()]
                 out.append(_sse("responses", kind, {**event, "item": {**event["item"], "content": parts}}))
             else:
                 out.append(held)
         items = _function_call_items(found)
-        for item in items:
-            started = {**item, "status": "in_progress", "arguments": ""}
-            out.append(_sse("responses", "response.output_item.added", {"type": "response.output_item.added", "item": started}))
-            out.append(_sse("responses", "response.function_call_arguments.delta", {
-                "type": "response.function_call_arguments.delta", "delta": item["arguments"], "item_id": item["id"]}))
-            out.append(_sse("responses", "response.function_call_arguments.done", {
-                "type": "response.function_call_arguments.done", "arguments": item["arguments"], "item_id": item["id"]}))
-            out.append(_sse("responses", "response.output_item.done", {"type": "response.output_item.done", "item": item}))
+        base = self.next_output - (1 if dropped else 0)
+        for n, item in enumerate(items):
+            index = {"output_index": base + n}
+            for kind, fields in (
+                    ("response.output_item.added", {"item": {**item, "status": "in_progress", "arguments": ""}}),
+                    ("response.function_call_arguments.delta", {"delta": item["arguments"], "item_id": item["id"]}),
+                    ("response.function_call_arguments.done", {"arguments": item["arguments"], "item_id": item["id"]}),
+                    ("response.output_item.done", {"item": item})):
+                out.append(_sse("responses", kind, number({"type": kind, **index, **fields})))
         if obj.get("type") == "response.completed":
             response = obj.get("response") or {}
             response = {**response, "status": "completed",
-                        "output": responses_output(response.get("output") or [], found, items)}
-            out.append(_sse("responses", "response.completed", {**obj, "response": response}))
+                        "output": responses_output(response.get("output") or [], found, items, keep=not dropped)}
+            out.append(_sse("responses", "response.completed", number({**obj, "response": response})))
         else:
             out.append(raw)
         return b"".join(out)

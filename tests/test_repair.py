@@ -69,7 +69,7 @@ class Formats(unittest.TestCase):
 
     def test_raw_json(self):
         self.check('{"name": "get_secret", "arguments": {"name": "alpha"}}', "json")
-        self.check('```json\n{"name": "get_secret", "parameters": {"name": "alpha"}}\n```', "json")
+        self.check('Here you go: {"name": "get_secret", "parameters": {"name": "alpha"}}', "json", rest="Here you go:")
         self.check('{"name": "get_secret", "arguments": "{\\"name\\": \\"alpha\\"}"}', "json")
         self.check('{"type": "function", "function": {"name": "get_secret", "arguments": {"name": "alpha"}}}', "json")
 
@@ -127,18 +127,175 @@ class Rejected(unittest.TestCase):
         self.assertEqual(found.calls[0]["arguments"], {"a": "x", "b": None, "c": 1})
 
 
-class Holding(unittest.TestCase):
-    def test_states(self):
-        names = list(TOOLS)
-        self.assertEqual(repair.hold_state("Hello there, I will help.", names), repair.NO)
-        self.assertEqual(repair.hold_state("Use <b>bold</b> text", names), repair.NO)
-        self.assertEqual(repair.hold_state("text [TOOL_CALLS]", names), repair.YES)
-        self.assertEqual(repair.hold_state("text [TOOL", names), repair.MAYBE)
-        self.assertEqual(repair.hold_state("text <tool_c", names), repair.MAYBE)
-        self.assertEqual(repair.hold_state("a\nget_secret(", names), repair.YES)
-        self.assertEqual(repair.hold_state("a\nget_sec", names), repair.MAYBE)
-        self.assertEqual(repair.hold_state('a\n{"name"', names), repair.YES)
-        self.assertEqual(repair.hold_state("a\n{\n  ", names), repair.MAYBE)
+class Conservative(unittest.TestCase):
+    BASH = {"bash": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}
+    CALL = '{"name": "bash", "arguments": {"command": "rm -rf build"}}'
+
+    def none(self, text, tools=None):
+        self.assertIsNone(repair.find_tool_call(text, tools or self.BASH), text)
+
+    def test_call_shaped_examples_in_prose_are_not_repaired(self):
+        self.none("The model emits:\n```json\n" + self.CALL + "\n```\nThat is the format.")
+        self.none("The model emits: " + self.CALL + " That is the format.")
+        self.none(self.CALL + "\nThat is the format.")
+        self.none("Output:\n```\n" + self.CALL + "\n```")
+        self.none("<tool_call>" + self.CALL + "</tool_call> is how Qwen writes it, and Mistral writes it differently.")
+        self.none("x" * 400 + "\n" + self.CALL)
+
+    def test_a_short_lead_in_and_closing_markers_are_fine(self):
+        found = repair.find_tool_call("Cleaning up.\n<tool_call>" + self.CALL + "</tool_call>\n", self.BASH)
+        self.assertEqual((found.format, found.text), ("tool_call", "Cleaning up."))
+
+    def test_odd_values_do_not_raise(self):
+        tools = {"t": {"type": "object", "properties": {}}}
+        for text in ("t(a={[]: 1})", "t(a={1, 2})", "t(a=b'x')", "t(a=1j)", "t(a=" + "[" * 5000 + ")",
+                     '{"name": "t", "arguments": {"a": NaN}}'):
+            self.assertIsNone(repair.find_tool_call(text, tools), text)
+
+    def test_hold_start(self):
+        names = TOOLS
+        for text in ("Hello there, I will help.", "Use <b>bold</b> text", "mention [TOOL_CALLS] in prose",
+                     "x = read(fd, buf, n);", '{"name": "bob"}', "```\n[TOOL_CALLS]\n```"):
+            self.assertIsNone(repair.find_hold_start(text, 0, names), text)
+        self.assertEqual(repair.find_hold_start("text\n[TOOL_CALLS]", 0, names), 5)
+        self.assertEqual(repair.find_hold_start("text\n[TOOL", 0, names), 5)
+        self.assertEqual(repair.find_hold_start("a\nget_secret(", 0, names), 2)
+        self.assertEqual(repair.find_hold_start("a\nget_sec", 0, names), 2)
+        self.assertEqual(repair.find_hold_start('a\n{"name": "get_secret", "arg', 0, names), 2)
+        self.assertIsNone(repair.find_hold_start("x" * 400 + "\n[TOOL_CALLS]", 0, names))  # lead-in too long
+
+    def test_can_be_call_releases(self):
+        names = TOOLS
+        text = '{"name": "get_secret", "arguments": {"name": "a"}}'
+        self.assertTrue(repair.can_be_call(text, 0, names))
+        self.assertFalse(repair.can_be_call(text + "\nand more prose", 0, names))
+        self.assertFalse(repair.can_be_call('{"name": "my-app", "version": "1"', 0, names))
+        self.assertFalse(repair.can_be_call("get_secret(1, 2)", 0, names))
+        self.assertFalse(repair.can_be_call("[TOOL_CALLS]" + "x" * 5000, 0, names))
+
+
+def event_stream(api, text):
+    return STREAMS[api](text)
+
+
+class StreamTiming(unittest.TestCase):
+    def feed_all(self, api, text, tools=None):
+        """(bytes sent before the stream ended, bytes at the end, the filter)."""
+        stream = repair.StreamRepair(api, repair.request_tools(api, {"tools": REQUEST_TOOLS[api]}) if tools is None else tools)
+        raw = STREAMS[api](text)
+        early = b""
+        # feed everything but the last event(s), as the relay does while the model is still writing
+        events = raw.split(b"\n\n")
+        cut = len(events) - {"anthropic": 4, "chat": 3, "responses": 2}[api]
+        for event in events[:cut]:
+            early += stream.feed(event + b"\n\n")
+        late = b"".join(stream.feed(e + b"\n\n") for e in events[cut:] if e) + stream.finish()
+        return raw, early, late, stream
+
+    def test_package_json_is_released_while_streaming(self):
+        text = 'Here is package.json:\n{\n  "name": "my-app",\n  "version": "1.0.0"\n}\nRun npm install now.'
+        for api in PATHS:
+            with self.subTest(api):
+                raw, early, late, stream = self.feed_all(api, text)
+                self.assertEqual(early + late, raw)
+                self.assertIn(b"rsion", early)  # not held until the end
+                self.assertIsNone(stream.repaired)
+
+    def test_function_call_in_code_is_released(self):
+        text = "Example:\nread(fd, buf, n);\nThat reads n bytes."
+        tools = {"read": {"type": "object", "properties": {}}}
+        for api in PATHS:
+            with self.subTest(api):
+                raw, early, late, stream = self.feed_all(api, text, tools)
+                self.assertEqual(early + late, raw)
+                self.assertIn(b"hat rea", early)
+
+    def test_prose_example_with_a_call_is_not_repaired_in_a_stream(self):
+        text = 'The model emits:\n<tool_call>{"name": "get_secret", "arguments": {"name": "a"}}</tool_call>\nThat is the format.'
+        for api in PATHS:
+            with self.subTest(api):
+                raw, early, late, stream = self.feed_all(api, text)
+                self.assertEqual(early + late, raw)
+                self.assertIsNone(stream.repaired)
+                self.assertIn(b"rmat.", early)
+
+    def test_marker_mentioned_in_prose_is_not_held(self):
+        text = "Mistral uses [TOOL_CALLS] to start a call, and Qwen uses <tool_call> tags. Both are fine."
+        for api in PATHS:
+            with self.subTest(api):
+                raw, early, late, stream = self.feed_all(api, text)
+                self.assertEqual(early + late, raw)
+                self.assertIn(b"th are", early)
+
+
+class StreamShapes(unittest.TestCase):
+    def run_stream(self, api, text, mutate=None):
+        raw = STREAMS[api](text)
+        stream = repair.StreamRepair(api, repair.request_tools(api, {"tools": REQUEST_TOOLS[api]}))
+        out = b"".join(stream.feed(e + b"\n\n") for e in raw.split(b"\n\n") if e) + stream.finish()
+        return parse_events(out), stream
+
+    def test_anthropic_call_only_reply_has_no_empty_text_block(self):
+        events, stream = self.run_stream("anthropic", CALL_TEXT)
+        self.assertTrue(stream.repaired)
+        starts = [(e["index"], e["content_block"]["type"]) for e in events if e["type"] == "content_block_start"]
+        self.assertEqual(starts, [(0, "thinking"), (1, "tool_use")])
+        stops = [e["index"] for e in events if e["type"] == "content_block_stop"]
+        self.assertEqual(stops, [0, 1])
+        self.assertFalse(any(e["type"] == "content_block_delta" and e["delta"]["type"] == "text_delta" for e in events))
+
+    def test_responses_call_only_reply_has_no_message_item(self):
+        events, stream = self.run_stream("responses", CALL_TEXT)
+        self.assertTrue(stream.repaired)
+        kinds = [e["type"] for e in events]
+        self.assertFalse(any(k.startswith("response.output_text") or k == "response.content_part.added" for k in kinds))
+        items = [e["item"]["type"] for e in events if e["type"] == "response.output_item.added"]
+        self.assertEqual(items, ["reasoning", "function_call"])
+        self.assertEqual([i["type"] for i in events[-1]["response"]["output"]], ["function_call"])
+
+    def test_responses_events_carry_output_index_and_sequence_numbers(self):
+        raw = responses_stream("Looking.\n" + CALL_TEXT)
+        numbered, number = [], 0
+        for block in raw.split(b"\n\n"):
+            if not block:
+                continue
+            number += 1
+            line = block.split(b"\n")[-1]
+            event = json.loads(line[5:])
+            event["sequence_number"] = number
+            if event["type"].startswith("response.output_item"):
+                event["output_index"] = 0 if event["item"]["type"] == "reasoning" else 1
+            numbered.append(event)
+        data = b"".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode() for e in numbered)
+        stream = repair.StreamRepair("responses", repair.request_tools("responses", {"tools": REQUEST_TOOLS["responses"]}))
+        events = parse_events(stream.feed(data) + stream.finish())
+        calls = [e for e in events if "function_call" in json.dumps(e.get("item", "")) or e["type"].startswith("response.function_call_arguments")]
+        self.assertTrue(calls)
+        self.assertEqual({e["output_index"] for e in calls}, {2})
+        sequence = [e["sequence_number"] for e in events]
+        self.assertEqual(len(sequence), len(set(sequence)))
+        self.assertEqual(sequence, sorted(sequence))
+        self.assertEqual(events[-1]["type"], "response.completed")
+
+    def test_responses_events_get_output_index_without_upstream_numbers(self):
+        events, _ = self.run_stream("responses", "Looking.\n" + CALL_TEXT)
+        added = [e for e in events if e["type"] == "response.output_item.added" and e["item"]["type"] == "function_call"]
+        self.assertEqual([e["output_index"] for e in added], [2])
+        for kind in ("response.function_call_arguments.delta", "response.function_call_arguments.done", "response.output_item.done"):
+            self.assertTrue(any(e["type"] == kind and e.get("output_index") == 2 for e in events), kind)
+
+    def test_errors_never_lose_the_reply(self):
+        from unittest import mock
+        for api in PATHS:
+            with self.subTest(api):
+                raw = STREAMS[api]("Looking.\n" + CALL_TEXT)
+                stream = repair.StreamRepair(api, repair.request_tools(api, {"tools": REQUEST_TOOLS[api]}))
+                with mock.patch.object(repair, "find_tool_call", side_effect=RuntimeError("boom")):
+                    out = b"".join(stream.feed(e + b"\n\n") for e in raw.split(b"\n\n") if e) + stream.finish()
+                self.assertEqual(out, raw)
+        from hearthwork import harnesses
+        with mock.patch.object(repair, "repair_response", side_effect=TypeError("boom")):
+            self.assertIsNone(harnesses.repaired_reply("chat", json.dumps(whole("chat", CALL_TEXT)).encode(), TOOLS))
 
 
 # ---------- the relay, against a fake llama-server ----------

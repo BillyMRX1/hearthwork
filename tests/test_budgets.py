@@ -79,7 +79,7 @@ class Estimates(unittest.TestCase):
         text = "\n".join(budgets.explain(c, Path("Qwen3.5-35B-A3B-Q4_K_M.gguf"), problems, need, 131072, details, e))
         self.assertIn("smaller quantization", text)
         self.assertIn("another preset", text)
-        self.assertIn("never shrinks it for you", text)
+        self.assertNotIn("--context", text)  # 1.4 GB of KV cannot cover 3.6 GB: no pointless context advice
 
     def test_viable_budget_has_no_problems(self):
         c = cfg()

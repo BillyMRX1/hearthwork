@@ -47,19 +47,27 @@ class FitAndRank(unittest.TestCase):
     def test_devstral_fits_a_24gb_gpu(self):
         self.assertEqual(by(rank([DEVSTRAL], pc(24, 32)), "devstral")["fit"], "fast")
 
-    def test_fit_tier_comes_first(self):
+    def test_slow_comes_after_usable(self):
         picks = rank([DEVSTRAL, MOE, SMALL, BIG], pc(16, 22.6))
-        order = ("fast", "good", "slow", "too big")
-        tiers = [order.index(p["fit"]) for p in picks]
-        self.assertEqual(tiers, sorted(tiers))
-        self.assertEqual(picks[0]["name"], "small9")  # only one that fits the GPU, despite lowest capability
+        self.assertEqual(picks[-1]["fit"], "slow")
+        self.assertNotEqual(picks[0]["name"], "small9")
+
+    def test_usable_moe_in_ram_beats_small_gpu_model(self):
+        big_moe = cand("moe35", True, 35, {"Q4_K_M": 20.5}, 20000, active=3, tier=4)
+        weak = cand("small9", False, 9, {"Q4_K_M": 5.2}, 40000, tier=2)
+        picks = rank([weak, big_moe, MOE], pc(16, 22.6))
+        self.assertEqual(picks[0]["name"], "moe35")
+        self.assertEqual(picks[-1]["name"], "small9")
+
+    def test_small_pc_still_gets_a_small_model(self):
+        picks = rank([BIG, MOE, SMALL], pc(8, 12))
+        self.assertEqual(models.best(picks)["name"], "small9")
 
     def test_different_pcs_give_different_orders(self):
         small = [p["name"] for p in rank([DEVSTRAL, MOE, SMALL, BIG], pc(8, 16))]
         large = [p["name"] for p in rank([DEVSTRAL, MOE, SMALL, BIG], pc(32, 64))]
         self.assertNotEqual(small, large)
-        self.assertEqual(large[0], "devstral")  # fits the GPU; the 80B MoE needs RAM
-        self.assertEqual(small[0], "moe30")
+        self.assertEqual(large[0], "big80")
 
     def test_capability_orders_within_a_tier(self):
         self.assertEqual([p["name"] for p in rank([SMALL, DEVSTRAL], pc(48, 64))], ["devstral", "small9"])

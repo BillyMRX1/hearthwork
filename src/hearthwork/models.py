@@ -3,9 +3,10 @@
 Shared by `hearthwork check` and setup's suggestions. The ranking (`rank`) is a pure function of the hardware, free
 RAM, each model's file sizes and its KV-cache size per token (read from the GGUF header on Hugging Face with a
 range request, cached on disk). Order of importance:
-  1. fit tier: fits the GPU > MoE partly in RAM > dense partly in RAM > too big (memory includes that model's own
-     KV cache at the context Hearthwork would use, see context.py)
-  2. quantization quality: Q4 or better, then Q3 (with a note); Q2 is never recommended, only listed last
+  1. usable first: fits the GPU, or a MoE partly in RAM estimated at >= 15 tokens/s; then the slower ones (dense
+     partly in RAM, slow MoE); then too big. Memory includes that model's own KV cache at the context Hearthwork
+     would use, see context.py
+  2. quantization: Q3 is allowed (with a note); Q2 is never recommended, only listed last in its class
   3. capability: the curated "tier" (from the maker's published coding/agent benchmarks), else parameter count
   4. estimated speed
 """
@@ -20,9 +21,9 @@ from .paths import HOME
 
 # Coding models with tool-calling chat templates (checked on Hugging Face, 2026-10).
 # "moe": only a few experts run per token, so the model stays usable when part of it sits in system RAM.
-# "params"/"active": billions of parameters in total / used per token (MoE). "tier": capability 1-5 for coding
-# agents, from the maker's published coding/agent benchmarks on the model card ("source"); a model without a tier
-# is ranked by parameter count.
+# "params"/"active": billions of parameters in total / used per token (MoE). "tier": capability class 1-5 for
+# coding agents: Hearthwork's judgement from size, active parameters and the maker's model card ("source");
+# not measured by Hearthwork. A model without a tier is ranked by parameter count.
 MODELS = [
     {"repo": "unsloth/Qwen3.5-35B-A3B-GGUF", "name": "Qwen3.5-35B-A3B", "moe": True, "params": 35, "active": 3, "tier": 4,
      "source": "https://huggingface.co/Qwen/Qwen3.5-35B-A3B", "note": "MoE general model with strong coding and tool use"},
@@ -50,6 +51,7 @@ FALLBACK_CONTEXT = 65536
 HEADER_BYTES = 25_000_000
 RAM_SPEED_GBS, EFFICIENCY = 40.0, 0.5  # dual-channel system RAM; real speed is about half the memory-bandwidth bound
 GPU_SPEED_GBS = {"cuda": 300.0, "vulkan": 250.0, "metal": 150.0}  # typical class of that kind of GPU; no card lookup
+USABLE_TOKENS_PER_SEC = 15  # a MoE partly in RAM counts as usable at this estimated speed (low end)
 FITS = {0: "fast", 1: "good", 2: "slow", 3: "too big"}
 
 
@@ -189,10 +191,11 @@ def rank(candidates, hw, ram_free, settings):
         placed = place(c, c["files"], c.get("info"), hw, ram_free, settings)
         base = {k: v for k, v in c.items() if k not in ("files", "info")}
         if not placed:
-            keyed.append(((3, 0, 0, 0, 0, index), {**base, "quant": None, "sizeGB": None, "fit": "too big", "recommended": False}))
+            keyed.append(((2, 0, 0, 0, 0, index), {**base, "quant": None, "sizeGB": None, "fit": "too big", "recommended": False}))
             continue
         group = quant_group(placed["quant"])
-        key = (placed["tier"], group, -capability(c), -(c.get("params") or 0), -placed["speed"][1], index)
+        usable = placed["tier"] == 0 or (placed["tier"] == 1 and placed["speed"][0] >= USABLE_TOKENS_PER_SEC)
+        key = (0 if usable else 1, 1 if group == 2 else 0, -capability(c), -(c.get("params") or 0), -placed["speed"][1], index)
         keyed.append((key, {**base, **{k: placed[k] for k in ("quant", "sizeGB", "kvGB", "context", "estimated", "ramNeedGB", "ramWarning")},
                             "fit": FITS[placed["tier"]], "lowQuality": group == 2, "q3": group == 1,
                             "speedTokensPerSec": list(placed["speed"]), "recommended": group < 2}))

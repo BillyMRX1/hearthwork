@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from . import context as ctx, diagnostics
+from . import budgets, context as ctx, diagnostics
 from .harnesses import ClientGone, Overloaded, Unavailable, client_gone, make_relay
 from .onboard import GREEN, RED, RESET, WINDOWS, YELLOW
 from .paths import HOME, HOST_FILE, HOST_LOCK, HOST_LOG, LOG, STATE
@@ -1101,6 +1101,8 @@ def ensure(config, model=None, context=None, force=False, drain=False):
             print(f"{YELLOW}Not switching: {busy} request(s) are running or waiting ({got['active']} active, {got['queued']} queued). "
                   f"Wait for them, or use --force to interrupt them.{RESET}")
             return False
+        if not budgets.guard(config, model, context, {"ramGB": budgets.measure().get("ramGB") or 0.0}, force):
+            return False
         if not got.get("adopted"):
             answer = call(info, "switch", "POST", timeout=10, errors=True,
                           payload={"model": str(model), "context": context, "force": force}) or {}
@@ -1124,6 +1126,8 @@ def ensure(config, model=None, context=None, force=False, drain=False):
             return False
     if model is None:
         print(f"{YELLOW}No model to start.{RESET}")
+        return False
+    if not budgets.guard(config, model, context, force=force):
         return False
     args = ["--model", str(model)] + (["--context", str(context)] if context else [])
     return _wait_ready(f"Starting {model.name} (logs: `hearthwork logs`)", spawn(args))

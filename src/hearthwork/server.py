@@ -71,6 +71,8 @@ def command(config, model, context=None, slot_path=None):
            "-ctk", s["kvCacheType"], "-ctv", s["kvCacheType"], "-np", str(s["slots"]), "-kvu",
            "-b", str(s["batch"]), "-ub", str(s["batch"]), "--host", "127.0.0.1", "--port", str(s["port"]),
            "--slot-save-path", str(slot_path or slot_dir(config, model, context))]
+    if s.get("threads"):  # CPU threads budget (hearthwork budget)
+        cmd += ["-t", str(s["threads"])]
     # Escape hatch for a chat template broken in a way the relay (harnesses.py) doesn't cover.
     template = TEMPLATES / f"{model.stem}.jinja"
     if template.is_file():

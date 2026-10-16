@@ -10,6 +10,7 @@
   hearthwork mcp [install ...]  MCP server so any agent can use the local model as a subagent
   hearthwork start [--model X] [--force]   start the model (under the Hearthwork host, in the background)
   hearthwork idle [30|off]      unload the model after N idle minutes (off by default); the next request loads it
+  hearthwork budget [show|use dedicated|balanced|work|set vram=10GB ram=12GB slots=1 threads=8 idle=20m|reset]   resource budget
   hearthwork stop [--force]     stop the model and the host (saves the prompt cache); --force even with requests running
   hearthwork serve [--model X]  run the host in this terminal with its log (Ctrl+C stops it)
   hearthwork logs [--server] [-f]   the host's log (requests, queue); --server: llama-server's output
@@ -163,6 +164,9 @@ def main(argv=None):
         elif command == "diagnose":
             from . import diagnostics
             sys.exit(diagnostics.main(rest))
+        elif command == "budget":
+            from . import budgets
+            sys.exit(budgets.main(rest))
         elif command == "idle":
             from . import host
             sys.exit(host.idle_main(rest))
@@ -185,6 +189,9 @@ def main(argv=None):
             got = host.status()
             if "--json" in rest:
                 import json
+                if got and config.get("server"):
+                    from . import budgets
+                    got["budget"] = budgets.summary(config, got)
                 print(json.dumps(got, indent=2) if got else json.dumps({"host": None}))
                 sys.exit(0 if got else 1)
             if got:
@@ -193,6 +200,9 @@ def main(argv=None):
                 from . import diagnostics
                 info = host.read_info()
                 print(diagnostics.status_line(host.call(info, "diagnostics") if info else None))
+                from . import budgets
+                for line in budgets.table(config, got):
+                    print(line)
             else:
                 from .server import running_context, served_model
                 running = served_model(port)

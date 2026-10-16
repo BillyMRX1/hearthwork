@@ -2,6 +2,9 @@
 
 # Hearthwork
 
+
+**Website and docs: [billymrx1.github.io/hearthwork](https://billymrx1.github.io/hearthwork/)**
+
 **Hearthwork runs a local AI model on your own computer and connects your coding agent to it, from one menu.** The model runs on your GPU and RAM; the agent is Claude Code, Codex, OpenCode, Qwen Code or Aider. Hearthwork sets itself up for your hardware, tells you honestly whether your computer is good enough, and handles the small incompatibilities that otherwise break agents on local models.
 
 Works on Windows, macOS and Linux. Needs Python 3.9+ and the agent(s) you want to use; no extra Python packages.

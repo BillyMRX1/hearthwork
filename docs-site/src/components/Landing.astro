@@ -1,0 +1,87 @@
+---
+import { Code, LinkButton } from '@astrojs/starlight/components';
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const docs = (p: string) => `${base}${p}`;
+
+const why = [
+	['Private', 'The model runs on your own GPU and RAM. Your code and prompts stay on your computer.'],
+	['No per-token cost', 'Once the model is downloaded, using it costs electricity, not an API bill.'],
+	['Works with the agents you already use', 'Claude Code, Codex, OpenCode, Qwen Code and Aider, each started with one command.'],
+];
+const agents = ['Claude Code', 'Codex', 'OpenCode', 'Qwen Code', 'Aider'];
+const features = [
+	['Model check from your PC', 'Reads your hardware and tells you honestly whether a local model is worth it, and which ones fit.', '/get-started/check-your-pc/'],
+	['Doctor', 'Tests the server, the API and your agent step by step and says which layer is at fault.', '/troubleshooting/doctor/'],
+	['Diagnose', 'Explains what slowed or broke your sessions, using numbers measured on your own requests.', '/troubleshooting/diagnose/'],
+	['Budgets and presets', 'Leave room for gaming or work: cap VRAM, slots and threads, or unload when idle.', '/guides/budgets/'],
+	['Setup profiles', 'Save a setup that works, with proof, then re-check, export or restore it.', '/guides/setup-profiles/'],
+	['Automatic recovery', 'If the model server crashes, the host restarts it and tells clients clearly if it cannot.', '/guides/recovery/'],
+	['API mode', 'One local endpoint that speaks both the OpenAI and the Anthropic API, for any other tool.', '/guides/api-mode/'],
+	['Subagents and MCP', 'Let another agent hand small coding tasks to your local model.', '/guides/subagents/'],
+];
+const quickstart = `uvx hearthwork check          # is this computer suited, and which models fit? (installs nothing)
+uv tool install hearthwork    # install (or: pipx install hearthwork)
+hearthwork model unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF   # download a model that fits
+cd my-project
+hearthwork claude             # run an agent on the local model (also: codex, opencode, qwen, aider)`;
+---
+
+<section class="hw-hero">
+	<img class="hw-hero-banner" src={`${base}/banner.svg`} alt="Hearthwork: local models for your coding agents, tuned to your own machine" />
+	<p class="hw-tagline">Run a local AI model on your own computer and connect your coding agent to it, from one menu. Private, no per-token cost, tuned to your hardware.</p>
+	<div class="hw-buttons">
+		<LinkButton href={docs('/get-started/check-your-pc/')} variant="primary" icon="right-arrow">Get started</LinkButton>
+		<LinkButton href="https://github.com/BillyMRX1/hearthwork" variant="minimal" icon="external">GitHub</LinkButton>
+	</div>
+</section>
+
+<section class="hw-section">
+	<h2>Why Hearthwork</h2>
+	<div class="hw-grid">
+		{why.map(([t, d]) => <div class="hw-card"><h3>{t}</h3><p>{d}</p></div>)}
+	</div>
+</section>
+
+<section class="hw-section">
+	<h2>Supported agents</h2>
+	<p class="hw-lead">Hearthwork connects each one to your local model without touching its own settings.</p>
+	<div class="hw-agents">
+		{agents.map((a) => <span class="hw-pill">{a}</span>)}
+	</div>
+</section>
+
+<section class="hw-section">
+	<h2>How it works</h2>
+	<p class="hw-lead">One host per computer owns the model and a single queue. Everything goes through a relay that cleans up requests and repairs tool calls.</p>
+	<div class="hw-diagram"><img src={`${base}/how-it-works.svg`} alt="How Hearthwork works: menu, first-run setup, model folder, llama-server using GPU and RAM, and a relay between the agents and the model" loading="lazy" /></div>
+	<p class="hw-cta"><a href={docs('/how-it-works/')}>Read how it works</a></p>
+</section>
+
+<section class="hw-section">
+	<h2>Use it anywhere</h2>
+	<p class="hw-lead">Run the model on the computer with the GPU and use it from your laptop, at home or away.</p>
+	<div class="hw-grid">
+		<div class="hw-card"><h3>Share on your network</h3><p>Pair another computer with a 6-digit PIN. It needs no model and no setup. <a href={docs('/guides/other-computer/')}>Learn more</a></p></div>
+		<div class="hw-card"><h3>Tailscale</h3><p>Reach your model from anywhere over an encrypted private network. <a href={docs('/guides/tailscale/')}>Learn more</a></p></div>
+		<div class="hw-card"><h3>Mobile app</h3><p>In development, Android first. <a href={docs('/guides/mobile-app/')}>Learn more</a></p></div>
+	</div>
+</section>
+
+<section class="hw-section">
+	<h2>Everything you need around the model</h2>
+	<div class="hw-grid">
+		{features.map(([t, d, l]) => <a class="hw-card" href={docs(l)} style="text-decoration:none"><h3>{t}</h3><p>{d}</p></a>)}
+	</div>
+</section>
+
+<section class="hw-section">
+	<h2>Quick start</h2>
+	<Code code={quickstart} lang="sh" />
+	<p class="hw-lead">The first run sets things up for you: hardware check, llama.cpp and a models folder. <a href={docs('/get-started/check-your-pc/')}>Start here</a></p>
+</section>
+
+<section class="hw-section hw-demo">
+	<h2>See it run</h2>
+	<img src={`${base}/demo.gif`} alt="Hearthwork demo: pick Claude Code, pick a model, it loads, the agent reads a file and answers; then Codex on the same model; then quit" loading="lazy" />
+	<p class="hw-lead"><small>A replay of a real run. Waits are sped up, the agent screens are simplified, and paths are shortened.</small></p>
+</section>

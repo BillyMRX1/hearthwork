@@ -1,0 +1,39 @@
+/* Hearth accent colours, matched to the banner (ember orange on warm brown). */
+:root {
+	--sl-color-accent-low: #4a2614;
+	--sl-color-accent: #c2410c;
+	--sl-color-accent-high: #ffd9b0;
+	--sl-color-white: #ffffff;
+}
+:root[data-theme='light'] {
+	--sl-color-accent-low: #ffe4cc;
+	--sl-color-accent: #c2410c;
+	--sl-color-accent-high: #7c2d12;
+	--sl-color-bg-nav: #fffaf4;
+	--sl-color-bg-sidebar: #fffaf4;
+}
+:root[data-theme='dark'] {
+	--sl-color-accent: #e8742a;
+	--sl-color-bg: #1c120d;
+	--sl-color-bg-nav: #231610;
+	--sl-color-bg-sidebar: #231610;
+	--sl-color-hairline: #3d2a1f;
+}
+.hw-hero-banner { width: 100%; max-width: 56rem; margin: 0 auto 1.5rem; display: block; border-radius: 0.75rem; }
+.hw-section { max-width: 64rem; margin: 3.5rem auto; }
+.hw-section > h2 { text-align: center; margin-bottom: 0.5rem; }
+.hw-lead { text-align: center; color: var(--sl-color-gray-2); max-width: 40rem; margin: 0 auto 1.5rem; }
+.hw-grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); }
+.hw-card { border: 1px solid var(--sl-color-hairline); border-radius: 0.75rem; padding: 1rem 1.1rem; background: var(--sl-color-bg-nav); }
+.hw-card h3 { margin: 0 0 0.35rem; font-size: var(--sl-text-lg); color: var(--sl-color-white); }
+.hw-card p { margin: 0; font-size: var(--sl-text-sm); color: var(--sl-color-gray-2); }
+.hw-agents { display: flex; flex-wrap: wrap; gap: 0.6rem; justify-content: center; }
+.hw-pill { border: 1px solid var(--sl-color-accent); color: var(--sl-color-text-accent); border-radius: 999px; padding: 0.3rem 1rem; font-weight: 600; }
+.hw-diagram { background: #fffaf2; border-radius: 0.75rem; padding: 0.5rem; border: 1px solid var(--sl-color-hairline); }
+.hw-diagram img, .hw-demo img { width: 100%; height: auto; display: block; border-radius: 0.5rem; }
+.hw-demo img { border: 1px solid var(--sl-color-hairline); }
+.hw-cta { text-align: center; }
+.hw-hero { text-align: center; max-width: 56rem; margin: 1rem auto 0; }
+.hw-hero-banner { width: 100%; height: auto; display: block; border-radius: 0.75rem; margin-bottom: 1.25rem; }
+.hw-tagline { font-size: var(--sl-text-lg); color: var(--sl-color-gray-2); max-width: 40rem; margin: 0 auto 1.25rem; }
+.hw-buttons { display: flex; flex-wrap: wrap; gap: 0.75rem; justify-content: center; }

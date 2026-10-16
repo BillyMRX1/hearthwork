@@ -7,7 +7,7 @@ server.json
 server.log
 
 # Local-only folders
-docs/
+/docs/
 .claude/
 
 # Python
@@ -27,3 +27,8 @@ bench/
 dist/
 *.egg-info/
 build/
+
+# docs-site
+docs-site/node_modules/
+docs-site/dist/
+docs-site/.astro/

@@ -124,7 +124,7 @@ hearthwork context [model] [N|auto]   context per model: range for this computer
 ## diagnose
 
 ```text
-usage: hearthwork diagnose [-h] [--last N] [--since DURATION] [--client CLIENT] [--json]
+usage: hearthwork diagnose [-h] [--last N] [--since DURATION] [--all] [--client CLIENT] [--json]
                            [--export FILE]
 
 Explain what limited your agent sessions, from measured requests (HOME/logs/requests.jsonl).
@@ -134,6 +134,7 @@ options:
   -h, --help        show this help message and exit
   --last N          only the last N requests
   --since DURATION  only requests from the last period, e.g. 90s, 30m, 2h, 1d
+  --all             every recorded request, not only the last 24 hours (the default)
   --client CLIENT   only this client (part of its id, e.g. opencode, api, share)
   --json            print the report as JSON
   --export FILE     write a sanitized JSON report (numbers only: no prompts, code, or credentials)

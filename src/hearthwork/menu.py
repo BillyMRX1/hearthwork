@@ -48,7 +48,7 @@ def status_lines(config):
 def ensure_server(config):
     """The running model's name, starting one (after picking a model) if none is running."""
     port = config["server"]["port"]
-    name = served_model(port) or (port_open(port) and served_model(port, timeout=60))
+    name = served_model(port) or host.hosted_model() or (port_open(port) and served_model(port, timeout=60))
     if name:  # running: make sure the host fronts it (starts one, or adopts a server an older Hearthwork started)
         return name if host.ensure(config) else None
     if port_open(port):

@@ -116,7 +116,7 @@ class Api:
         if served_model(self.model_port, timeout=5) == model_id(model):
             return True
         print(f"\n{YELLOW}Switching to {model.name} (a request asked for it)...{RESET}", flush=True)
-        ok = host.ensure(self.config, model, force=True)  # --allow-switch interrupts others, as before (step 2: drain)
+        ok = host.ensure(self.config, model, drain=True)  # waits for running requests (new ones queue), then switches
         if ok:
             self.config["lastModel"] = str(model)
             save_config(self.config)

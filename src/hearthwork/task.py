@@ -126,8 +126,8 @@ def model_for_task(config):
         return None, name, context, config["remote"]
     port = config["server"]["port"]
     from .server import port_open
-    name = served_model(port) or (port_open(port) and served_model(port, timeout=60))  # busy: wait, never restart it
     from . import host
+    name = served_model(port) or host.hosted_model() or (port_open(port) and served_model(port, timeout=60))  # busy: wait, never restart it
     if name:
         with contextlib.redirect_stdout(sys.stderr):  # its progress must not reach stdout (`task --json`)
             fronted = host.ensure(config)  # starts the host in front of it (or adopts it)

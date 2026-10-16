@@ -135,7 +135,7 @@ def model_need(config, model, context=None, eff=None):
     return estimate(weights, kv, hw_of(config), eff), chosen, {"weightsGB": weights, "kvGB": kv, "perToken": per_token}
 
 
-def check(config, need, context, details, free_ram=None, reclaim_ram=0.0, eff=None):
+def check(config, need, context, details, eff=None):
     """Problems (list of strings, each with units) that stop the model from starting under the budget. Empty = viable."""
     eff, hw = eff or effective(config), hw_of(config)
     problems = []
@@ -144,12 +144,32 @@ def check(config, need, context, details, free_ram=None, reclaim_ram=0.0, eff=No
         label = "RAM budget" if not unified(hw) else "memory budget (unified memory)"
         problems.append(f"{label}: {eff['ramGB']:.1f} GB, the model needs about {need['ramGB']:.1f} GB in RAM "
                         f"({over:.1f} GB too much)")
-    if free_ram is not None:
-        available = free_ram + reclaim_ram
-        if need["ramGB"] > available + 0.05:
-            problems.append(f"free RAM now: {available:.1f} GB, the model needs about {need['ramGB']:.1f} GB "
-                            f"({need['ramGB'] - available:.1f} GB too much; close other programs)")
+    capacity = (hw.get("ramGB") or 0) + total_vram(hw)
+    if need["totalGB"] > capacity + 0.05:
+        problems.append(f"this computer's memory: {capacity:.1f} GB (RAM + VRAM), the model needs about "
+                        f"{need['totalGB']:.1f} GB ({need['totalGB'] - capacity:.1f} GB too much)")
     return problems
+
+
+def warnings(need, free_ram, reclaim_ram=0.0):
+    """Not a reason to refuse (free memory moves): a shortfall against the RAM free right now."""
+    if free_ram is None:
+        return []
+    available = free_ram + reclaim_ram
+    if need["ramGB"] > available + 0.05:
+        return [f"Warning: free RAM now is {available:.1f} GB and the model needs about {need['ramGB']:.1f} GB "
+                f"({need['ramGB'] - available:.1f} GB short). Close other apps if loading is slow or fails."]
+    return []
+
+
+def log_refusal(text):
+    from .paths import HOST_LOG
+    import time
+    try:
+        with open(HOST_LOG, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + " budget: refused: " + text.replace(chr(10), " | ") + chr(10))
+    except OSError:
+        pass
 
 
 def options(config, problems, need, context, details, eff):
@@ -182,11 +202,17 @@ def guard(config, model, context=None, reclaim=None, force=False):
     if not got:
         return True  # unreadable file: llama-server will say what is wrong
     need, chosen, details = got
-    problems = check(config, need, chosen, details, memory_gb()[1], (reclaim or {}).get("ramGB", 0.0), eff)
+    free = memory_gb()[1]
+    reclaim_ram = (reclaim or {}).get("ramGB", 0.0)
+    for w in warnings(need, free, reclaim_ram):
+        print(f"{YELLOW}{w}{RESET}")
+    problems = check(config, need, chosen, details, eff=eff)
     if not problems:
         return True
-    for line in explain(config, model, problems, need, chosen, details, eff):
+    lines = explain(config, model, problems, need, chosen, details, eff)
+    for line in lines:
         print(line)
+    log_refusal(f"{model.name}: " + "; ".join(problems))
     if force:
         print(f"{YELLOW}--force: starting anyway.{RESET}")
         return True
@@ -392,7 +418,7 @@ def main(argv):
     got = host.status()
     model = current_model(config, got) if got else None
     if got and model and got.get("ready") and not got.get("adopted"):
-        if not guard(config, model, None, {"ramGB": (measure().get("ramGB") or 0.0)}, force):
+        if not guard(config, model, got.get("requestedContext"), {"ramGB": (measure().get("ramGB") or 0.0)}, force):
             print("Budget not changed.")
             return 1
     save_config(config)
@@ -407,7 +433,7 @@ def main(argv):
         print(f"Applying to {model.name}: " + (f"waiting for {busy} request(s) to finish" if busy and not force
                                               else "restarting the model server") + " (logs: `hearthwork logs`)", end="", flush=True)
         answer = host.call(host.read_info(), "switch", "POST", timeout=10, errors=True,
-                           payload={"model": str(model), "context": None, "force": force}) or {}
+                           payload={"model": str(model), "context": got.get("requestedContext"), "force": force}) or {}
         if answer.get("error"):
             print(f"\n{YELLOW}Not applied now: {answer['error'].get('message')}. The budget is saved and applies at the next start.{RESET}")
             return 1

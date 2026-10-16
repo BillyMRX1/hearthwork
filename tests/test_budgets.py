@@ -72,7 +72,7 @@ class Estimates(unittest.TestCase):
         e = budgets.set_preset(c, "balanced", {"vramGB": 8.0, "ramGB": 12.0})
         need = budgets.estimate(20.5, 1.4, c["hardware"], e)
         details = {"weightsGB": 20.5, "kvGB": 1.4, "perToken": 11264}
-        problems = budgets.check(c, need, 131072, details, free_ram=20.0, eff=e)
+        problems = budgets.check(c, need, 131072, details, eff=e)
         self.assertEqual(len(problems), 1)
         self.assertIn("RAM budget: 12.0 GB", problems[0])
         self.assertIn("3.6 GB too much", problems[0])
@@ -85,21 +85,25 @@ class Estimates(unittest.TestCase):
         c = cfg()
         e = budgets.effective(c)
         need = budgets.estimate(20.5, 1.4, c["hardware"], e)
-        self.assertEqual(budgets.check(c, need, 131072, {}, free_ram=18.0, eff=e), [])
+        self.assertEqual(budgets.check(c, need, 131072, {}, eff=e), [])
 
-    def test_free_ram_now_counts_what_the_old_model_gives_back(self):
+    def test_low_free_ram_only_warns_and_reclaim_counts(self):
+        need = {"ramGB": 12.4, "totalGB": 23.3, "gpuGB": 10.9}
+        self.assertIn("Close other apps", budgets.warnings(need, 3.0)[0])
+        self.assertEqual(budgets.warnings(need, 3.0, 10.0), [])
+
+    def test_more_than_the_machine_has_is_refused(self):
         c = cfg()
         e = budgets.effective(c)
-        need = budgets.estimate(20.5, 1.4, c["hardware"], e)
-        self.assertTrue(budgets.check(c, need, 1, {}, free_ram=3.0, eff=e))
-        self.assertEqual(budgets.check(c, need, 1, {}, free_ram=3.0, reclaim_ram=10.0, eff=e), [])
+        need = budgets.estimate(60.0, 1.4, c["hardware"], e)
+        self.assertIn("this computer's memory", budgets.check(c, need, 1, {}, eff=e)[-1])
 
     def test_guard_refuses_but_force_goes_on_and_context_is_untouched(self):
         c = cfg()
         c["budget"] = {"preset": "balanced", "custom": {"ramGB": 4.0}}
         found = (budgets.estimate(20.5, 1.4, c["hardware"], budgets.effective(c)), 131072,
                  {"weightsGB": 20.5, "kvGB": 1.4, "perToken": 11264})
-        with mock.patch.object(budgets, "model_need", return_value=found), mock.patch.object(budgets, "memory_gb", return_value=(22.6, 18.0)):
+        with mock.patch.object(budgets, "model_need", return_value=found), mock.patch.object(budgets, "memory_gb", return_value=(22.6, 18.0)), mock.patch.object(budgets, "log_refusal"):
             out = io.StringIO()
             with redirect_stdout(out):
                 self.assertFalse(budgets.guard(c, Path("m.gguf"), 131072))

@@ -458,7 +458,7 @@ class Host:
         if self.ready:
             idle_for = 0 if self.gate.active or self.gate.queue else time.monotonic() - self.gate.last_activity
         now = time.monotonic()
-        return {"pid": os.getpid(), "port": port(self.config), "model": self.model, "context": self.context,
+        return {"pid": os.getpid(), "port": port(self.config), "model": self.model, "context": self.context, "requestedContext": self.load_context,
                 "ready": self.ready, "error": self.error, "adopted": self.adopted, "restored": self.restored,
                 "serverPort": self.llama_port, "started": self.started, "uptime": time.time() - self.started,
                 "slots": self.slots, "state": self.state, "transition": transition, "switchError": self.switch_error,

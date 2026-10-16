@@ -232,12 +232,103 @@ class RecoveryTests(Rig):
         post(self.llama, "/__hang", {"seconds": 3})
         t, result = self.stream(count=30, delay=0.1)  # a stream is being served: never restart it
         self.assertTrue(wait_for(lambda: self.host.gate.active))
-        self.assertTrue(wait_for(lambda: self.host.health_fails >= host.HEALTH_FAILS, 10))
-        time.sleep(0.5)
+        self.assertTrue(wait_for(lambda: self.host.last_health == "timeout", 10))
+        time.sleep(2)  # many failed checks while the stream runs: activity resets the count, nothing restarts
+        self.assertLess(self.host.health_fails, host.HEALTH_FAILS)
         self.assertEqual((self.host.state, self.host.recovered, self.llama_pid()), ("ready", 0, pid))
         t.join(20)
         self.assertIn("tok29", result["body"])
-        self.assertEqual(self.host.status()["recovery"]["lastHealth"], "timeout")
+
+    def test_silent_and_idle_server_is_restarted(self):
+        pid = self.llama_pid()
+        post(self.llama, "/__hang", {"seconds": 3})  # no request at all during the whole window
+        self.assertTrue(wait_for(lambda: self.host.recovered == 1, 30))
+        self.assertNotEqual(self.llama_pid(), pid)
+        self.assertEqual(self.host.failure["kind"], "timeout")
+
+    def test_stream_that_ended_gets_no_error_event(self):
+        result = post(self.port, "/v1/messages", {"stream": True, "count": 2, "final": "event: message_stop\ndata: {}\n\n", "die": True})
+        self.assertIn("message_stop", result[1])
+        self.assertNotIn("event: error", result[1])
+        self.assertTrue(wait_for(lambda: self.host.recovered == 1, 30))
+
+    def test_cancelled_request_is_not_retried(self):
+        dead = free_port()
+        gate = host.Gate(lambda: 2)
+        calls = []
+
+        def restart():
+            calls.append(1)
+            gate.cancel_all("cancelled by a switch")
+            self.addCleanup(http_server(dead).shutdown)
+            return True
+
+        gate.on_refused = restart
+        listener = harnesses.make_relay(dead, ("127.0.0.1", 0), None, gate=gate)
+        threading.Thread(target=listener.serve_forever, daemon=True).start()
+        self.addCleanup(listener.shutdown)
+        status, body = post(listener.server_address[1], "/v1/chat/completions", {"n": 1}, timeout=30)
+        self.assertEqual(status, 503)
+        self.assertIn("cancelled by a switch", body)
+        self.assertEqual(calls, [1])
+
+    def test_load_deadline_kills_the_process(self):
+        self.host.kill_server()
+        os.environ["FAKE_LOAD_DELAY"] = "30"
+        self.addCleanup(os.environ.pop, "FAKE_LOAD_DELAY", None)
+        with mock.patch.object(host, "LOAD_DEADLINE", 1):
+            with self.assertRaises(RuntimeError):
+                self.host.load(self.model_a, None)
+        self.assertIsNone(self.host.process)
+        self.assertFalse((self.tmp / "server.json").exists())
+        self.assertFalse(host.health(self.llama, 0.5)[0])
+
+    def test_stopping_during_load_leaves_no_process(self):
+        self.host.kill_server()
+        os.environ["FAKE_LOAD_DELAY"] = "30"
+        self.addCleanup(os.environ.pop, "FAKE_LOAD_DELAY", None)
+        threading.Timer(1, self.host.stop_event.set).start()
+        with self.assertRaises(RuntimeError):
+            self.host.load(self.model_a, None)
+        self.assertFalse((self.tmp / "server.json").exists())
+        self.assertIsNone(self.host.process)
+
+    def test_unload_survives_a_failing_stop(self):
+        self.host.idle_minutes = 0
+        with mock.patch.object(server, "stop", side_effect=RuntimeError("boom")):
+            self.host.unload()
+        self.assertEqual(self.host.state, "unloaded")
+        self.assertIsNone(self.host.process)
+        self.assertEqual(self.host.gate.hold, "loading model")
+        self.assertFalse(host.health(self.llama, 0.5)[0])
+
+    def test_models_and_other_posts_while_unloaded(self):
+        self.host.unload()
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        conn.request("GET", "/v1/models")
+        response = conn.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(response.read())["data"][0]["id"], "A.gguf")
+        self.assertEqual(self.host.state, "unloaded")  # listing does not load the model
+        status, body = post(self.port, "/v1/messages/count_tokens", {"n": 1}, timeout=60)  # not a generation: wakes and waits
+        self.assertEqual(status, 200)
+        self.assertEqual(self.host.state, "ready")
+
+    def test_context_is_auto_unless_given_and_config_is_reread(self):
+        self.assertIsNone(self.host.load_context)
+        fresh = {"server": {"port": self.llama, "slots": 2, "marker": 1}}
+        with mock.patch("hearthwork.onboard.load_config", lambda: fresh):
+            self.host.unload()
+            self.host.wake()
+            self.assertTrue(wait_for(lambda: self.host.state == "ready", 30))
+        self.assertEqual(self.host.config["server"].get("marker"), 1)
+        self.assertIsNone(self.host.load_context)
+        self.assertEqual(self.host.switch(str(self.model_b), 8192, False)[0], 202)
+        self.assertTrue(wait_for(lambda: self.host.state == "ready" and self.host.model == "B", 30))
+        self.assertEqual(self.host.load_context, 8192)
+        self.assertEqual(self.host.switch(str(self.model_a), None, False)[0], 202)
+        self.assertTrue(wait_for(lambda: self.host.state == "ready" and self.host.model == "A", 30))
+        self.assertIsNone(self.host.load_context)
 
     def test_request_during_crash_is_served_after_restart(self):
         with self.assertRaises(Exception):

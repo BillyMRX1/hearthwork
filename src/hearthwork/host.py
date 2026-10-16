@@ -149,6 +149,7 @@ class Gate:
         self.hold = None            # why new requests wait (switching, loading, recovering...); None: admit as usual
         self.failed = None          # the model server failed for good: requests get this as a 503
         self.wake = None            # called while requests wait on a held gate (starts an unloaded model)
+        self.models_fallback = None  # host: the /v1/models list while llama-server is not up
         self.on_refused = None      # host: wait for a restart; True when the model server is back
         self.last_activity = time.monotonic()
         self.hint = None            # latest model server failure, told to the requests it interrupts
@@ -248,6 +249,24 @@ class Gate:
                 abort()
         return len(entries)
 
+    def wait_available(self):
+        """A request that is not a generation (count_tokens...) while the model is unloaded or loading: wake it and wait,
+        within the normal wait limit, instead of failing."""
+        if not self.hold and not self.failed:
+            return
+        end = time.monotonic() + self.max_wait
+        with self.cond:
+            while self.hold or self.failed:
+                if self.failed:
+                    raise Unavailable(self.failed)
+                if self.closing:
+                    raise Overloaded("The Hearthwork host is shutting down.")
+                if time.monotonic() > end:
+                    raise Overloaded(f"The model was not ready after {self.max_wait:.0f} s. Try again later.")
+                if self.wake:
+                    self.wake()
+                self.cond.wait(0.25)
+
     def recovered_for_retry(self):
         """A request was refused or reset before the model server accepted it: True once the host got it running again."""
         return bool(self.on_refused and self.on_refused())
@@ -327,6 +346,7 @@ HEALTH_FAILS = 6        # consecutive failed checks (and no request running) bef
 RESTART_LIMIT = 3       # restarts allowed per RESTART_WINDOW seconds; then the state is "failed"
 RESTART_WINDOW = 900
 BACKOFF = (2, 10, 30)   # seconds before the first, second, third restart
+LOAD_DEADLINE = LOAD_TIMEOUT  # seconds before a model that never gets ready is killed and counted as a failed start
 LOAD_POLL = 1           # seconds between checks while llama-server loads
 
 
@@ -402,9 +422,27 @@ class Host:
         self.idle_minutes = idle_setting(config)
         self.restarts, self.recovered = [], 0
         self.failure, self.health_fails, self.last_health, self.health_at = None, 0, None, 0.0
+        self.fail_marker, self.logged_health = None, False
         self._wlock, self._waking = threading.Lock(), False
         self.gate.wake = self.wake
         self.gate.on_refused = self.wait_recovered
+        self.gate.models_fallback = self.models_list
+
+    def models_list(self):
+        """/v1/models while llama-server is down (unloaded, loading): the model the host would load."""
+        if not self.model_path:
+            return None
+        return [{"id": self.model_path.name, "object": "model"}]
+
+    def refresh_config(self):
+        """Settings changed since the host started (`hearthwork context X N`) count at the next load."""
+        try:
+            from .onboard import load_config
+            fresh = load_config()
+            if fresh.get("server"):
+                self.config = fresh
+        except Exception:
+            pass
 
     def record(self):
         write_private(HOST_FILE, json.dumps({"pid": os.getpid(), "port": port(self.config), "token": self.token,
@@ -471,28 +509,52 @@ class Host:
         self.gate.set_hold(None)
         self.record()
 
+    def kill_server(self):
+        """Terminate the llama-server this host spawned (and its children); forget its record."""
+        proc, self.process = self.process, None
+        if proc is not None and proc.poll() is None:
+            if WINDOWS:
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+            else:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+            try:
+                proc.wait(10)
+            except Exception:
+                pass
+        STATE.unlink(missing_ok=True)
+
     def load(self, model, context):
         """Start llama-server on `model` and wait until it answers. Raises RuntimeError when it cannot."""
         from . import server
         server.stop(self.config, quiet=True)  # a stale record or leftover process of an older start
+        requested = context  # None = auto: recomputed at the next load, for the model and settings of that time
         context, source, rng = ctx.choose(self.config, model, context)
         self.log(ctx.describe(context, source, rng))
         cmd = server.command(self.config, model, context)
         self.log("Starting " + model.name)
         self.process = server.spawn_server(cmd)
-        STATE.write_text(json.dumps({"pid": self.process.pid, "model": str(model), "port": self.llama_port}))
         started = time.time()
-        while not server.ready(self.llama_port):
-            if self.process.poll() is not None:
-                tail = tail_lines(10)
-                STATE.unlink(missing_ok=True)
-                kind = classify_exit(self.process.returncode, tail)
-                raise RuntimeError(f"llama-server stopped while loading (exit code {self.process.returncode}"
-                                   f"{', out of memory' if kind == 'out of memory' else ''})\n" + "\n".join(tail))
-            if self.stop_event.is_set():
-                raise RuntimeError("the host is stopping")
-            time.sleep(LOAD_POLL)
-        self.model_path, self.load_context = model, context
+        try:
+            STATE.write_text(json.dumps({"pid": self.process.pid, "model": str(model), "port": self.llama_port}))
+            while not server.ready(self.llama_port):
+                if self.process.poll() is not None:
+                    tail = tail_lines(10)
+                    STATE.unlink(missing_ok=True)
+                    kind = classify_exit(self.process.returncode, tail)
+                    raise RuntimeError(f"llama-server stopped while loading (exit code {self.process.returncode}"
+                                       f"{', out of memory' if kind == 'out of memory' else ''})\n" + "\n".join(tail))
+                if self.stop_event.is_set():
+                    raise RuntimeError("the host is stopping")
+                if time.time() - started > LOAD_DEADLINE:
+                    raise RuntimeError(f"the model did not load within {LOAD_DEADLINE:.0f} s")
+                time.sleep(LOAD_POLL)
+        except BaseException:
+            self.kill_server()  # never leave a llama-server behind holding the GPU
+            raise
+        self.model_path, self.load_context = model, requested
         self.restored = server.restore_slots(self.llama_port, self.config["server"]["slots"])
         self.log(f"Model ready in {time.time() - started:.0f} s" + (f", restored {self.restored:,} cached prompt tokens" if self.restored else ""))
         self.model = server.served_model(self.llama_port, timeout=30) or model.stem
@@ -554,6 +616,7 @@ class Host:
             self.end()
             return 409, {"error": {"message": "the model is still starting; try again in a moment"}}
         self.switch_error = None
+        self.transition["phase"] = "draining"
         threading.Thread(target=self._switch, args=(path, context, force), daemon=True).start()
         return 202, {"switching": path.stem}
 
@@ -561,6 +624,7 @@ class Host:
         from . import server
         previous, previous_context = self.model_path, self.load_context
         name = path.stem
+        self.refresh_config()
         try:
             self.gate.set_hold(f"switching to {name}")
             self.transition["phase"] = "draining"
@@ -620,10 +684,14 @@ class Host:
                 self.gate.hold = "loading model"  # from here on new requests wait; the first one loads the model again
             self.log(f"No requests for {self.idle_minutes} min: unloading the model")
             self.ready, self.state = False, "unloading"
-            server.stop(self.config, quiet=True)
-            self.process = None
-            self.state = "unloaded"
+            try:
+                server.stop(self.config, quiet=True)
+            except Exception:
+                self.log(traceback.format_exc())
+            self.kill_server()  # whatever stop left running
         finally:
+            if self.state == "unloading":
+                self.state = "unloaded"
             self.end()
 
     def wake(self):
@@ -644,6 +712,7 @@ class Host:
                 if self.state != "unloaded" or not self.model_path:
                     return
                 self.state = "loading"
+                self.refresh_config()
                 self.log("A request is waiting: loading the model")
                 try:
                     self.load(self.model_path, self.load_context)
@@ -688,11 +757,17 @@ class Host:
             self.health_at = now
             ok, kind = health(self.llama_port)
             if ok:
-                self.health_fails, self.last_health = 0, None
+                self.health_fails, self.last_health, self.logged_health = 0, None, False
             else:
-                self.health_fails += 1
+                busy = bool(self.gate.active)
+                if self.health_fails == 0 or busy or self.fail_marker != self.gate.last_activity:
+                    self.health_fails = 0 if busy else 1  # the window restarts: only silence with no activity counts
+                    self.fail_marker = self.gate.last_activity
+                else:
+                    self.health_fails += 1
                 self.last_health = kind
-                if self.health_fails == 1:
+                if not self.logged_health:
+                    self.logged_health = True
                     self.log(f"Health check of llama-server failed ({kind}); it may only be busy, so it is not restarted")
                 # an alive process is only restarted when it keeps failing while nothing at all is running on it
                 if self.health_fails >= HEALTH_FAILS and not self.gate.active and self.process.poll() is None:

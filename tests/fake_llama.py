@@ -74,6 +74,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
                 self.wfile.flush()
                 time.sleep(float(body.get("delay") or 0))
+            if body.get("final"):
+                chunk = body["final"].encode()
+                self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                self.wfile.flush()
+            if body.get("die"):
+                os._exit(1)
             self.wfile.write(b"0\r\n\r\n")
             return
         time.sleep(float(body.get("delay") or 0))

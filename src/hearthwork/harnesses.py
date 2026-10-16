@@ -335,6 +335,9 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                         data = json.load(response).get("data", [])
                     return self._send_json(200, {"object": "list", "data": data, "models": []})
                 except Exception as error:
+                    fallback = gate.models_fallback() if gate and gate.models_fallback else None
+                    if fallback is not None:  # the model is unloaded or loading: the host still lists it
+                        return self._send_json(200, {"object": "list", "data": fallback, "models": []})
                     return self._send_json(502, {"error": {"message": str(error)}})
             api, tools, wants_stream = None, {}, False
             if normalize and body and self.command == "POST":
@@ -365,6 +368,11 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                     return self._overloaded(path, str(error), isinstance(error, Unavailable))
                 except ClientGone:
                     return
+            if gate and not ticket and self.command == "POST":
+                try:  # not a generation (count_tokens...): wait for an unloaded or loading model instead of failing
+                    gate.wait_available()
+                except Overloaded as error:
+                    return self._overloaded(path, str(error), isinstance(error, Unavailable))
             try:
                 headers = {k: v for k, v in self.headers.items()
                            if k.lower() not in ("host", "content-length", "connection", "accept-encoding")}
@@ -402,6 +410,15 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                                 pass
                     ticket.entry["abort"] = abort
 
+                def cancelled():
+                    return bool(ticket and ticket.entry.get("cancelled"))
+
+                def note(chunk):  # has the stream's terminal event passed through? then nothing is appended to it
+                    tail = state.get("tail", b"") + chunk
+                    state["tail"] = tail[-64:]
+                    if any(mark in tail for mark in (b"message_stop", b"[DONE]", b"response.completed", b"response.failed")):
+                        state["done"] = True
+
                 threading.Thread(target=watch, daemon=True).start()
                 try:
                     for attempt in (0, 1):
@@ -412,7 +429,7 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                             # Refused/reset before the request was accepted: nothing ran. The host may restart the
                             # model server; then it is sent once more. Anything later is never retried.
                             upstream.close()
-                            if attempt or not gate or not gate.recovered_for_retry() or state["outcome"] != "ok":
+                            if attempt or not gate or cancelled() or not gate.recovered_for_retry() or state["outcome"] != "ok"                                     or cancelled():  # a cancelled request is never run again
                                 raise
                             upstream = http.client.HTTPConnection("127.0.0.1", upstream_port, timeout=3600)
                     state["link"] = upstream.sock
@@ -442,6 +459,7 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                     elif tools:
                         stream = repair.StreamRepair(api, tools)
                         while chunk := response.read1(65536):
+                            note(chunk)
                             self.wfile.write(stream.feed(chunk))
                             self.wfile.flush()
                         self.wfile.write(stream.finish())
@@ -450,6 +468,7 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                             log_repair(stream.repaired)
                     else:
                         while chunk := response.read1(65536):
+                            note(chunk)
                             self.wfile.write(chunk)
                             self.wfile.flush()
                 except (ConnectionError, OSError, http.client.HTTPException):
@@ -460,6 +479,8 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                             if not state["sent"]:
                                 state["outcome"] = "error"
                                 self._overloaded(path, why, True)
+                            elif state.get("done"):  # the stream had ended: say nothing more
+                                pass
                             elif streaming:  # interrupted mid-stream: end it with the API's error event, never a new generation
                                 state["outcome"] = "interrupted"
                                 self.wfile.write(stream_error(path, why))

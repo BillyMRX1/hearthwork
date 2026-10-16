@@ -9,13 +9,14 @@
   hearthwork task "TASK"        one coding task for another agent to delegate (no terminal needed); see --help
   hearthwork mcp [install ...]  MCP server so any agent can use the local model as a subagent
   hearthwork start [--model X] [--force]   start the model (under the Hearthwork host, in the background)
+  hearthwork idle [30|off]      unload the model after N idle minutes (off by default); the next request loads it
   hearthwork stop [--force]     stop the model and the host (saves the prompt cache); --force even with requests running
   hearthwork serve [--model X]  run the host in this terminal with its log (Ctrl+C stops it)
   hearthwork logs [--server] [-f]   the host's log (requests, queue); --server: llama-server's output
   hearthwork alias add <name> <agent>   short command for it, e.g. ccl  (also: alias list, alias remove <name>)
   hearthwork context [model] [N|auto]   context per model: range for this computer; save N for a model
   hearthwork diagnose [--last N | --since 30m] [--client X] [--json] [--export FILE]   what limited your sessions (measured)
-  hearthwork status             host, model, context, slots, and active/queued requests per client
+  hearthwork status [--json]    host, model, context, slots, requests per client; switching, idle and recovery state
   hearthwork share [--port N]   share the running model on your home network (Ctrl+C stops); a PIN pairs each computer
   hearthwork api [--port N]     OpenAI + Anthropic compatible endpoint on this computer for any tool (--show: setup snippets)
   hearthwork devices            trusted devices (devices remove <name> revokes one)
@@ -162,6 +163,9 @@ def main(argv=None):
         elif command == "diagnose":
             from . import diagnostics
             sys.exit(diagnostics.main(rest))
+        elif command == "idle":
+            from . import host
+            sys.exit(host.idle_main(rest))
         elif command == "stop":
             from . import host
             sys.exit(0 if host.stop(load_config(), force="--force" in rest) else 1)
@@ -169,8 +173,9 @@ def main(argv=None):
             from . import host
             config = load_config()
             port = config.get("server", {}).get("port", 8001)
-            print(f"hearthwork {__version__}   data: {HOME}")
-            if config.get("remote"):
+            if "--json" not in rest:
+                print(f"hearthwork {__version__}   data: {HOME}")
+            if config.get("remote") and "--json" not in rest:
                 from .remote import require
                 from .remote import status_lines
                 got = require(config)
@@ -178,6 +183,10 @@ def main(argv=None):
                     print(line)
                 sys.exit(0 if got else 1)
             got = host.status()
+            if "--json" in rest:
+                import json
+                print(json.dumps(got, indent=2) if got else json.dumps({"host": None}))
+                sys.exit(0 if got else 1)
             if got:
                 for line in host.status_lines(got):
                     print(line)

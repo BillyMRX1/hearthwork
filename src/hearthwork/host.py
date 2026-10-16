@@ -10,21 +10,24 @@ and /stop on the listener, needs the random token in host.json. Logs: HOME/logs/
 import collections
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 from . import context as ctx, diagnostics
-from .harnesses import ClientGone, Overloaded, client_gone, make_relay
+from .harnesses import ClientGone, Overloaded, Unavailable, client_gone, make_relay
 from .onboard import GREEN, RED, RESET, WINDOWS, YELLOW
 from .paths import HOME, HOST_FILE, HOST_LOCK, HOST_LOG, LOG, STATE
 
@@ -144,6 +147,13 @@ class Gate:
         self.clients = {}
         self.rejected = 0
         self.closing = False
+        self.hold = None            # why new requests wait (switching, loading, recovering...); None: admit as usual
+        self.failed = None          # the model server failed for good: requests get this as a 503
+        self.wake = None            # called while requests wait on a held gate (starts an unloaded model)
+        self.models_fallback = None  # host: the /v1/models list while llama-server is not up
+        self.on_refused = None      # host: wait for a restart; True when the model server is back
+        self.last_activity = time.monotonic()
+        self.hint = None            # latest model server failure, told to the requests it interrupts
 
     def wants(self, command, path):
         return command == "POST" and path.rstrip("/").endswith(GENERATION)
@@ -157,10 +167,15 @@ class Gate:
     def admit(self, sock, cid, path=""):
         entry = {"client": cid, "path": path, "queued": time.monotonic()}
         who = display_name(cid)
+        if self.hold and self.wake:
+            self.wake()
         with self.cond:
             if self.closing:
                 raise Overloaded("The Hearthwork host is shutting down.")
-            if self.queue or len(self.active) >= self.limit():
+            if self.failed:
+                raise Unavailable(self.failed)
+            self.last_activity = time.monotonic()
+            if self.queue or self.hold or len(self.active) >= self.limit():
                 if len(self.queue) >= self.max_queue:
                     self.rejected += 1
                     self.log(f"{who} {path}: refused, the queue is full ({len(self.queue)} waiting)")
@@ -169,9 +184,13 @@ class Gate:
                 self._client(cid)["queued"] += 1
                 self.log(f"{who} {path}: queued (position {len(self.queue)}, {len(self.active)} running)")
                 try:
-                    while not (self.queue[0] is entry and len(self.active) < self.limit()):
+                    while not (self.queue[0] is entry and len(self.active) < self.limit() and not self.hold):
                         if self.closing:
                             raise Overloaded("The Hearthwork host is shutting down.")
+                        if self.failed:
+                            raise Unavailable(self.failed)
+                        if self.hold and self.wake:
+                            self.wake()
                         if time.monotonic() - entry["queued"] >= self.max_wait:
                             self.rejected += 1
                             self.log(f"{who} {path}: gave up after {self.max_wait:.0f} s in the queue")
@@ -186,7 +205,7 @@ class Gate:
                         self.queue.remove(entry)
                     self._client(cid)["queued"] -= 1
                     self.cond.notify_all()
-            entry["started"] = time.monotonic()
+            entry["started"] = self.last_activity = time.monotonic()
             self.active.append(entry)
             client = self._client(cid)
             client["active"] += 1
@@ -201,6 +220,7 @@ class Gate:
                 self.active.remove(entry)
             client = self._client(entry["client"])
             client["active"] -= 1
+            self.last_activity = time.monotonic()
             self.cond.notify_all()
             self.log(f"{display_name(entry['client'])} {entry['path']}: {outcome} after {time.monotonic() - entry['started']:.1f} s")
             if len(self.clients) > 50:  # keep the table small: forget the idle ones that were seen longest ago
@@ -212,6 +232,48 @@ class Gate:
         with self.cond:
             self.closing = True
             self.cond.notify_all()
+
+    def set_hold(self, reason=None, failed=None):
+        """Hold (or release) new requests: they wait in the queue, within the normal wait limit. `failed` makes them fail."""
+        with self.cond:
+            self.hold, self.failed = reason, failed
+            self.cond.notify_all()
+
+    def cancel_all(self, message):
+        """Cancel the running requests (a forced switch): each client gets `message` as its error. Returns how many."""
+        with self.cond:
+            entries = list(self.active)
+        for entry in entries:
+            entry["cancelled"] = message
+            abort = entry.get("abort")
+            if abort:
+                abort()
+        return len(entries)
+
+    def wait_available(self):
+        """A request that is not a generation (count_tokens...) while the model is unloaded or loading: wake it and wait,
+        within the normal wait limit, instead of failing."""
+        if not self.hold and not self.failed:
+            return
+        end = time.monotonic() + self.max_wait
+        with self.cond:
+            while self.hold or self.failed:
+                if self.failed:
+                    raise Unavailable(self.failed)
+                if self.closing:
+                    raise Overloaded("The Hearthwork host is shutting down.")
+                if time.monotonic() > end:
+                    raise Overloaded(f"The model was not ready after {self.max_wait:.0f} s. Try again later.")
+                if self.wake:
+                    self.wake()
+                self.cond.wait(0.25)
+
+    def recovered_for_retry(self):
+        """A request was refused or reset before the model server accepted it: True once the host got it running again."""
+        return bool(self.on_refused and self.on_refused())
+
+    def failure_text(self):
+        return self.failed or self.hint
 
     def wait_idle(self, seconds):
         """Wait until no request is running (at most `seconds`); True when idle."""
@@ -275,6 +337,71 @@ def props_slots(llama_port, fallback):
     return fallback
 
 
+OOM_PATTERNS = ("out of memory", "failed to allocate", "cudamalloc failed", "unable to allocate", "outofdevicememory",
+                "bad_alloc", "insufficient memory")
+SWITCH_DRAIN = 120      # a switch waits this long for running requests (with --force: FORCE_GRACE, then cancels them)
+FORCE_GRACE = 10
+HEALTH_EVERY = 10       # seconds between /health checks of llama-server
+HEALTH_TIMEOUT = 10     # a slower answer than this is a failed check, never a reason to restart by itself
+HEALTH_FAILS = 6        # consecutive failed checks (and no request running) before a silent process is restarted
+RESTART_LIMIT = 3       # restarts allowed per RESTART_WINDOW seconds; then the state is "failed"
+RESTART_WINDOW = 900
+BACKOFF = (2, 10, 30)   # seconds before the first, second, third restart
+LOAD_DEADLINE = LOAD_TIMEOUT  # seconds before a model that never gets ready is killed and counted as a failed start
+LOAD_POLL = 1           # seconds between checks while llama-server loads
+
+
+def tail_lines(n=20, path=None):
+    try:
+        return (path or LOG).read_text(errors="replace").splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def classify_exit(code, tail):
+    """"out of memory" when llama-server's last lines say so, else "crash"."""
+    low = "\n".join(tail).lower()
+    return "out of memory" if any(p in low for p in OOM_PATTERNS) else "crash"
+
+
+def classify_error(error):
+    """Kind of a failed /health request: "connection refused", "connection reset", "timeout" or "connection error"."""
+    reason = getattr(error, "reason", error)
+    if isinstance(reason, ConnectionRefusedError):
+        return "connection refused"
+    if isinstance(reason, (ConnectionResetError, ConnectionAbortedError, http.client.RemoteDisconnected)):
+        return "connection reset"
+    return "timeout" if isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(reason) else "connection error"
+
+
+def health(llama_port, timeout=None):
+    """(True, None) when llama-server answers /health at all (a "loading" 503 counts: it is alive), else (False, kind)."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{llama_port}/health", timeout=timeout or HEALTH_TIMEOUT):
+            return True, None
+    except urllib.error.HTTPError:
+        return True, None
+    except (OSError, http.client.HTTPException) as error:
+        return False, classify_error(error)
+
+
+def failure_record(kind, code=None, detail=None):
+    reason = {"crash": "llama-server crashed", "out of memory": "llama-server ran out of memory"}.get(kind, f"llama-server stopped answering ({kind})")
+    if code is not None:
+        reason += f" (exit code {code})"
+    if detail:
+        reason += f": {detail}"
+    return {"kind": kind, "reason": reason, "exitCode": code, "time": time.time(), "logTail": tail_lines()}
+
+
+def idle_setting(config):
+    """Minutes of no requests before the model is unloaded; 0 = never (the default)."""
+    try:
+        return max(0, int((config.get("host") or {}).get("idleUnloadMinutes") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 class Host:
     def __init__(self, config, log):
         self.config, self.log = config, log
@@ -289,16 +416,57 @@ class Host:
         self.gate = Gate(lambda: self.slots, log)
         diagnostics.RECORDER.context = lambda: (self.context, self.slots, self.model)
         self.listener = None
+        self.state = "starting"       # starting, loading, ready, switching, unloaded, recovering, failed
+        self.model_path = self.load_context = None
+        self.tlock = threading.Lock()  # one transition (switch, unload, load, recovery) at a time
+        self.transition = None
+        self.switch_error = None
+        self.idle_minutes = idle_setting(config)
+        self.restarts, self.recovered = [], 0
+        self.failure, self.health_fails, self.last_health, self.health_at = None, 0, None, 0.0
+        self.fail_marker, self.logged_health = None, False
+        self._wlock, self._waking = threading.Lock(), False
+        self.gate.wake = self.wake
+        self.gate.on_refused = self.wait_recovered
+        self.gate.models_fallback = self.models_list
+
+    def models_list(self):
+        """/v1/models while llama-server is down (unloaded, loading): the model the host would load."""
+        if not self.model_path:
+            return None
+        return [{"id": self.model_path.name, "object": "model"}]
+
+    def refresh_config(self):
+        """Settings changed since the host started (`hearthwork context X N`) count at the next load."""
+        try:
+            from .onboard import load_config
+            fresh = load_config()
+            if fresh.get("server"):
+                self.config = fresh
+        except Exception:
+            pass
 
     def record(self):
         write_private(HOST_FILE, json.dumps({"pid": os.getpid(), "port": port(self.config), "token": self.token,
                                              "model": self.model, "started": self.started, "adopted": self.adopted}))
 
     def status(self):
+        transition = dict(self.transition) if self.transition else None
+        if transition:
+            transition["draining"] = len(self.gate.active) if transition.get("phase") == "draining" else 0
+        idle_for = None
+        if self.ready:
+            idle_for = 0 if self.gate.active or self.gate.queue else time.monotonic() - self.gate.last_activity
+        now = time.monotonic()
         return {"pid": os.getpid(), "port": port(self.config), "model": self.model, "context": self.context,
                 "ready": self.ready, "error": self.error, "adopted": self.adopted, "restored": self.restored,
                 "serverPort": self.llama_port, "started": self.started, "uptime": time.time() - self.started,
-                "slots": self.slots, **self.gate.snapshot()}
+                "slots": self.slots, "state": self.state, "transition": transition, "switchError": self.switch_error,
+                "idleMinutes": self.idle_minutes, "idleFor": idle_for,
+                "recovery": {"restarts": len([t for t in self.restarts if now - t < RESTART_WINDOW]), "limit": RESTART_LIMIT,
+                             "windowMinutes": RESTART_WINDOW // 60, "recovered": self.recovered, "lastFailure": self.failure,
+                             "healthFails": self.health_fails, "lastHealth": self.last_health},
+                **self.gate.snapshot()}
 
     def control(self, handler):
         """Answer /hearthwork/control/* (token required); True when the request was handled here."""
@@ -311,6 +479,7 @@ class Host:
             handler._send_json(401 if path.startswith("/hearthwork/control/") else 404,
                                {"error": {"message": "control token required" if path.startswith("/hearthwork/control/") else "not found"}})
             return True
+        name = path.rsplit("/", 1)[-1]
         if path == "/hearthwork/control/status" and handler.command == "GET":
             handler._send_json(200, self.status())
         elif path == "/hearthwork/control/diagnostics" and handler.command == "GET":  # ?seconds=N (default 300)
@@ -319,11 +488,83 @@ class Host:
         elif path == "/hearthwork/control/stop" and handler.command == "POST":
             handler._send_json(200, {"stopping": True})
             self.stop_event.set()
+        elif handler.command == "POST" and name in ("switch", "idle", "load"):
+            try:
+                body = json.loads(handler.read_body() or b"{}")
+            except ValueError:
+                body = {}
+            if name == "switch":
+                code, payload = self.switch(body.get("model"), body.get("context"), bool(body.get("force")))
+            elif name == "idle":
+                code, payload = self.set_idle(body.get("minutes"))
+            else:
+                code, payload = self.request_load()
+            handler._send_json(code, payload)
         else:
             handler._send_json(404, {"error": {"message": "not found"}})
         return True
 
     # -- llama-server --
+
+    def set_ready(self):
+        self.ready, self.state, self.transition = True, "ready", None
+        self.health_fails, self.last_health = 0, None
+        self.gate.hint = None
+        self.gate.last_activity = time.monotonic()
+        self.gate.set_hold(None)
+        self.record()
+
+    def kill_server(self):
+        """Terminate the llama-server this host spawned (and its children); forget its record."""
+        proc, self.process = self.process, None
+        if proc is not None and proc.poll() is None:
+            if WINDOWS:
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+            else:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+            try:
+                proc.wait(10)
+            except Exception:
+                pass
+        STATE.unlink(missing_ok=True)
+
+    def load(self, model, context):
+        """Start llama-server on `model` and wait until it answers. Raises RuntimeError when it cannot."""
+        from . import server
+        server.stop(self.config, quiet=True)  # a stale record or leftover process of an older start
+        requested = context  # None = auto: recomputed at the next load, for the model and settings of that time
+        context, source, rng = ctx.choose(self.config, model, context)
+        self.log(ctx.describe(context, source, rng))
+        cmd = server.command(self.config, model, context)
+        self.log("Starting " + model.name)
+        self.process = server.spawn_server(cmd)
+        started = time.time()
+        try:
+            STATE.write_text(json.dumps({"pid": self.process.pid, "model": str(model), "port": self.llama_port}))
+            while not server.ready(self.llama_port):
+                if self.process.poll() is not None:
+                    tail = tail_lines(10)
+                    STATE.unlink(missing_ok=True)
+                    kind = classify_exit(self.process.returncode, tail)
+                    raise RuntimeError(f"llama-server stopped while loading (exit code {self.process.returncode}"
+                                       f"{', out of memory' if kind == 'out of memory' else ''})\n" + "\n".join(tail))
+                if self.stop_event.is_set():
+                    raise RuntimeError("the host is stopping")
+                if time.time() - started > LOAD_DEADLINE:
+                    raise RuntimeError(f"the model did not load within {LOAD_DEADLINE:.0f} s")
+                time.sleep(LOAD_POLL)
+        except BaseException:
+            self.kill_server()  # never leave a llama-server behind holding the GPU
+            raise
+        self.model_path, self.load_context = model, requested
+        self.restored = server.restore_slots(self.llama_port, self.config["server"]["slots"])
+        self.log(f"Model ready in {time.time() - started:.0f} s" + (f", restored {self.restored:,} cached prompt tokens" if self.restored else ""))
+        self.model = server.served_model(self.llama_port, timeout=30) or model.stem
+        self.context = server.running_context(self.llama_port)
+        self.slots = props_slots(self.llama_port, self.slots)
 
     def start_model(self, model, context, adopt):
         from . import server
@@ -334,38 +575,274 @@ class Host:
                 if not name:
                     raise RuntimeError(f"nothing answers on port {self.llama_port}")
                 self.log(f"Using the model server already running on port {self.llama_port}: {name}")
+                self.model = name
+                self.context = server.running_context(self.llama_port)
+                self.slots = props_slots(self.llama_port, self.slots)
             else:
-                server.stop(self.config, quiet=True)  # a stale record or leftover process of an older start
-                context, source, rng = ctx.choose(self.config, model, context)
-                self.log(ctx.describe(context, source, rng))
-                cmd = server.command(self.config, model, context)
-                self.log("Starting " + model.name)
-                self.process = server.spawn_server(cmd)
-                STATE.write_text(json.dumps({"pid": self.process.pid, "model": str(model), "port": self.llama_port}))
-                started = time.time()
-                while not server.ready(self.llama_port):
-                    if self.process.poll() is not None:
-                        tail = ""
-                        try:
-                            tail = "\n".join(LOG.read_text(errors="replace").splitlines()[-10:])
-                        except OSError:
-                            pass
-                        STATE.unlink(missing_ok=True)
-                        raise RuntimeError(f"llama-server stopped while loading (exit code {self.process.returncode})\n{tail}")
-                    if self.stop_event.is_set():
-                        return
-                    time.sleep(1)
-                self.restored = server.restore_slots(self.llama_port, self.config["server"]["slots"])
-                self.log(f"Model ready in {time.time() - started:.0f} s" + (f", restored {self.restored:,} cached prompt tokens" if self.restored else ""))
-            self.model = server.served_model(self.llama_port, timeout=30) or (model.stem if model else None)
-            self.context = server.running_context(self.llama_port)
-            self.slots = props_slots(self.llama_port, self.slots)
-            self.ready = True
-            self.record()
+                self.state = "loading"
+                self.gate.set_hold("loading model")
+                self.load(model, context)
+            self.set_ready()
         except Exception as error:
+            if self.stop_event.is_set():
+                return
             self.error = str(error)
             self.log(f"The model did not start: {error}")
             self.stop_event.set()
+
+    # -- transitions: switch, idle unload, recovery --
+
+    def begin(self, kind, target=None):
+        """Take the transition lock (False when another transition runs: only one at a time)."""
+        if not self.tlock.acquire(False):
+            return False
+        self.transition = {"kind": kind, "target": target, "phase": kind, "since": time.time()}
+        return True
+
+    def end(self):
+        self.transition = None
+        if self.tlock.locked():
+            self.tlock.release()
+
+    def busy_message(self):
+        kind = (self.transition or {}).get("kind")
+        return "a switch is already in progress" if kind == "switch" else f"the host is busy ({kind or 'starting'}); try again in a moment"
+
+    def switch(self, model, context, force):
+        """Control API: switch to another model file. Returns (HTTP status, payload); the work runs in the background."""
+        if self.adopted:
+            return 409, {"error": {"message": "this model server was started by an older Hearthwork; run `hearthwork stop` first"}}
+        path = Path(model) if model else None
+        if not path or not path.is_file():
+            return 400, {"error": {"message": f"model file not found: {model}"}}
+        if not self.begin("switch", path.stem):
+            return 409, {"error": {"message": self.busy_message()}}
+        if self.state not in ("ready", "failed", "unloaded"):
+            self.end()
+            return 409, {"error": {"message": "the model is still starting; try again in a moment"}}
+        self.switch_error = None
+        self.transition["phase"] = "draining"
+        threading.Thread(target=self._switch, args=(path, context, force), daemon=True).start()
+        return 202, {"switching": path.stem}
+
+    def _switch(self, path, context, force):
+        from . import server
+        previous, previous_context = self.model_path, self.load_context
+        name = path.stem
+        self.refresh_config()
+        try:
+            self.gate.set_hold(f"switching to {name}")
+            self.transition["phase"] = "draining"
+            self.log(f"Switching to {name}: no new requests start; {len(self.gate.active)} running")
+            if not self.gate.wait_idle(FORCE_GRACE if force else SWITCH_DRAIN):
+                if not force:
+                    self.switch_error = (f"Not switching: {len(self.gate.active)} request(s) were still running after "
+                                         f"{SWITCH_DRAIN} s. Try again later, or use --force.")
+                    self.log(self.switch_error)
+                    self.gate.set_hold(None if self.state == "ready" else self.gate.hold, self.gate.failed)
+                    return
+                n = self.gate.cancel_all(f"The model is being switched to {name}; this request was cancelled.")
+                self.log(f"Switching to {name}: cancelled {n} running request(s)")
+                self.gate.wait_idle(10)
+            self.transition["phase"] = "loading"
+            self.ready, self.state = False, "switching"
+            self.gate.set_hold(f"loading {name}")
+            server.stop(self.config, quiet=True)  # saves the prompt cache first
+            self.process = None
+            try:
+                self.load(path, context)
+            except Exception as error:
+                if self.stop_event.is_set():
+                    return
+                self.switch_error = f"Could not switch to {name}: {str(error).splitlines()[0]}"
+                self.log(self.switch_error)
+                if not previous:
+                    raise
+                self.log(f"Going back to {previous.stem}")
+                self.load(previous, previous_context)  # failing again: the handler below marks the host failed
+            self.set_ready()
+        except Exception as error:
+            if not self.stop_event.is_set():
+                self.give_up(failure_record("crash", detail=(str(error).splitlines() or [""])[0]))
+        finally:
+            self.end()
+
+    def set_idle(self, minutes):
+        try:
+            minutes = max(0, int(minutes or 0))
+        except (TypeError, ValueError):
+            return 400, {"error": {"message": "minutes must be a number, or 0 for off"}}
+        self.idle_minutes = minutes
+        self.gate.last_activity = time.monotonic()
+        self.log("Idle unload: " + (f"after {minutes} min without requests" if minutes else "off"))
+        return 200, {"idleMinutes": minutes}
+
+    def unload(self):
+        """Idle unload: save the prompt cache, stop llama-server, keep the host. Never with a request active or queued."""
+        from . import server
+        if not self.begin("unload"):
+            return
+        try:
+            with self.gate.cond:
+                if self.gate.active or self.gate.queue:
+                    return
+                self.gate.hold = "loading model"  # from here on new requests wait; the first one loads the model again
+            self.log(f"No requests for {self.idle_minutes} min: unloading the model")
+            self.ready, self.state = False, "unloading"
+            try:
+                server.stop(self.config, quiet=True)
+            except Exception:
+                self.log(traceback.format_exc())
+            self.kill_server()  # whatever stop left running
+        finally:
+            if self.state == "unloading":
+                self.state = "unloaded"
+            self.end()
+
+    def wake(self):
+        """A request waits and the model is unloaded: load it in the background."""
+        if self.state != "unloaded" or self.stop_event.is_set():
+            return
+        with self._wlock:
+            if self._waking:
+                return
+            self._waking = True
+        threading.Thread(target=self.reload, daemon=True).start()
+
+    def reload(self):
+        try:
+            if not self.begin("loading", self.model_path.stem if self.model_path else None):
+                return
+            try:
+                if self.state != "unloaded" or not self.model_path:
+                    return
+                self.state = "loading"
+                self.refresh_config()
+                self.log("A request is waiting: loading the model")
+                try:
+                    self.load(self.model_path, self.load_context)
+                    self.set_ready()
+                except Exception as error:
+                    if not self.stop_event.is_set():
+                        self.give_up(failure_record("crash", detail=(str(error).splitlines() or [""])[0]))
+            finally:
+                self.end()
+        finally:
+            self._waking = False
+
+    def request_load(self):
+        """Control API: load an unloaded model now, or clear a failed state and try again (`hearthwork start`)."""
+        if self.state == "failed" and self.model_path:
+            self.restarts.clear()
+            self.log("Failed state cleared: starting the model again")
+            self.gate.set_hold("loading model")
+            self.state = "unloaded"
+        if self.state == "unloaded":
+            self.wake()
+        return 200, {"state": self.state}
+
+    def give_up(self, failure):
+        self.failure = failure
+        self.ready, self.state = False, "failed"
+        message = (f"The model server failed: {failure['reason']}. See `hearthwork logs --server` for its output; "
+                   f"`hearthwork start` tries again.")
+        self.log("Giving up: " + failure["reason"])
+        self.gate.set_hold(None, message)
+
+    def tick(self):
+        """Once a second from the main loop: process exit, /health, idle unload. Only the host restarts anything."""
+        if self.state != "ready" or self.adopted or self.process is None or self.stop_event.is_set() or self.transition:
+            return
+        code = self.process.poll()
+        if code is not None:
+            self.recover(failure_record(classify_exit(code, tail_lines()), code))
+            return
+        now = time.monotonic()
+        if now - self.health_at >= HEALTH_EVERY:
+            self.health_at = now
+            ok, kind = health(self.llama_port)
+            if ok:
+                self.health_fails, self.last_health, self.logged_health = 0, None, False
+            else:
+                busy = bool(self.gate.active)
+                if self.health_fails == 0 or busy or self.fail_marker != self.gate.last_activity:
+                    self.health_fails = 0 if busy else 1  # the window restarts: only silence with no activity counts
+                    self.fail_marker = self.gate.last_activity
+                else:
+                    self.health_fails += 1
+                self.last_health = kind
+                if not self.logged_health:
+                    self.logged_health = True
+                    self.log(f"Health check of llama-server failed ({kind}); it may only be busy, so it is not restarted")
+                # an alive process is only restarted when it keeps failing while nothing at all is running on it
+                if self.health_fails >= HEALTH_FAILS and not self.gate.active and self.process.poll() is None:
+                    self.recover(failure_record(kind, detail=f"no answer from /health for {self.health_fails} checks"))
+                    return
+        if self.idle_minutes:
+            with self.gate.cond:
+                idle = not self.gate.active and not self.gate.queue and now - self.gate.last_activity >= self.idle_minutes * 60
+            if idle:
+                self.unload()
+
+    def recover(self, failure):
+        """Restart llama-server after a failure: at most RESTART_LIMIT times per RESTART_WINDOW, with backoff."""
+        if not self.begin("recovery"):
+            return
+        try:
+            self.failure = failure
+            self.ready, self.state = False, "recovering"
+            self.gate.hint = failure["reason"]
+            self.gate.set_hold("recovering")
+            self.log("Model server failure: " + failure["reason"])
+            for line in failure["logTail"][-5:]:
+                self.log("  server.log: " + line)
+            if self.process is not None and self.process.poll() is not None:
+                STATE.unlink(missing_ok=True)  # its pid may be reused: never signal it
+            while not self.stop_event.is_set():
+                now = time.monotonic()
+                self.restarts = [t for t in self.restarts if now - t < RESTART_WINDOW]
+                if len(self.restarts) >= RESTART_LIMIT:
+                    self.give_up(failure)
+                    return
+                delay = BACKOFF[min(len(self.restarts), len(BACKOFF) - 1)]
+                self.transition["phase"] = f"restart {len(self.restarts) + 1} of {RESTART_LIMIT} in {delay} s"
+                self.log(f"Restarting llama-server in {delay} s (restart {len(self.restarts) + 1} of {RESTART_LIMIT})")
+                if self.stop_event.wait(delay):
+                    return
+                self.restarts.append(time.monotonic())
+                self.transition["phase"] = "loading"
+                try:
+                    self.load(self.model_path, self.load_context)
+                except Exception as error:
+                    if self.stop_event.is_set():
+                        return
+                    text = str(error)
+                    tail = tail_lines()
+                    failure = failure_record(classify_exit(None, tail), detail=text.splitlines()[0])
+                    self.failure = failure
+                    self.gate.hint = failure["reason"]
+                    self.log("Restart failed: " + failure["reason"])
+                    continue
+                self.recovered += 1
+                self.log("llama-server is back")
+                self.set_ready()
+                return
+        finally:
+            self.end()
+
+    def wait_recovered(self, timeout=MAX_WAIT):
+        """A request was refused or reset before llama-server took it. Wait for the host's own restart (only the
+        host restarts); True when the model server is up again, False when it failed or the wait ran out."""
+        from . import server
+        time.sleep(1.5)  # the monitor notices a dead process within a second
+        end = time.monotonic() + timeout
+        while time.monotonic() < end and not self.stop_event.is_set():
+            if self.state == "failed":
+                return False
+            if self.state == "ready" and (self.process is None or self.process.poll() is None) and server.ready(self.llama_port):
+                return True
+            time.sleep(0.25)
+        return False
 
     def shutdown(self):
         from . import server
@@ -415,10 +892,10 @@ def serve(config, model=None, context=None, adopt=False, console=False):
         refreshed = time.time()
         try:
             while not host.stop_event.wait(1):
-                if host.process and host.ready and host.process.poll() is not None:
-                    host.error = f"llama-server exited (code {host.process.returncode})"
-                    print(host.error + "; stopping the host")
-                    break
+                try:
+                    host.tick()
+                except Exception:
+                    print(traceback.format_exc())
                 if host.ready and time.time() - refreshed > 30:
                     refreshed = time.time()
                     host.slots = props_slots(host.llama_port, host.slots)
@@ -470,13 +947,19 @@ def read_info():
     return info
 
 
-def call(info, path, method="GET", timeout=5):
-    """JSON answer of the host's control API, or None."""
+def call(info, path, method="GET", timeout=5, payload=None, errors=False):
+    """JSON answer of the host's control API, or None. With `errors`, an HTTP error answer is returned too (it has "error")."""
+    data = json.dumps(payload).encode() if payload is not None else b"" if method == "POST" else None
     request = urllib.request.Request(f"http://127.0.0.1:{info['port']}/hearthwork/control/{path}", method=method,
-                                     data=b"" if method == "POST" else None, headers={"Authorization": f"Bearer {info['token']}"})
+                                     data=data, headers={"Authorization": f"Bearer {info['token']}"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            return json.load(error) if errors else None
+        except ValueError:
+            return None
     except (OSError, ValueError):
         return None
 
@@ -485,6 +968,13 @@ def status():
     """The host's status (model, context, slots, requests per client), or None when no host answers."""
     info = read_info()
     return call(info, "status") if info else None
+
+
+def hosted_model():
+    """Name of the model of a running host even while it is unloaded, loading or recovering (nothing answers on the
+    model port then, but any command that needs the model just waits for it), else None."""
+    got = status()
+    return (got.get("model") or "model") if got else None
 
 
 def running():
@@ -516,6 +1006,10 @@ def _wait_ready(label, process=None, timeout=LOAD_TIMEOUT):
         now = time.time()
         if got and got.get("error"):
             print(f"\n{RED}The model did not start: {got['error']}{RESET}")
+            return False
+        if got and got.get("state") == "failed":
+            why = ((got.get("recovery") or {}).get("lastFailure") or {}).get("reason", "unknown")
+            print(f"\n{RED}The model server failed: {why} (see `hearthwork logs --server`){RESET}")
             return False
         if got and got.get("ready"):
             note = f" (restored {got['restored']:,} cached prompt tokens: the first message will be quick)" if got.get("restored") else ""
@@ -552,25 +1046,69 @@ def _tail(path, lines=10):
         pass
 
 
-def ensure(config, model=None, context=None, force=False):
+def wait_switch(timeout=LOAD_TIMEOUT):
+    """Wait for a switch to end; prints what the host is doing. True when the host runs the new model."""
+    started, shown = time.time(), None
+    while time.time() - started < timeout:
+        info = read_info()
+        got = call(info, "status") if info else None
+        if got is None:
+            print(f"\n{RED}The host stopped answering during the switch (see `hearthwork logs`).{RESET}")
+            return False
+        if got.get("transition") is None and got.get("state") != "switching":
+            if got.get("switchError"):
+                print(f"\n{RED}{got['switchError']}{RESET}")
+                return False
+            if got.get("state") == "failed":
+                print(f"\n{RED}The model server failed (see `hearthwork logs --server`).{RESET}")
+                return False
+            print(f" {GREEN}ready in {time.time() - started:.0f} s{RESET}")
+            return True
+        line = transition_text(got)
+        if line != shown:
+            print(f"\n{line}", end="", flush=True)
+            shown = line
+        print(".", end="", flush=True)
+        time.sleep(1)
+    print(f"\n{RED}The switch did not finish after {timeout:.0f} s (see `hearthwork logs`).{RESET}")
+    return False
+
+
+def ensure(config, model=None, context=None, force=False, drain=False):
     """Make sure the host runs the model. Starts the host (and llama-server) when needed; adopts a llama-server an older
     Hearthwork started. A different `model` or `context` than the running one restarts the host's server, but refuses
-    while requests are active unless `force`. Returns True when the model is ready."""
+    while requests are active unless `force` or `drain` (then the switch waits for them, up to 2 minutes, while new
+    requests queue). Returns True when the model is ready."""
     from . import server
     llama = config["server"]["port"]
     info = read_info()
     got = call(info, "status") if info else None
     if info and not got:  # alive but silent: still starting
         return _wait_ready("Waiting for the Hearthwork host")
+    if got and got.get("state") in ("failed", "unloaded"):  # `start` clears a failed state / loads an unloaded model
+        if model is None or (got.get("model") == model.stem and context in (None, got.get("context"))):
+            call(info, "load", "POST", payload={})
+            return _wait_ready("Starting the model" if got["state"] == "unloaded" else "Restarting the model")
+    if got and (got.get("transition") or {}).get("kind") == "switch" and model is not None \
+            and got["transition"].get("target") == model.stem:
+        return wait_switch()  # someone else is already switching to it
     if got:
         same = model is None or (got.get("model") == model.stem and (context is None or got.get("context") == context))
         if same:
             return True if got.get("ready") else _wait_ready("Waiting for the model")
         busy = got["active"] + got["queued"]
-        if busy and not force:
+        if busy and not force and not drain:
             print(f"{YELLOW}Not switching: {busy} request(s) are running or waiting ({got['active']} active, {got['queued']} queued). "
                   f"Wait for them, or use --force to interrupt them.{RESET}")
             return False
+        if not got.get("adopted"):
+            answer = call(info, "switch", "POST", timeout=10, errors=True,
+                          payload={"model": str(model), "context": context, "force": force}) or {}
+            if answer.get("error"):
+                print(f"{YELLOW}Not switching: {answer['error'].get('message')}.{RESET}")
+                return False
+            print(f"Switching to {model.name} (logs: `hearthwork logs`)", end="", flush=True)
+            return wait_switch()
         stop(config, quiet=True, force=True)
     elif server.port_open(llama):  # a llama-server of an older Hearthwork (or someone else's) is already there
         name = server.served_model(llama) or server.served_model(llama, timeout=60)
@@ -641,18 +1179,80 @@ def duration(seconds):
     return (f"{days} d " if days else "") + (f"{hours} h " if hours or days else "") + (f"{minutes} min" if minutes or hours or days else f"{secs} s")
 
 
+def transition_text(got):
+    """What the host is doing instead of serving: switching to X (draining N), loading X, recovering, unloaded."""
+    t, state = got.get("transition") or {}, got.get("state")
+    if t.get("kind") == "switch":
+        if t.get("phase") == "draining":
+            return f"switching to {t.get('target')} (draining {t.get('draining', 0)})"
+        return f"loading {t.get('target')}"
+    if state == "recovering" or t.get("kind") == "recovery":
+        why = ((got.get("recovery") or {}).get("lastFailure") or {}).get("reason", "failure")
+        return f"recovering: {why} ({t.get('phase') or 'restarting'})"
+    if state == "unloaded":
+        return "unloaded (idle); loads on the next request"
+    if t.get("kind") == "loading" or state == "loading":
+        return f"loading {t.get('target') or 'the model'}"
+    return state or "starting"
+
+
+def idle_main(argv):
+    """`hearthwork idle [minutes|off]`: show or set the idle unload (off by default; 30 is a good value)."""
+    from .onboard import load_config, save_config
+    config = load_config()
+    current = idle_setting(config)
+    if not argv:
+        now = f"after {current} min without requests" if current else "off"
+        print(f"Idle unload: {now}. Set it with `hearthwork idle 30` or `hearthwork idle off`.")
+        return 0
+    word = argv[0].lower()
+    try:
+        minutes = 0 if word in ("off", "no", "never") else int(word)
+        if minutes < 0:
+            raise ValueError
+    except ValueError:
+        print("Usage: hearthwork idle [minutes|off]")
+        return 2
+    config.setdefault("host", {})["idleUnloadMinutes"] = minutes
+    save_config(config)
+    info = read_info()
+    if info:
+        call(info, "idle", "POST", payload={"minutes": minutes})
+    if minutes:
+        print(f"Idle unload: after {minutes} min without requests (the model unloads, the host stays; the next request loads it).")
+    else:
+        print("Idle unload: off.")
+    return 0
+
+
 def status_lines(got):
     """Text lines for `hearthwork status` from a host status."""
     lines = [f"host: {GREEN}running{RESET}  pid {got['pid']}, port {got['port']}, up {duration(got['uptime'])}"
              + (f"  {DIM}(model server started by an older Hearthwork){RESET}" if got.get("adopted") else "")]
+    state, recovery = got.get("state"), got.get("recovery") or {}
+    last = recovery.get("lastFailure")
     if got.get("error"):
         lines.append(f"model: {RED}{got['error']}{RESET}")
+    elif state == "failed":
+        lines.append(f"model: {RED}failed: {(last or {}).get('reason', 'unknown')}{RESET}  (`hearthwork logs --server`; `hearthwork start` tries again)")
+    elif state in ("switching", "recovering", "unloaded") or got.get("transition"):
+        lines.append(f"model: {YELLOW}{transition_text(got)}{RESET}")
     elif got.get("ready"):
         n_ctx = got.get("context")
         lines.append(f"model: {GREEN}{got['model']}{RESET}  (port {got['serverPort']}"
                      + (f", context {n_ctx:,} = {ctx.format_k(n_ctx)}" if n_ctx else "") + f", {got['slots']} slots)")
     else:
         lines.append(f"model: {YELLOW}loading{RESET}")
+    if got.get("switchError"):
+        lines.append(f"switch: {YELLOW}{got['switchError']}{RESET}")
+    minutes = got.get("idleMinutes")
+    idle_text = f"after {minutes} min without requests" if minutes else "off"
+    lines.append(f"idle unload: {idle_text}" + (f"  (idle for {duration(got['idleFor'])})" if minutes and got.get("idleFor") else ""))
+    if last and (state in ("failed", "recovering") or recovery.get("recovered")):
+        lines.append(f"recovery: {recovery.get('restarts', 0)} of {recovery.get('limit')} restarts in the last {recovery.get('windowMinutes')} min, "
+                     f"{recovery.get('recovered', 0)} recovered; last failure: {last['reason']}")
+    elif recovery.get("lastHealth"):
+        lines.append(f"health: last check failed ({recovery['lastHealth']}); a busy server is not restarted")
     lines.append(f"requests: {got['active']} active / {got['limit']} slots, {got['queued']} queued"
                  + (f", {got['rejected']} refused" if got.get("rejected") else ""))
     for cid, c in sorted(got["clients"].items()):

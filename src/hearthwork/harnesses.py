@@ -224,6 +224,10 @@ class Overloaded(Exception):
     """The host's queue is full, the wait ran out, or it is shutting down."""
 
 
+class Unavailable(Overloaded):
+    """The model server failed and the host gave up restarting it: the message names the reason."""
+
+
 class ClientGone(Exception):
     """The caller hung up while its request waited in the queue."""
 
@@ -233,6 +237,26 @@ def overloaded_reply(path, message):
     if path.rstrip("/").endswith("/messages"):  # Anthropic: HTTP 529 overloaded_error
         return 529, [], {"type": "error", "error": {"type": "overloaded_error", "message": message}}
     return 503, [("Retry-After", "10")], {"error": {"message": message, "type": "server_error", "code": "overloaded"}}
+
+
+def unavailable_reply(path, message):
+    """(status, headers, body) of the "model server failed" error (HTTP 503) in the caller's own API format."""
+    if path.rstrip("/").endswith("/messages"):
+        return 503, [], {"type": "error", "error": {"type": "api_error", "message": message}}
+    return 503, [], {"error": {"message": message, "type": "server_error", "code": "model_unavailable"}}
+
+
+def stream_error(path, message):
+    """The error event that ends a stream that was interrupted after it began (never a new generation spliced on)."""
+    path = path.rstrip("/")
+    if path.endswith("/messages"):
+        event = {"type": "error", "error": {"type": "api_error", "message": message}}
+        return b"event: error\ndata: " + json.dumps(event).encode() + b"\n\n"
+    if path.endswith("/responses"):
+        event = {"type": "error", "code": "server_error", "message": message, "param": None}
+        return b"event: error\ndata: " + json.dumps(event).encode() + b"\n\n"
+    chunk = {"error": {"message": message, "type": "server_error", "code": "interrupted"}}
+    return b"data: " + json.dumps(chunk).encode() + b"\n\ndata: [DONE]\n\n"
 
 
 def client_gone(sock):
@@ -286,8 +310,8 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
             length = int(self.headers.get("content-length") or 0)
             return self.rfile.read(min(length, limit) if limit else length)
 
-        def _overloaded(self, path, message):
-            status, headers, payload = overloaded_reply(path, message)
+        def _overloaded(self, path, message, unavailable=False):
+            status, headers, payload = (unavailable_reply if unavailable else overloaded_reply)(path, message)
             data = json.dumps(payload).encode()
             self.send_response(status)
             for name, value in headers:
@@ -311,6 +335,9 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                         data = json.load(response).get("data", [])
                     return self._send_json(200, {"object": "list", "data": data, "models": []})
                 except Exception as error:
+                    fallback = gate.models_fallback() if gate and gate.models_fallback else None
+                    if fallback is not None:  # the model is unloaded or loading: the host still lists it
+                        return self._send_json(200, {"object": "list", "data": fallback, "models": []})
                     return self._send_json(502, {"error": {"message": str(error)}})
             api, tools, wants_stream = None, {}, False
             if normalize and body and self.command == "POST":
@@ -341,12 +368,17 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                     ticket = gate.admit(self.connection, gate.client_of(self.headers), path)
                     probe.admitted(ticket)
                 except Overloaded as error:
-                    probe.response(529 if path.rstrip("/").endswith("/messages") else 503)
-                    probe.finish("overloaded")
-                    return self._overloaded(path, str(error))
+                    probe.response(503 if isinstance(error, Unavailable) else 529 if path.rstrip("/").endswith("/messages") else 503)
+                    probe.finish("unavailable" if isinstance(error, Unavailable) else "overloaded")
+                    return self._overloaded(path, str(error), isinstance(error, Unavailable))
                 except ClientGone:
                     probe.finish("cancelled")
                     return
+            if gate and not ticket and self.command == "POST":
+                try:  # not a generation (count_tokens...): wait for an unloaded or loading model instead of failing
+                    gate.wait_available()
+                except Overloaded as error:
+                    return self._overloaded(path, str(error), isinstance(error, Unavailable))
             try:
                 headers = {k: v for k, v in self.headers.items()
                            if k.lower() not in ("host", "content-length", "connection", "accept-encoding")}
@@ -356,6 +388,7 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                 if body:
                     headers["content-length"] = str(len(body))
                 upstream = http.client.HTTPConnection("127.0.0.1", upstream_port, timeout=3600)
+                streaming = wants_stream
 
                 def watch():
                     # The caller hung up: shut the upstream connection down, so llama-server sees it close and stops
@@ -373,9 +406,38 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                                 ticket.release("client disconnected")
                             return
 
+                if ticket:  # a forced switch cancels running requests through this
+                    def abort():
+                        link = state["link"]
+                        if link is not None:
+                            try:
+                                link.shutdown(socket.SHUT_RDWR)
+                            except OSError:
+                                pass
+                    ticket.entry["abort"] = abort
+
+                def cancelled():
+                    return bool(ticket and ticket.entry.get("cancelled"))
+
+                def note(chunk):  # has the stream's terminal event passed through? then nothing is appended to it
+                    tail = state.get("tail", b"") + chunk
+                    state["tail"] = tail[-64:]
+                    if any(mark in tail for mark in (b"message_stop", b"[DONE]", b"response.completed", b"response.failed")):
+                        state["done"] = True
+
                 threading.Thread(target=watch, daemon=True).start()
                 try:
-                    upstream.request(self.command, self.path, body=body, headers=headers)
+                    for attempt in (0, 1):
+                        try:
+                            upstream.request(self.command, self.path, body=body, headers=headers)
+                            break
+                        except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError):
+                            # Refused/reset before the request was accepted: nothing ran. The host may restart the
+                            # model server; then it is sent once more. Anything later is never retried.
+                            upstream.close()
+                            if attempt or not gate or cancelled() or not gate.recovered_for_retry() or state["outcome"] != "ok"                                     or cancelled():  # a cancelled request is never run again
+                                raise
+                            upstream = http.client.HTTPConnection("127.0.0.1", upstream_port, timeout=3600)
                     state["link"] = upstream.sock
                     if state["outcome"] != "ok":  # the caller left before we connected
                         raise ConnectionAbortedError("the caller left")
@@ -411,6 +473,7 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                         stream = repair.StreamRepair(api, tools)
                         while chunk := response.read1(65536):
                             probe.feed(chunk)
+                            note(chunk)
                             self.wfile.write(stream.feed(chunk))
                             self.wfile.flush()
                         self.wfile.write(stream.finish())
@@ -420,24 +483,34 @@ def make_relay(upstream_port, address=("127.0.0.1", 0), intercept=None, extra_he
                     else:
                         while chunk := response.read1(65536):
                             probe.feed(chunk)
+                            note(chunk)
                             self.wfile.write(chunk)
                             self.wfile.flush()
                 except (ConnectionError, OSError, http.client.HTTPException):
                     # the client went away (e.g. Esc in the agent), or the model server did
                     if state["outcome"] == "ok":
-                        state["outcome"] = "caller closed the connection" if state["sent"] else "error"
-                        if not state["sent"]:
-                            try:
-                                self._overloaded(path, "The model server is not answering (loading, or stopped).")
-                            except OSError:
+                        why = (ticket.entry.get("cancelled") if ticket else None) or (gate.failure_text() if gate else None)                             or "The model server stopped answering (it crashed, or was stopped)."
+                        try:
+                            if not state["sent"]:
+                                state["outcome"] = "error"
+                                self._overloaded(path, why, True)
+                            elif state.get("done"):  # the stream had ended: say nothing more
                                 pass
+                            elif streaming:  # interrupted mid-stream: end it with the API's error event, never a new generation
+                                state["outcome"] = "interrupted"
+                                self.wfile.write(stream_error(path, why))
+                                self.wfile.flush()
+                            else:
+                                state["outcome"] = "interrupted"
+                        except OSError:
+                            state["outcome"] = "caller closed the connection"
                 finally:
                     finished.set()
                     upstream.close()
 
             finally:
                 finished.set()
-                probe.finish("disconnected" if state["outcome"] in ("client disconnected", "caller closed the connection") else state["outcome"])
+                probe.finish("cancelled" if ticket and ticket.entry.get("cancelled") else "disconnected" if state["outcome"] in ("client disconnected", "caller closed the connection") else state["outcome"])
                 if ticket:
                     ticket.release(state["outcome"])
 

@@ -16,7 +16,7 @@
   hearthwork logs [--server] [-f]   the host's log (requests, queue); --server: llama-server's output
   hearthwork alias add <name> <agent>   short command for it, e.g. ccl  (also: alias list, alias remove <name>)
   hearthwork context [model] [N|auto]   context per model: range for this computer; save N for a model
-  hearthwork diagnose [--last N | --since 30m] [--client X] [--json] [--export FILE]   what limited your sessions (measured)
+  hearthwork diagnose [--last N | --since 30m | --all] [--client X] [--json] [--export FILE]   what limited your sessions (measured; default last 24 h)
   hearthwork status [--json]    host, model, context, slots, requests per client; switching, idle and recovery state
   hearthwork share [--port N]   share the running model on your home network (Ctrl+C stops); a PIN pairs each computer
   hearthwork api [--port N]     OpenAI + Anthropic compatible endpoint on this computer for any tool (--show: setup snippets)

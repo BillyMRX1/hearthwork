@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import sys
 import threading
 import time
 
@@ -22,6 +23,10 @@ from .paths import LOGS
 RING = 500
 SOURCES = ("server", "relay-stream", "relay-total")
 SOURCE_LABEL = {"server": "", "relay-stream": " (relay-measured)", "relay-total": " (relay-measured, includes prompt processing)"}
+PROMPT_SOURCES = ("server", "relay-estimated")
+PROMPT_LABEL = {"server": "", "relay-estimated": " (relay-estimated, includes overhead)"}
+PROMPT_ESTIMATE_MIN_TTFB_MS = 200   # below this, first-byte time is too small to divide by
+DEFAULT_SINCE = 24 * 3600
 ROTATE_AT = 5_000_000
 HEAD, TAIL = 4096, 16384
 CAPTURE_LIMIT = 2_000_000
@@ -126,7 +131,21 @@ class Recorder:
         self.ring = collections.deque(maxlen=size)
         self.rotate_at = rotate_at
         self.lock = threading.Lock()
+        self.open = set()                            # probes whose request has not ended yet
         self.context = lambda: (None, None, None)   # the host sets: () -> (n_ctx, slots, model)
+
+    def track(self, probe):
+        with self.lock:
+            self.open.add(probe)
+
+    def untrack(self, probe):
+        with self.lock:
+            self.open.discard(probe)
+
+    def running(self):
+        """Requests that hold a slot right now (admitted, not yet finished)."""
+        with self.lock:
+            return sum(1 for p in self.open if p.started is not None)
 
     def add(self, record):
         line = json.dumps(record, separators=(",", ":")) + "\n"
@@ -184,6 +203,7 @@ class Probe:
         self.capture = os.environ.get("HEARTHWORK_CAPTURE") == "1"
         self.request_body = bytes(body or b"") if self.capture else None
         self.everything = bytearray() if self.capture else None
+        recorder.track(self)
 
     def admitted(self, ticket):
         entry = ticket.entry
@@ -223,6 +243,7 @@ class Probe:
         if self.done:
             return
         self.done = True
+        self.recorder.untrack(self)
         record = self.record
         status = record["status"]
         if outcome == "ok" and status is not None and status >= 400:
@@ -237,6 +258,11 @@ class Probe:
             prompt, cached, gen, prompt_tps, gen_tps = extract(text)
             record.update(prompt_tokens=prompt, cached_tokens=cached, gen_tokens=gen, prompt_tps=prompt_tps, gen_tps=gen_tps)
             record["gen_tps_source"] = "server" if gen_tps is not None else None
+            record["prompt_tps_source"] = "server" if prompt_tps is not None else None
+            ttfb = record["ttfb_ms"]  # measured from admission, so queue wait is already excluded
+            if prompt_tps is None and prompt and ttfb is not None and ttfb >= PROMPT_ESTIMATE_MIN_TTFB_MS and prompt - (cached or 0) > 0:
+                # no server timings: uncached prompt tokens over the time to the first byte (includes overhead)
+                record.update(prompt_tps=(prompt - (cached or 0)) / (ttfb / 1000), prompt_tps_source="relay-estimated")
             if gen_tps is None and gen and status == 200:  # no server timings: the relay's own clock and the usage token counts
                 if self.streams and self.first_at is not None and time.monotonic() - self.first_at > 0.05:
                     record.update(gen_tps=gen / (time.monotonic() - self.first_at), gen_tps_source="relay-stream")
@@ -317,6 +343,12 @@ def summarize(records):
     for r in records:
         if _num(r.get("prompt_tokens")) is not None and _num(r.get("n_ctx")):
             pressure.append((r["prompt_tokens"] + (r.get("max_output") or 0)) / r["n_ctx"])
+    prompt_median = (None, None)
+    for source in PROMPT_SOURCES:  # same rule: one source only
+        values = [r["prompt_tps"] for r in records if (r.get("prompt_tps_source") or "server") == source and _num(r.get("prompt_tps")) is not None]
+        if values:
+            prompt_median = (percentile(values, 50), source)
+            break
     gen_median = (None, None)
     for source in SOURCES:  # never mix sources: the best source that has values
         values = [r["gen_tps"] for r in records if r.get("gen_tps_source") == source and r.get("gen_tps") is not None]
@@ -333,7 +365,7 @@ def summarize(records):
         "clients": sorted({str(r.get("client")) for r in records}),
         "queue_wait_ms": {"p50": percentile(_vals(records, "wait_ms"), 50), "p95": percentile(_vals(records, "wait_ms"), 95)},
         "ttfb_ms": {"p50": percentile(_vals(records, "ttfb_ms"), 50), "p95": percentile(_vals(records, "ttfb_ms"), 95)},
-        "prompt_tps_median": percentile(_vals(records, "prompt_tps"), 50),
+        "prompt_tps_median": prompt_median[0], "prompt_tps_source": prompt_median[1],
         "gen_tps_median": gen_median[0], "gen_tps_source": gen_median[1],
         "gen_tps_by_source": {k: percentile([r["gen_tps"] for r in records if r.get("gen_tps_source") == k and r.get("gen_tps") is not None], 50) for k in SOURCES},
         "cache": {"requests_measured": len(prompt_known), "prompt_tokens": prompt_sum, "cached_tokens": cached_sum,
@@ -451,13 +483,14 @@ def _pct(value):
 
 def format_report(rep):
     s = rep["summary"]
+    head = f"Selection: {rep['selection'].get('label', 'all recorded requests')}"
     if not s["requests"]:
-        return "No requests recorded for this selection yet. Use an agent through the Hearthwork host, then run this again."
+        return head + "\nNo requests recorded for this selection yet. Use an agent through the Hearthwork host, then run this again."
     o = ", ".join(f"{n} {k}" for k, n in sorted(s["outcomes"].items()))
-    lines = [f"Requests: {s['requests']} ({o}) from {len(s['clients'])} client(s)",
+    lines = [head, f"Requests: {s['requests']} ({o}) from {len(s['clients'])} client(s)",
              f"Queue wait:  p50 {_ms(s['queue_wait_ms']['p50'])}, p95 {_ms(s['queue_wait_ms']['p95'])}",
              f"First byte:  p50 {_ms(s['ttfb_ms']['p50'])}, p95 {_ms(s['ttfb_ms']['p95'])}",
-             f"Speed (median): prompt {_rate(s['prompt_tps_median'])}, generation {_rate(s['gen_tps_median'])}{SOURCE_LABEL.get(s['gen_tps_source'], '')}",
+             f"Speed (median): prompt {_rate(s['prompt_tps_median'])}{PROMPT_LABEL.get(s['prompt_tps_source'], '')}, generation {_rate(s['gen_tps_median'])}{SOURCE_LABEL.get(s['gen_tps_source'], '')}",
              f"Cache hit ratio: {_pct(s['cache']['hit_ratio'])}",
              f"Context pressure: {_pct(s['context']['share_above_80pct'])} of requests above 80% of capacity"
              + (f" (context {s['context']['n_ctx']:,})" if s["context"]["n_ctx"] else ""),
@@ -475,10 +508,14 @@ def format_report(rep):
 
 
 def status_line(summary):
-    if not summary or not summary.get("requests"):
-        return "last 5 min: no requests"
-    return (f"last 5 min: {summary['requests']} requests, median generation {_rate(summary['gen_tps_median'])}{SOURCE_LABEL.get(summary['gen_tps_source'], '')}, "
-            f"queue wait p95 {_ms(summary['queue_wait_ms']['p95'])}")
+    """One line for `hearthwork status`. summary is the host's diagnostics payload (summarize() plus "running")."""
+    summary = summary or {}
+    running = summary.get("running") or 0
+    tail = f", {running} running now" if running else ""
+    if not summary.get("requests"):
+        return f"last 5 min: 0 finished{tail}" if running else "last 5 min: no requests"
+    return (f"last 5 min: {summary['requests']} finished, median generation {_rate(summary['gen_tps_median'])}{SOURCE_LABEL.get(summary['gen_tps_source'], '')}, "
+            f"queue wait p95 {_ms(summary['queue_wait_ms']['p95'])}{tail}")
 
 
 def main(argv):
@@ -487,20 +524,38 @@ def main(argv):
                                      "(HOME/logs/requests.jsonl). Nothing leaves this computer; prompts and code are not recorded.")
     parser.add_argument("--last", type=int, metavar="N", help="only the last N requests")
     parser.add_argument("--since", metavar="DURATION", help="only requests from the last period, e.g. 90s, 30m, 2h, 1d")
+    parser.add_argument("--all", action="store_true", help="every recorded request, not only the last 24 hours (the default)")
     parser.add_argument("--client", help="only this client (part of its id, e.g. opencode, api, share)")
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
     parser.add_argument("--export", metavar="FILE", help="write a sanitized JSON report (numbers only: no prompts, code, or credentials)")
     args = parser.parse_args(argv)
+    if args.all and args.since:
+        parser.error("use --all or --since, not both")
     try:
         since = parse_duration(args.since) if args.since else None
     except ValueError as error:
         parser.error(str(error))
+    if args.all:
+        label = "all recorded history"
+    elif args.last:
+        label = f"last {args.last} requests"
+    elif args.since:
+        label = f"last {args.since}"
+    else:
+        since = DEFAULT_SINCE
+        label = "last 24 h; use --since or --last to change"
     records = select(load_records(), args.last, since, args.client)
-    rep = report(records, {"last": args.last, "since": args.since, "client": args.client})
+    rep = report(records, {"label": label, "last": args.last, "since": args.since, "client": args.client})
     if args.export:
-        with open(args.export, "w", encoding="utf-8") as f:
-            json.dump(rep, f, indent=2)
-        print(f"Sanitized report written to {args.export} (numbers only: no prompts, code, or credentials).")
+        target = os.path.abspath(args.export)
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                json.dump(rep, f, indent=2)
+        except OSError as error:
+            print(f"hearthwork diagnose: cannot write {args.export}: {error.strerror or error}", file=sys.stderr)
+            return 1
+        print(f"Sanitized report written to {target} (numbers only: no prompts, code, or credentials).")
     elif args.json:
         print(json.dumps(rep, indent=2))
     else:

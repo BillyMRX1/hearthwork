@@ -484,7 +484,9 @@ class Host:
             handler._send_json(200, self.status())
         elif path == "/hearthwork/control/diagnostics" and handler.command == "GET":  # ?seconds=N (default 300)
             seconds = int((urllib.parse.parse_qs(handler.path.partition("?")[2]).get("seconds") or ["300"])[0])
-            handler._send_json(200, diagnostics.summarize(diagnostics.RECORDER.recent(seconds)))
+            payload = diagnostics.summarize(diagnostics.RECORDER.recent(seconds))
+            payload["running"] = diagnostics.RECORDER.running()
+            handler._send_json(200, payload)
         elif path == "/hearthwork/control/stop" and handler.command == "POST":
             handler._send_json(200, {"stopping": True})
             self.stop_event.set()

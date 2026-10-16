@@ -278,5 +278,134 @@ class Passive(unittest.TestCase):
         self.assertEqual(r["outcome"], "error")
 
 
+class ExportFolders(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.records = Path(self.folder.name) / "requests.jsonl"
+        self.records.write_text(json.dumps(rec(ts=time.time() - 3 * 86400)) + "\n" + json.dumps(rec(ts=time.time() - 60)) + "\n", encoding="utf-8")
+        self.old = d.REQUESTS_FILE
+        d.REQUESTS_FILE = self.records
+
+    def tearDown(self):
+        d.REQUESTS_FILE = self.old
+        self.folder.cleanup()
+
+    def run_main(self, argv):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = d.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_missing_folders_are_created_and_path_printed(self):
+        target = Path(self.folder.name) / "new" / "deeper" / "d.json"
+        code, out, err = self.run_main(["--export", str(target)])
+        self.assertEqual(code, 0)
+        self.assertTrue(target.exists())
+        self.assertIn("written to", out)
+        self.assertIn(str(target.resolve()), out)
+        self.assertEqual(err, "")
+
+    def test_unwritable_target_is_one_clear_line_and_exit_1(self):
+        blocker = Path(self.folder.name) / "file.txt"
+        blocker.write_text("x", encoding="utf-8")
+        code, out, err = self.run_main(["--export", str(blocker / "d.json")])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertTrue(err.startswith("hearthwork diagnose: cannot write"))
+        self.assertEqual(err.count("\n"), 1)
+        self.assertNotIn("Traceback", err)
+
+    def test_default_window_is_last_24_hours(self):
+        target = Path(self.folder.name) / "d.json"
+        self.assertEqual(self.run_main(["--export", str(target)])[0], 0)
+        report = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual(report["summary"]["requests"], 1)
+        self.assertEqual(report["selection"]["label"], "last 24 h; use --since or --last to change")
+        self.assertEqual(self.run_main(["--all", "--export", str(target)])[0], 0)
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["summary"]["requests"], 2)
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["selection"]["label"], "all recorded history")
+
+    def test_explicit_selections_still_work(self):
+        target = Path(self.folder.name) / "d.json"
+        self.run_main(["--since", "2d", "--export", str(target)])
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["summary"]["requests"], 1)
+        self.run_main(["--last", "2", "--export", str(target)])
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["summary"]["requests"], 2)
+        self.run_main(["--client", "nobody", "--export", str(target)])
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["summary"]["requests"], 0)
+        with self.assertRaises(SystemExit):  # the two options conflict
+            self.run_main(["--all", "--since", "1h", "--export", str(target)])
+
+    def test_header_says_the_window(self):
+        text = d.format_report(d.report([rec()], {"label": "last 24 h; use --since or --last to change"}))
+        self.assertTrue(text.startswith("Selection: last 24 h; use --since or --last to change\n"))
+
+
+class RunningNow(unittest.TestCase):
+    def test_status_counts_running_requests(self):
+        self.assertEqual(d.status_line({"requests": 0, "running": 2}), "last 5 min: 0 finished, 2 running now")
+        self.assertEqual(d.status_line({"requests": 0}), "last 5 min: no requests")
+        self.assertEqual(d.status_line(None), "last 5 min: no requests")
+        text = d.status_line(dict(d.summarize([rec(), rec()]), running=1))
+        self.assertTrue(text.startswith("last 5 min: 2 finished, median generation"))
+        self.assertTrue(text.endswith(", 1 running now"))
+        self.assertNotIn("running", d.status_line(d.summarize([rec()])))
+
+    def test_recorder_tracks_admitted_requests_until_finished(self):
+        recorder = d.Recorder(Path(tempfile.mkdtemp()) / "r.jsonl")
+        p = d.begin("api", "/v1/messages", b"{}", recorder=recorder)
+        self.assertEqual(recorder.running(), 0)  # queued, not admitted yet
+        p.started = time.monotonic()
+        self.assertEqual(recorder.running(), 1)
+        p.finish("ok")
+        p.finish("ok")  # idempotent
+        self.assertEqual(recorder.running(), 0)
+
+
+class PromptSpeeds(unittest.TestCase):
+    def probe(self, chunks, delay_before_first=0.0):
+        recorder = d.Recorder(Path(tempfile.mkdtemp()) / "r.jsonl")
+        p = d.begin("api", "/v1/messages", b'{"stream": true}', recorder=recorder)
+        p.started = time.monotonic()
+        p.response(200)
+        time.sleep(delay_before_first)
+        for c in chunks:
+            p.feed(c)
+        p.finish("ok")
+        return recorder.recent()[0]
+
+    START = (b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"cache_read_input_tokens":7,"input_tokens":4,"output_tokens":0}}}\n\n')
+    DELTA = b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":40}}\n\n'
+
+    def test_estimated_from_uncached_tokens_over_first_byte(self):
+        r = self.probe([self.START, self.DELTA], delay_before_first=0.4)
+        self.assertEqual((r["prompt_tokens"], r["cached_tokens"], r["prompt_tps_source"]), (11, 7, "relay-estimated"))
+        self.assertTrue(4 / 0.5 < r["prompt_tps"] < 4 / 0.35)  # 4 uncached tokens over about 0.4 s
+
+    def test_skipped_when_first_byte_is_tiny(self):
+        r = self.probe([self.START, self.DELTA])
+        self.assertIsNone(r["prompt_tps"])
+        self.assertIsNone(r["prompt_tps_source"])
+
+    def test_skipped_when_tokens_missing(self):
+        r = self.probe([b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":40}}\n\n'], delay_before_first=0.4)
+        self.assertIsNone(r["prompt_tokens"])
+        self.assertIsNone(r["prompt_tps"])
+
+    def test_server_timings_win_over_estimate(self):
+        r = self.probe([json.dumps({"usage": CHAT_USAGE, "timings": TIMINGS}).encode()], delay_before_first=0.4)
+        self.assertEqual((r["prompt_tps"], r["prompt_tps_source"]), (32.5, "server"))
+
+    def test_medians_never_mix_sources(self):
+        s = d.summarize([rec(prompt_tps=500.0), rec(prompt_tps=600.0), rec(prompt_tps=10.0, prompt_tps_source="relay-estimated")])
+        self.assertEqual((s["prompt_tps_median"], s["prompt_tps_source"]), (550.0, "server"))
+        s = d.summarize([rec(prompt_tps=None), rec(prompt_tps=10.0, prompt_tps_source="relay-estimated")])
+        self.assertEqual((s["prompt_tps_median"], s["prompt_tps_source"]), (10.0, "relay-estimated"))
+        self.assertIn("prompt 10.0 tokens/s (relay-estimated, includes overhead)", d.format_report(d.report([rec(prompt_tps=None), rec(prompt_tps=10.0, prompt_tps_source="relay-estimated")])))
+        self.assertIn("prompt unavailable", d.format_report(d.report([rec(prompt_tps=None)])))
+
+
 if __name__ == "__main__":
     unittest.main()

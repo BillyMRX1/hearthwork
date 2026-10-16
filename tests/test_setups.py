@@ -27,6 +27,9 @@ class SetupsTest(unittest.TestCase):
         patcher = mock.patch.object(setups, "DIR", self.tmp / "profiles")
         patcher.start()
         self.addCleanup(patcher.stop)
+        p2 = mock.patch.object(setups, "still_pending", lambda config: [])  # never ask a real host
+        p2.start()
+        self.addCleanup(p2.stop)
         self.models = self.tmp / "models"
         (self.models / "sub").mkdir(parents=True)
         self.config = {"modelsDir": str(self.models), "server": {"port": 1}}

@@ -258,6 +258,11 @@ def main(argv=None):
             check.main(rest)
         elif command == "setup":
             from . import onboard as setup
+            try:
+                load_config()
+            except ConfigError:
+                if not setup.back_up_corrupt_config():
+                    sys.exit(1)
             setup.main(rest)
         elif command == "runtime":
             sys.exit(runtime.main(rest))

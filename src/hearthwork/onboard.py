@@ -74,9 +74,11 @@ def load_config():
         except PermissionError as error:
             last = error
             time.sleep(0.05)
-    raise ConfigError(f"{CONFIG} cannot be read ({last}). Fix or delete it (`hearthwork setup` writes a new one).")
+    raise ConfigError(f"{CONFIG} cannot be read ({last}). `hearthwork setup` backs it up and starts fresh.")
 
 
+LOCK_TIMEOUT = 30.0
+ATOMIC_KEYS = ('budget',)  # replaced as a whole, never merged field by field
 _LOCK_DEPTH = threading.local()
 _THREAD_LOCK = threading.RLock()
 
@@ -86,25 +88,35 @@ class _FileLock:
 
     def __enter__(self):
         _THREAD_LOCK.acquire()
-        depth = getattr(_LOCK_DEPTH, "n", 0)
-        _LOCK_DEPTH.n = depth + 1
         self.fd = None
-        if depth == 0:
-            LOCK = CONFIG.with_name("config.lock")
-            LOCK.parent.mkdir(parents=True, exist_ok=True)
-            self.fd = os.open(str(LOCK), os.O_RDWR | os.O_CREAT)
-            if os.name == "nt":
-                import msvcrt
+        try:
+            depth = getattr(_LOCK_DEPTH, "n", 0)
+            if depth == 0:
+                lock = CONFIG.with_name("config.lock")
+                lock.parent.mkdir(parents=True, exist_ok=True)
+                self.fd = os.open(str(lock), os.O_RDWR | os.O_CREAT)
+                deadline = time.time() + LOCK_TIMEOUT
                 while True:
                     try:
-                        os.lseek(self.fd, 0, 0)
-                        msvcrt.locking(self.fd, msvcrt.LK_LOCK, 1)  # waits up to ~10 s per call
+                        if os.name == "nt":
+                            import msvcrt
+                            os.lseek(self.fd, 0, 0)
+                            msvcrt.locking(self.fd, msvcrt.LK_NBLCK, 1)
+                        else:
+                            import fcntl
+                            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         break
                     except OSError:
+                        if time.time() > deadline:
+                            raise ConfigError(f"another Hearthwork process has held {lock} for {LOCK_TIMEOUT:.0f} s; "
+                                              "close it (or delete the lock file if no Hearthwork is running) and try again")
                         time.sleep(0.02)
-            else:
-                import fcntl
-                fcntl.flock(self.fd, fcntl.LOCK_EX)
+            _LOCK_DEPTH.n = depth + 1
+        except BaseException:
+            if self.fd is not None:
+                os.close(self.fd)
+            _THREAD_LOCK.release()
+            raise
         return self
 
     def __exit__(self, *exc):
@@ -140,6 +152,18 @@ def _write_atomic(data):
             time.sleep(0.05)
 
 
+def back_up_corrupt_config(ask_first=True):
+    """Move an unreadable config.json to config.json.corrupt-<time> so setup can start fresh. True when done."""
+    if not CONFIG.exists():
+        return True
+    if ask_first and sys.stdin.isatty() and not yes(f"{CONFIG} is unreadable. Back it up and start fresh?", True):
+        return False
+    target = CONFIG.with_name(f"config.json.corrupt-{time.strftime('%Y%m%d-%H%M%S')}")
+    os.replace(CONFIG, target)
+    print(f"Backed up the unreadable config to {target}; starting fresh.")
+    return True
+
+
 def update_config(change):
     """Under a cross-process lock: re-read config.json, apply change(config) to the fresh copy, write it atomically.
     Returns the new config. Raises ConfigError on an unreadable file instead of overwriting it."""
@@ -150,16 +174,16 @@ def update_config(change):
         return _freeze(fresh)
 
 
-def _merge_changes(fresh, old, new):
-    """Apply what `new` changed relative to `old` onto `fresh` (dicts recursively; lists and values as a whole)."""
+def _merge_changes(fresh, old, new, top=True):
+    """Apply what `new` changed relative to `old` onto `fresh` (dicts recursively; lists, values and ATOMIC_KEYS as a whole)."""
     for key in list(old):
         if key not in new:
             fresh.pop(key, None)
     for key, value in new.items():
         if key not in old:
             fresh[key] = copy.deepcopy(value)
-        elif isinstance(value, dict) and isinstance(old[key], dict) and isinstance(fresh.get(key), dict):
-            _merge_changes(fresh[key], old[key], value)
+        elif isinstance(value, dict) and isinstance(old[key], dict) and isinstance(fresh.get(key), dict)                 and not (top and key in ATOMIC_KEYS):
+            _merge_changes(fresh[key], old[key], value, False)
         elif value != old[key]:
             fresh[key] = copy.deepcopy(value)
 

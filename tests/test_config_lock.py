@@ -19,7 +19,7 @@ for i in range(200):
 """
 
 
-class ConfigWrites(unittest.TestCase):
+class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
@@ -30,6 +30,8 @@ class ConfigWrites(unittest.TestCase):
         self.patch.stop()
         self.tmp.cleanup()
 
+
+class ConfigWrites(Base):
     def test_two_processes_lose_no_updates(self):
         (self.home / "config.json").write_text(json.dumps({"keep": 1}))
         env = dict(os.environ, HEARTHWORK_HOME=str(self.home), PYTHONPATH=SRC)
@@ -112,3 +114,72 @@ class Guard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FollowUps(Base):
+    def test_budget_key_is_replaced_whole_not_merged(self):
+        onboard.update_config(lambda c: c.update({"budget": {"preset": "work", "custom": {"slots": 1}, "base": {"slots": 2}}}))
+        mine = onboard.load_config()
+        onboard.update_config(lambda c: c.update({"budget": {"preset": "dedicated", "custom": {"ramGB": 9}}}))  # other process
+        mine["budget"]["custom"] = {"threads": 4}
+        onboard.save_config(mine)
+        self.assertEqual(json.loads((self.home / "config.json").read_text())["budget"],
+                         {"preset": "work", "custom": {"threads": 4}, "base": {"slots": 2}})
+
+    def test_touch_does_not_resurrect_a_removed_device_and_remove_filters_current_list(self):
+        from hearthwork import share
+        onboard.update_config(lambda c: c.update({"share": {"devices": [{"name": "a"}, {"name": "b"}]}}))
+        stale = onboard.load_config()  # what a slow touch would have read earlier
+        with mock.patch("builtins.print"):
+            self.assertEqual(share.devices_main(["remove", "a"]), 0)
+        obj = share.Share.__new__(share.Share)
+        obj.seen, obj.written = {"a", "b"}, {}
+        obj.touch("a", "1.2.3.4")
+        obj.touch("b", "1.2.3.4")
+        names = [d["name"] for d in json.loads((self.home / "config.json").read_text())["share"]["devices"]]
+        self.assertEqual(names, ["b"])
+        self.assertTrue(stale["share"]["devices"])  # the stale copy was never written back
+
+    def test_lock_failure_does_not_wedge_later_saves(self):
+        with mock.patch("os.open", side_effect=OSError("denied")):
+            with self.assertRaises(OSError):
+                onboard.update_config(lambda c: None)
+        onboard.update_config(lambda c: c.update(ok=1))
+        self.assertEqual(onboard.load_config()["ok"], 1)
+
+    def test_lock_wait_times_out_with_a_clear_error(self):
+        with onboard._FileLock():
+            pass
+        other = {}
+
+        def hold():
+            with onboard._FileLock():
+                other["held"] = True
+                import time
+                time.sleep(1.5)
+        import threading
+        t = threading.Thread(target=hold)
+        # a lock held by another PROCESS: simulate with a helper process holding it
+        code = ("import sys,time;from hearthwork import onboard;from pathlib import Path;onboard.CONFIG=Path(sys.argv[1]);"
+                "l=onboard._FileLock();l.__enter__();print('held',flush=True);time.sleep(4)")
+        env = dict(os.environ, PYTHONPATH=SRC)
+        proc = subprocess.Popen([sys.executable, "-c", code, str(self.home / "config.json")], env=env, stdout=subprocess.PIPE, text=True)
+        try:
+            proc.stdout.readline()
+            with mock.patch.object(onboard, "LOCK_TIMEOUT", 0.5):
+                with self.assertRaises(onboard.ConfigError) as caught:
+                    onboard.update_config(lambda c: None)
+            self.assertIn("another Hearthwork process", str(caught.exception))
+        finally:
+            proc.kill()
+            proc.wait()
+            proc.stdout.close()
+        del t
+
+    def test_corrupt_config_is_backed_up_for_setup(self):
+        (self.home / "config.json").write_text("{half")
+        with mock.patch("builtins.print"):
+            self.assertTrue(onboard.back_up_corrupt_config(ask_first=False))
+        self.assertFalse((self.home / "config.json").exists())
+        self.assertEqual(len(list(self.home.glob("config.json.corrupt-*"))), 1)
+        self.assertEqual(onboard.load_config(), {})

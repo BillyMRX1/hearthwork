@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 from . import context as ctx
-from .onboard import GREEN, RESET, YELLOW, find_models, load_config, memory_gb, save_config
+from .onboard import GREEN, RESET, YELLOW, find_models, load_config, memory_gb, update_config
 
 GB = 2**30
 OVERHEAD_GB = 1.5   # llama.cpp compute buffers + CUDA/Metal runtime
@@ -359,6 +359,10 @@ def summary(config, got=None):
 
 # ---------- command ----------
 
+class Refused(Exception):
+    """The memory check said no; nothing is written."""
+
+
 def pending(config, got):
     """Settings the config wants that the running server was not started with: list of 'name: running -> wanted'.
     Only what Hearthwork itself passed to llama-server is compared (never what the engine reports)."""
@@ -441,27 +445,38 @@ def main(argv):
         for line in table(config, got):
             print(line)
         return 0
-    if action == "use" and len(argv) == 2 and argv[1].lower() in PRESETS:
-        new = set_preset(config, argv[1].lower())
-    elif action == "set" and len(argv) > 1:
+    if action not in ("use", "set", "reset") or (action == "use" and not (len(argv) == 2 and argv[1].lower() in PRESETS))             or (action == "set" and len(argv) < 2):
+        print(USAGE)
+        return 2
+    custom = None
+    if action == "set":
         custom, error = parse_set(argv[1:])
         if error:
             print(error)
             return 2
-        merged = dict(state(config).get("custom") or {}, **custom)
-        new = set_preset(config, state(config).get("preset", "balanced"), merged)
-    elif action == "reset":
-        new = set_preset(config, "balanced")
-    else:
-        print(USAGE)
-        return 2
     got = host.status()
     model = current_model(config, got) if got else None
-    if got and model and got.get("ready") and not got.get("adopted"):
-        if not guard(config, model, got.get("requestedContext"), {"ramGB": (measure().get("ramGB") or 0.0)}, over_budget):
-            print("Budget not changed.")
-            return 1
-    save_config(config)
+    result = {}
+
+    def change(fresh):
+        """Read, decide, check and write under one lock: the memory check sees the merged state."""
+        if action == "use":
+            result["new"] = set_preset(fresh, argv[1].lower())
+        elif action == "set":
+            merged = dict(state(fresh).get("custom") or {}, **custom)
+            result["new"] = set_preset(fresh, state(fresh).get("preset", "balanced"), merged)
+        else:
+            result["new"] = set_preset(fresh, "balanced")
+        if got and model and got.get("ready") and not got.get("adopted"):
+            if not guard(fresh, model, got.get("requestedContext"), {"ramGB": (measure().get("ramGB") or 0.0)}, over_budget):
+                raise Refused()
+
+    try:
+        config = update_config(change)
+    except Refused:
+        print("Budget not changed.")
+        return 1
+    new = result["new"]
     print(f"Budget: {new['preset']}" + (" + custom numbers" if new["custom"] else "")
           + f": VRAM headroom {new['fitTargetMiB']} MiB, {new['slots']} slot(s), threads {new['threads'] or 'default'}, "
             f"idle unload {str(new['idleMinutes']) + ' min' if new['idleMinutes'] else 'off'}.")

@@ -20,7 +20,7 @@ import urllib.request
 
 from . import __version__
 from .harnesses import make_relay
-from .onboard import CYAN, GREEN, RED, RESET, WINDOWS, YELLOW, load_config, save_config
+from .onboard import CYAN, GREEN, RED, RESET, WINDOWS, YELLOW, load_config, save_config, update_config
 from .server import agent_context, served_model
 
 DIM = "\033[2m"
@@ -117,11 +117,11 @@ def devices_of(config):
 
 def add_device(name, key):
     """Trust a device: replaces an older one of the same name. Saved at once, so `share` and `devices` agree."""
-    config = load_config()
-    devices = [d for d in devices_of(config) if d.get("name") != name]
-    devices.append({"name": name, "keyHash": hash_key(key), "added": now_text(), "lastSeen": now_text()})
-    config["share"]["devices"] = devices
-    save_config(config)
+    def add(config):
+        devices = [d for d in devices_of(config) if d.get("name") != name]
+        devices.append({"name": name, "keyHash": hash_key(key), "added": now_text(), "lastSeen": now_text()})
+        config["share"]["devices"] = devices
+    update_config(add)
 
 
 def clean_name(text, fallback):
@@ -360,11 +360,11 @@ class Share:
             print(f"{GREEN}{name} ({ip}) connected.{RESET}", flush=True)
         if now - self.written.get(name, 0) > SEEN_EVERY:
             self.written[name] = now
-            config = load_config()
-            for device in devices_of(config):
-                if device.get("name") == name:
-                    device["lastSeen"] = now_text()
-            save_config(config)
+            def stamp(config):  # the CURRENT list: a device removed meanwhile stays removed
+                for device in devices_of(config):
+                    if device.get("name") == name:
+                        device["lastSeen"] = now_text()
+            update_config(stamp)
 
     def pair(self, handler):
         try:
@@ -504,12 +504,17 @@ def devices_main(argv):
     devices = devices_of(config)
     if argv and argv[0] == "remove":
         name = " ".join(argv[1:])
-        kept = [d for d in devices if d.get("name") != name]
-        if len(kept) == len(devices):
+        found = []
+
+        def drop(current):
+            lst = devices_of(current)
+            kept = [d for d in lst if d.get("name") != name]
+            found.append(len(kept) != len(lst))
+            current["share"]["devices"] = kept
+        update_config(drop)
+        if not found[0]:
             print(f"No trusted device named '{name}'. `hearthwork devices` lists them.")
             return 1
-        config["share"]["devices"] = kept
-        save_config(config)
         print(f"Removed {name}. It can no longer use this computer's model.")
         return 0
     if argv:

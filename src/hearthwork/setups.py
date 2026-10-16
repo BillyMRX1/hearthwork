@@ -99,8 +99,13 @@ def current_model_path(config):
 
 def template_fingerprint(config):
     from . import doctor
-    props = doctor.get_json(f"http://127.0.0.1:{config.get('server', {}).get('port', 8001)}/props")
-    template = (props or {}).get("chat_template")
+    template = None
+    for attempt in range(3):
+        props = doctor.get_json(f"http://127.0.0.1:{config.get('server', {}).get('port', 8001)}/props", timeout=10)
+        template = (props or {}).get("chat_template")
+        if isinstance(template, str) and template:
+            break
+        time.sleep(1 if attempt < 2 else 0)
     return hashlib.sha256(template.encode()).hexdigest()[:12] if isinstance(template, str) and template else None
 
 
@@ -189,6 +194,11 @@ def bench_evidence(model_name):
 def is_verified(evidence):
     agents = (evidence or {}).get("agents") or {}
     return bool(agents) and all(a.get("verdict") == "works" for a in agents.values())
+
+
+def template_note(profile, now):
+    a, b = (profile.get("model") or {}).get("chatTemplate"), (now.get("model") or {}).get("chatTemplate")
+    return None if a and b else "template not compared (unavailable)"
 
 
 def default_doctor(config, agents):
@@ -441,7 +451,30 @@ def apply_settings(config, profile, model_path):
     return notes, (ctx.choose(config, model_path)[0] if model_path else None)
 
 
-def apply(config, profile, save_config, ensure, validator=None, restore=True, say=print, versions=None):
+def running_state(config):
+    """{model, context, slots} of the running host, or None."""
+    from . import host
+    got = host.status()
+    if not got or not got.get("ready"):
+        return None
+    return {"model": got.get("model"), "context": got.get("context"), "slots": got.get("slots")}
+
+
+def settings_changes(old, new):
+    """Names of managed settings that differ between two snapshots."""
+    out = [k for k in SERVER_KEYS if old["server"].get(k) != new["server"].get(k)]
+    if old["lastModel"] != new["lastModel"]:
+        out.append("model file")
+    if old["contexts"] != new["contexts"]:
+        out.append("model context")
+    if old["extra"] != new["extra"]:
+        out.append("budget")
+    if (old["selected"], old["active"]) != (new["selected"], new["active"]):
+        out.append("runtime build")
+    return out
+
+
+def apply(config, profile, save_config, ensure, validator=None, restore=True, say=print, versions=None, running=None):
     """Apply `profile`. The previous settings are stored as profile 'previous' first; if applying or validating fails
     they are restored. All side effects (save_config, ensure(config, model, context), validator(config)) are injected."""
     model_path, problems = find_model(config, profile["model"]) if profile.get("model") else (None, [])
@@ -463,6 +496,15 @@ def apply(config, profile, save_config, ensure, validator=None, restore=True, sa
         if present.get(key) != version:
             say(f"  note: agent {key} is {present.get(key) or 'not installed'}, profile recorded {version} "
                 "(externally managed, not changed)")
+    changed = settings_changes(snapshot(before), snapshot(config))
+    live = (running or running_state)(config) if model_path else None
+    if not changed and live and live.get("model") == model_path.stem and live.get("context") == context             and live.get("slots") in (None, config.get("server", {}).get("slots")):
+        say("already active: the running model already has these settings")
+        config["activeProfile"] = profile["name"]
+        save_config(config)
+        return True
+    if changed:
+        say("  changed: " + ", ".join(changed))
     ok = ensure(config, model_path, context) if model_path else True
     if ok and validator:
         ok = validator(config)
@@ -605,6 +647,9 @@ def main(argv):
             print(f"profile {name}: {status}")
             for line in changes:
                 print("  - " + line)
+            note = template_note(profile, capture(config, name, evidence=False))
+            if note:
+                print("  note: " + note)
             if status == RECHECK:
                 print("Run `hearthwork profile check --run` to re-run Doctor.")
             return 0 if status == VERIFIED else 1

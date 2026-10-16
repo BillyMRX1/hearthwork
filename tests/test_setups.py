@@ -128,26 +128,66 @@ class SetupsTest(unittest.TestCase):
         with mock.patch.object(setups, "capture", return_value=dict(stub)), \
                 mock.patch("hearthwork.context.choose", return_value=(4096, "x", None)):
             ok = setups.apply(config, data, lambda c: None, lambda c, m, x: ensured.append(m.name) or True,
-                              validator=lambda c: False, versions={})
+                              validator=lambda c: False, versions={}, running=lambda c: None)
             self.assertFalse(ok)
             self.assertEqual(config["server"]["slots"], 1)
             self.assertEqual(config["lastModel"], str(old))
             self.assertEqual(ensured, ["m.gguf", "old.gguf"])
             self.assertNotIn("activeProfile", config)
-            ok = setups.apply(config, data, lambda c: None, lambda c, m, x: True, versions={})
+            ok = setups.apply(config, data, lambda c: None, lambda c, m, x: True, versions={}, running=lambda c: None)
             self.assertTrue(ok)
             self.assertEqual((config["server"]["slots"], config["activeProfile"]), (2, "t"))
             # the second apply saved the settings from before it: back to the old model's setup
             config["server"]["slots"] = 1
             config["lastModel"] = str(old)
-            self.assertTrue(setups.apply(config, data, lambda c: None, lambda c, m, x: True, versions={}))
+            self.assertTrue(setups.apply(config, data, lambda c: None, lambda c, m, x: True, versions={}, running=lambda c: None))
             self.assertTrue(setups.apply_previous(config, lambda c: None, lambda c, m, x: True))
             self.assertEqual((config["server"]["slots"], config["lastModel"]), (1, str(old)))
+
+    def test_apply_already_active(self):
+        f = self.models / "m.gguf"
+        f.write_bytes(b"x" * 10)
+        config = {"modelsDir": str(self.models), "lastModel": str(f),
+                  "server": {"context": "auto", "slots": 2, "batch": 4096, "kvCacheType": "q8_0", "fitTargetMiB": 1536, "port": 1}}
+        data = profile(agents={}, runtime={"name": None, "llamaCppBuild": None})
+        data["model"]["fingerprint"] = setups.fingerprint(f)
+        msgs, ensured = [], []
+        live = {"model": "m", "context": 4096, "slots": 2}
+        with mock.patch.object(setups, "capture", return_value={"name": "previous", "settings": {}}),                 mock.patch("hearthwork.context.choose", return_value=(4096, "x", None)):
+            ok = setups.apply(config, data, lambda c: None, lambda *a: ensured.append(1) or True, say=msgs.append,
+                              versions={}, running=lambda c: live)
+            self.assertTrue(ok)
+            self.assertEqual(ensured, [])
+            self.assertEqual(config["activeProfile"], "t")
+            self.assertIn("already active", msgs[-1])
+            data["settings"]["batch"] = 512  # a real difference restarts, and says which
+            msgs.clear()
+            setups.apply(config, data, lambda c: None, lambda *a: ensured.append(1) or True, say=msgs.append,
+                         versions={}, running=lambda c: live)
+        self.assertEqual(ensured, [1])
+        self.assertIn("changed: batch", chr(10).join(msgs))
+
+    def test_unknown_template_is_not_a_change(self):
+        p = profile()
+        now = {"model": dict(p["model"], chatTemplate=None), "runtime": dict(p["runtime"]), "agents": {"claude": "1.0"}}
+        self.assertEqual(setups.differences(p, now), [])
+        self.assertEqual(setups.check(self.config, p, now=now)[0], "verified")
+        self.assertIn("not compared", setups.template_note(p, now))
+        p["model"]["chatTemplate"] = None
+        now["model"]["chatTemplate"] = "zzz"
+        self.assertEqual(setups.differences(p, now), [])
+
+    def test_template_retries(self):
+        replies = iter([None, None, {"chat_template": "T"}])
+        with mock.patch("hearthwork.doctor.get_json", side_effect=lambda *a, **k: next(replies)),                 mock.patch.object(setups.time, "sleep"):
+            self.assertIsNotNone(setups.template_fingerprint({"server": {"port": 1}}))
+        with mock.patch("hearthwork.doctor.get_json", return_value=None), mock.patch.object(setups.time, "sleep"):
+            self.assertIsNone(setups.template_fingerprint({}))
 
     def test_apply_missing_model_refuses(self):
         msgs = []
         ok = setups.apply({"modelsDir": str(self.models), "server": {}}, profile(), lambda c: None, lambda *a: True,
-                          say=msgs.append, versions={})
+                          say=msgs.append, versions={}, running=lambda c: None)
         self.assertFalse(ok)
         self.assertIn("model not found", msgs[0])
 

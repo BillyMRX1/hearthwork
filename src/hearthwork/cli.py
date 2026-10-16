@@ -44,6 +44,8 @@ from .paths import HOME
 
 REPO = "git+https://github.com/BillyMRX1/hearthwork"
 USAGE = __doc__.split("\n", 2)[2]
+# commands whose `--help` must not load the config or touch the model, the network or running processes
+HELP_FIRST = ("start", "serve", "bench", "model", "setup", "context", "menu", "update", "status", "stop", "disconnect", "agents")
 
 
 def configured(interactive=True, remote_ok=False):
@@ -101,12 +103,35 @@ def update():
     return 0
 
 
+def help_first(command):
+    """`hearthwork <command> --help`, without loading the config or starting anything: argparse prints its own help
+    and exits 0; the others print their line of USAGE."""
+    if command in ("start", "serve"):
+        model_args(["--help"], command)
+    elif command == "bench":
+        from . import bench
+        bench.main(["--help"])
+    elif command == "model":
+        from . import model
+        model.main(["--help"])
+    elif command == "setup":
+        from . import onboard as setup
+        setup.main(["--help"])
+    elif command == "menu":
+        print(USAGE)
+    else:
+        print("\n".join(line for line in USAGE.splitlines() if line.split()[:2] == ["hearthwork", command]))
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     command, rest = (argv[0], argv[1:]) if argv else ("menu", [])
     try:
         if command in ("-h", "--help", "help"):
             print(USAGE)
+        elif rest[:1] in (["-h"], ["--help"]) and command in HELP_FIRST:
+            sys.exit(help_first(command))
         elif command in ("-V", "--version", "version"):
             print(f"hearthwork {__version__}  (data: {HOME})")
         elif command == "menu":

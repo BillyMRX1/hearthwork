@@ -1235,6 +1235,9 @@ def transition_text(got):
 def idle_main(argv):
     """`hearthwork idle [minutes|off]`: show or set the idle unload (off by default; 30 is a good value)."""
     from .onboard import load_config, save_config
+    if argv[:1] in (["-h"], ["--help"]):
+        print("Usage: hearthwork idle [minutes|off]")
+        return 0
     config = load_config()
     current = idle_setting(config)
     if not argv:

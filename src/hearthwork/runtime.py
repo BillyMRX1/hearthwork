@@ -440,6 +440,9 @@ def running_note(config):
 
 
 def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print("Usage: hearthwork runtime [install <name> | use <name> | update | rollback]")
+        return 0
     config = load_config()
     migrate(config)
     hw = config.get("hardware") or detect()

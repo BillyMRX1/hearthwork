@@ -102,6 +102,9 @@ def remove(name):
 
 
 def main(args):
+    if args[:1] in (["-h"], ["--help"]):
+        print(USAGE)
+        return 0
     if len(args) == 3 and args[0] == "add":
         return add(args[1], args[2])
     if len(args) == 1 and args[0] == "list":

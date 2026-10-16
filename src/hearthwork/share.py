@@ -500,6 +500,9 @@ def share_main(argv):
 
 
 def devices_main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print("Usage: hearthwork devices [remove <name>]")
+        return 0
     config = load_config()
     devices = devices_of(config)
     if argv and argv[0] == "remove":

@@ -388,6 +388,9 @@ def install(target):
 
 
 def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print("usage: hearthwork mcp [install claude|codex|print]")
+        return 0
     if argv[:1] == ["install"]:
         if len(argv) != 2 or argv[1] not in ("claude", "codex", "print"):
             print("usage: hearthwork mcp install claude|codex|print", file=sys.stderr)

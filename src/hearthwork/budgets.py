@@ -432,6 +432,9 @@ USAGE = ("Usage: hearthwork budget [show] | use dedicated|balanced|work | set vr
 
 
 def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(USAGE)
+        return 0
     from . import host
     force, over_budget = "--force" in argv, "--over-budget" in argv
     argv = [a for a in argv if a not in ("--force", "--over-budget")]

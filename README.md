@@ -192,6 +192,14 @@ The path to `hearthwork` is absolute, so GUI clients with another PATH work too.
 
 Tips: give small, precise tasks (file names, interfaces, the test command), and review the result afterwards, as the local model is weaker than the agent calling it. Run up to as many tasks in parallel as the server has slots (2 by default; give parallel tasks different files). `hearthwork claude` / `hearthwork codex` without a terminal and without a prompt exit with a hint pointing here; `hearthwork claude -p "..."` works as before.
 
+## Tool-call repair
+
+Some models write their tool call as plain text in a format the server's chat template does not parse, so the agent never runs it. The relay (used by every agent, `hearthwork api` and `hearthwork share`) recovers such calls: when a request offered tools and the reply holds no structured call, it looks for one in the text and rewrites the reply into the API's own tool-call form (Anthropic `tool_use`, OpenAI `tool_calls`, Responses `function_call`), streaming or not.
+
+Formats, tried in this order: Mistral `[TOOL_CALLS]`; `[Calling tool: f({...})]`; `<tool_call>{json}</tool_call>`; `<function=name><parameter=x>..</parameter></function>` (or JSON inside); XML-style tags (`<invoke name=..>`, `<tool_name>..</tool_name>`); pythonic `f(a=1, b="x")`; raw JSON `{"name": .., "arguments": ..}`. Several calls in one reply work, and `<think>` blocks are ignored.
+
+A call is only accepted when the tool exists in the request and its arguments are an object that satisfies the schema's required keys and basic types; otherwise the reply goes through untouched. Nothing is repaired when the request had no tools. Streams are not delayed unless the text starts to look like a call (`[TOOL_CALLS]`, `<tool_call>`, `<function=`, a tool name followed by `(`, ...); only then is the text held back until the reply ends. Each repair prints `repaired a tool call written as text (<format>, <name>)` on stderr of the process that owns the relay, and `hearthwork doctor` reports it as "repaired by Hearthwork". Turn it off with `HEARTHWORK_TOOL_REPAIR=0`.
+
 ## Benchmark
 
 `hearthwork bench` (or menu option 6) drives the running model through a coding agent (`--agent`, Claude Code by default) in a fresh folder, with 8 prompts in one conversation. It grades each step by checking the files and running the code, not by trusting the agent's reply:

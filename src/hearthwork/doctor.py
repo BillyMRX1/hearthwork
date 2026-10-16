@@ -187,6 +187,7 @@ class Endpoint:
 
     def __init__(self, host, port, key=None, timeout=120):
         self.host, self.port, self.key, self.timeout = host, port, key, timeout
+        self.repaired = None  # the format Hearthwork repaired in the last send() (X-Hearthwork-Repaired), if any
 
     def post(self, api, body):
         """(status, response object) of a POST; the object streams (iterable of lines) when body["stream"]."""
@@ -202,6 +203,7 @@ class Endpoint:
         response, connection = self.post(api, body)
         try:
             raw = response.read().decode("utf-8", "replace")
+            self.repaired = response.getheader("X-Hearthwork-Repaired")
         finally:
             connection.close()
         if response.status != 200:
@@ -318,6 +320,8 @@ def protocol_stages(api, endpoint, model):
                     "See Hearthwork issue #9 (tool-call repair).")
             if name == TOOL["name"] and "alpha" in json.dumps(parsed).lower():
                 state["call"] = (call_id or "call_1", name, json.dumps(parsed))
+                if endpoint.repaired:
+                    return OK, f"repaired by Hearthwork ({endpoint.repaired}): get_secret({json.dumps(parsed)})", None
                 return OK, f"get_secret({json.dumps(parsed)})", None
             return FAIL, f"tool call {name}({short(arguments, 40)}) does not ask for 'alpha'", (
                 "The model called the tool with the wrong name or arguments: a capability limit of the model."), "model"

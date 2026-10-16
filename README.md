@@ -393,6 +393,22 @@ uvx hearthwork check
 
 It shows the hardware, the verdict, installed agents, and the best version of each suggested coding model that fits (sizes live from Hugging Face). Once Hearthwork is installed: `hearthwork check` (add `--json` for machine-readable output).
 
+## Publishing (maintainers)
+
+Releases go to PyPI from GitHub Actions via Trusted Publishing (`.github/workflows/publish.yml`).
+
+One-time setup:
+
+- On PyPI: project `hearthwork` > Settings > Publishing > add a GitHub trusted publisher: owner `BillyMRX1`, repo `hearthwork`, workflow `publish.yml`, environment `pypi`.
+- On GitHub: Settings > Environments > New environment `pypi`, with Required reviewers set to the maintainer.
+
+Each release:
+
+1. Bump `__version__` in `src/hearthwork/__init__.py`, commit, and push a tag matching it, e.g. `git tag v0.8.1 && git push origin v0.8.1`. The workflow fails if the tag and version differ.
+2. Approve the `pypi` deployment on the workflow run in GitHub Actions.
+
+Manual publishing with `uv publish` still works.
+
 ## License
 
 [MIT](LICENSE)

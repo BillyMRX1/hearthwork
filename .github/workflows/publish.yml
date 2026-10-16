@@ -1,0 +1,46 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Check tag matches package version
+        run: |
+          test "${GITHUB_REF_NAME#v}" = "$(grep -Po '__version__ = "\K[^"]+' src/hearthwork/__init__.py)"
+
+      - name: Build
+        run: uv build
+
+      - name: Check distributions
+        run: uvx twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/hearthwork
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

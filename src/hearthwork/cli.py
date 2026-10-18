@@ -31,7 +31,7 @@
   hearthwork profile save|list|show|check|apply|export|import   verified setup profiles (model, runtime, settings + Doctor proof)
   hearthwork runtime            llama.cpp engines: list, install <name>, use <name>, update, rollback
   hearthwork setup              hardware check, llama.cpp download/update, models folder
-  hearthwork update             update Hearthwork itself
+  hearthwork update             update Hearthwork itself (stops a running model first, restarts it after)
 """
 import shutil
 import subprocess
@@ -92,15 +92,65 @@ def has_terminal():
     return True
 
 
-def update():
-    """Upgrade with whichever tool installed Hearthwork."""
+def _upgrade_cmd():
+    """The tool command that upgrades this install, or None when no known installer tool owns it."""
     if shutil.which("uv") and "uv" in sys.executable.replace("\\", "/").split("/"):
-        return subprocess.call(["uv", "tool", "upgrade", "hearthwork"])
+        return ["uv", "tool", "upgrade", "hearthwork"]
     if shutil.which("pipx") and "pipx" in sys.executable.replace("\\", "/"):
-        return subprocess.call(["pipx", "upgrade", "hearthwork"])
-    print(f"Upgrade with the tool you installed Hearthwork with, e.g.\n  uv tool upgrade hearthwork\n"
-          f"  pipx upgrade hearthwork\n  pip install --upgrade hearthwork")
-    return 0
+        return ["pipx", "upgrade", "hearthwork"]
+    return None
+
+
+def _importable():
+    """Can a fresh Python still import hearthwork? This process runs on the code loaded before the upgrade."""
+    try:
+        return subprocess.run([sys.executable, "-c", "import hearthwork"], capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def update():
+    """Upgrade with whichever tool installed Hearthwork. The running host process locks the program files on
+    Windows (and a half-replaced install breaks everything), so it is stopped first and the model restarted after."""
+    cmd = _upgrade_cmd()
+    if cmd is None:
+        print(f"Upgrade with the tool you installed Hearthwork with, e.g.\n  uv tool upgrade hearthwork\n"
+              f"  pipx upgrade hearthwork\n  pip install --upgrade hearthwork")
+        return 0
+    from pathlib import Path
+    from . import host
+    config = load_config()
+    running = host.status() is not None
+    last = Path(config.get("lastModel") or "")
+    stopped = False
+    if running:
+        print("Stopping the model to update (restarts after)")
+        if not host.stop(config):  # plain stop: it refuses while requests are active and says why
+            print("`hearthwork update` stopped: the model could not be stopped while requests are running. "
+                  "Finish them (`hearthwork status` shows them), then update again. Nothing was changed and "
+                  "the model is still running.")
+            return 1
+        stopped = True
+    try:
+        code = subprocess.call(cmd)
+        why = None if code == 0 else f"the updater exited {code}"
+    except Exception as error:  # the tool vanished or crashed: leave the install alone, just report
+        code, why = 1, f"the updater did not run ({type(error).__name__}: {error})"
+    if code and not _importable():
+        print(f"Update stopped halfway ({why}) and Hearthwork can no longer be imported. Recovery:")
+        print(f"  1. close other Hearthwork windows; if Python still runs from the {cmd[0]} tools folder, stop it "
+              "(Task Manager, or taskkill /F /IM python.exe)")
+        print(f"  2. reinstall:  {cmd[0]} tool install --force hearthwork" if cmd[0] == "uv"
+              else f"  2. reinstall:  pipx install --force hearthwork")
+        print("  3. start the model again:  hearthwork start")
+        return 1
+    if stopped:
+        print("Update done." if not code else f"Update did not finish ({why}), but Hearthwork still works.")
+        ok = host.ensure(config, last) if last.is_file() else False
+        print(f"Model restarted ({last.name})." if ok else "Start the model again with `hearthwork start`.")
+    else:
+        print("Update done." if not code else f"Update did not finish ({why}), but Hearthwork still works.")
+    return code
 
 
 def help_first(command):

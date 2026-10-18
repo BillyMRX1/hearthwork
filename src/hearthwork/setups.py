@@ -1,6 +1,7 @@
 """Verified setup profiles: a working configuration captured with the evidence that it works.
 
-  hearthwork profile save [NAME] [--doctor]   capture model, runtime, agents, server settings, hardware + Doctor/bench results
+  hearthwork profile save [NAME] [--doctor] [--quick-agents]   capture model, runtime, agents, server settings, hardware + Doctor/bench results
+      (--quick-agents: check one fast agent (claude) and the environment only, instead of every agent)
   hearthwork profile list | show NAME | check [NAME] [--run] | apply NAME | export NAME FILE | import FILE
 
 Stored in HOME/profiles/<name>.json (schema version 1). "previous" is kept automatically before every apply.
@@ -209,6 +210,55 @@ def default_doctor(config, agents):
     report = doctor.run_doctor(config, agents, quick=True)
     doctor.save(report)
     return report
+
+
+def merge_reports(reports):
+    """One Doctor report built from several single-agent runs: the same shape as run_doctor's (agents, protocol,
+    server, seconds, ok) so the evidence and the saved report work unchanged."""
+    if len(reports) == 1:
+        return reports[0]
+    from .doctor import OK
+    merged = dict(reports[0])
+    agents, protocol, seconds, suggestions = {}, {}, 0.0, []
+    for report in reports:
+        agents.update(report.get("agents") or {})
+        for api, stages in (report.get("protocol") or {}).items():
+            protocol.setdefault(api, stages)
+        seconds += report.get("seconds") or 0.0
+        for text in report.get("suggestions") or []:
+            if text not in suggestions:
+                suggestions.append(text)
+    merged.update(agents=agents, protocol=protocol, seconds=round(seconds, 1), suggestions=suggestions)
+    merged["ok"] = all(a.get("verdict") == "works" for a in agents.values()) \
+        and (merged.get("server") or {}).get("status") == OK
+    return merged
+
+
+def save_doctor(config, agents, say=print, quick_agents=False, run_one=None):
+    """The Doctor run behind `profile save`: agents are checked one at a time and each verdict prints as it lands
+    (one whole run takes minutes with no output in between and looks stuck), ending with
+    'verified: N of M agents work'. `quick_agents` checks only one fast agent (claude when installed, else the
+    first) plus the environment. The merged report is saved like a normal Doctor run;
+    `run_one(agents) -> report` is injectable for tests."""
+    from . import doctor
+    if quick_agents and agents:
+        agents = ["claude" if "claude" in agents else agents[0]]
+    if run_one is None:
+        run_one = lambda keys: doctor.run_doctor(config, keys, quick=True)
+    reports = []
+    for key in agents:
+        report = run_one([key]) or {}
+        entry = (report.get("agents") or {}).get(key) or {}
+        say(f"Doctor: {entry.get('title', key)} {entry.get('verdict', 'not run')} ({report.get('seconds') or 0} s)")
+        reports.append(report)
+    if not reports:
+        return None
+    merged = merge_reports(reports)
+    doctor.save(merged)
+    checked = merged.get("agents") or {}
+    works = sum(1 for a in checked.values() if a.get("verdict") == "works")
+    say(f"verified: {works} of {len(checked)} agents work")
+    return merged
 
 
 def capture(config, name, evidence=True, force_doctor=False, run_doctor=None):
@@ -624,6 +674,10 @@ def main(argv):
     p = sub.add_parser("save")
     p.add_argument("name", nargs="?", default="default")
     p.add_argument("--doctor", action="store_true", help="run Doctor now instead of using a report from the last 24 hours")
+    p.add_argument("--quick-agents", action="store_true",
+                   help="run Doctor now, but check one fast agent (claude) and the environment only instead of "
+                        "every agent; each verdict prints as it lands (the profile counts as verified when "
+                        "the checked agents work)")
     sub.add_parser("list")
     sub.add_parser("show").add_argument("name")
     p = sub.add_parser("check")
@@ -655,7 +709,8 @@ def main(argv):
             if config.get("remote"):
                 print("Profiles describe a local setup; this computer uses a remote host.")
                 return 1
-            profile = capture(config, args.name, force_doctor=args.doctor)
+            profile = capture(config, args.name, force_doctor=args.doctor or args.quick_agents,
+                              run_doctor=lambda c, a: save_doctor(c, a, quick_agents=args.quick_agents))
             if not profile["model"]:
                 print("No model found: start one first (`hearthwork start`).")
                 return 1

@@ -204,5 +204,63 @@ class SetupsTest(unittest.TestCase):
         self.assertIsNone(setups.status_line({}))
 
 
+class DoctorProgress(unittest.TestCase):
+    """`profile save` runs Doctor one agent at a time and shows each result as it lands: fake reports, exact lines."""
+
+    def fake(self, key, title, verdict, seconds):
+        return {"time": "2026-01-01T00:00:00", "mode": "local",
+                "server": {"name": "server", "status": "pass", "seconds": 0.1, "detail": "m on port 8001"},
+                "environment": {"hearthwork": "0.10", "model": "m"}, "protocol": {},
+                "agents": {key: {"title": title, "api": "openai-chat", "version": "1.0", "stages": [],
+                                 "verdict": verdict, "failedStage": None, "toolsApplicable": True}},
+                "seconds": seconds, "suggestions": [], "ok": verdict == "works"}
+
+    def test_one_line_per_agent_as_it_finishes(self):
+        lines = []
+        reports = {"claude": self.fake("claude", "Claude Code", "works", 12.3),
+                   "aider": self.fake("aider", "Aider", "works", 54.0)}
+        with mock.patch("hearthwork.doctor.save"):
+            merged = setups.save_doctor({}, ["claude", "aider"], say=lines.append, run_one=lambda keys: reports[keys[0]])
+        self.assertEqual(lines, ["Doctor: Claude Code works (12.3 s)", "Doctor: Aider works (54.0 s)",
+                                 "verified: 2 of 2 agents work"])
+        self.assertEqual(sorted(merged["agents"]), ["aider", "claude"])
+        self.assertEqual(merged["seconds"], 66.3)
+        self.assertTrue(merged["ok"])
+        self.assertTrue(setups.is_verified(setups.doctor_evidence(merged)))
+
+    def test_quick_agents_checks_only_one_fast_agent(self):
+        seen, lines = [], []
+
+        def run_one(keys):
+            seen.extend(keys)
+            return self.fake(keys[0], "Claude Code", "works", 5.0)
+
+        with mock.patch("hearthwork.doctor.save"):
+            merged = setups.save_doctor({}, ["aider", "claude", "codex"], say=lines.append, quick_agents=True,
+                                        run_one=run_one)
+        self.assertEqual(seen, ["claude"])  # claude is the fast one, even when not first
+        self.assertEqual(lines, ["Doctor: Claude Code works (5.0 s)", "verified: 1 of 1 agents work"])
+        self.assertTrue(setups.is_verified(setups.doctor_evidence(merged)))
+
+    def test_quick_agents_without_claude_takes_the_first(self):
+        seen = []
+        with mock.patch("hearthwork.doctor.save"):
+            setups.save_doctor({}, ["aider", "codex"], say=lambda s: None, quick_agents=True,
+                               run_one=lambda keys: (seen.extend(keys), self.fake(keys[0], "Aider", "works", 1.0))[1])
+        self.assertEqual(seen, ["aider"])
+
+    def test_failing_agent_shows_in_the_summary(self):
+        lines = []
+        reports = {"claude": self.fake("claude", "Claude Code", "works", 2.0),
+                   "aider": self.fake("aider", "Aider", "protocol problem at streaming", 3.0)}
+        with mock.patch("hearthwork.doctor.save"):
+            merged = setups.save_doctor({}, ["claude", "aider"], say=lines.append, run_one=lambda keys: reports[keys[0]])
+        self.assertEqual(lines, ["Doctor: Claude Code works (2.0 s)",
+                                 "Doctor: Aider protocol problem at streaming (3.0 s)",
+                                 "verified: 1 of 2 agents work"])
+        self.assertFalse(merged["ok"])
+        self.assertFalse(setups.is_verified(setups.doctor_evidence(merged)))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -304,6 +304,6 @@ options:
 ## update
 
 ```text
-hearthwork update             update Hearthwork itself
+hearthwork update             update Hearthwork itself (stops a running model first, restarts it after)
 ```
 

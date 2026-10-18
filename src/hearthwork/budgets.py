@@ -198,7 +198,8 @@ def options(config, problems, need, context, details, eff):
 
 
 def explain(config, model, problems, need, context, details, eff):
-    lines = [f"{YELLOW}Not starting {model.name} with the '{eff['preset']}' budget{RESET} (context {ctx.format_k(context)}):"]
+    lines = [f"{YELLOW}Not starting {model.name} with the '{budget_name(eff)}' budget{RESET} "
+             f"(context {ctx.format_k(context)}):"]
     lines += [f"  - {p}" for p in problems]
     lines.append(f"  estimate: weights {details['weightsGB']:.1f} GB + KV cache {details['kvGB']:.1f} GB + runtime "
                  f"{OVERHEAD_GB:.1f} GB = {need['totalGB']:.1f} GB ({need['gpuGB']:.1f} GB GPU + {need['ramGB']:.1f} GB RAM)")
@@ -312,6 +313,16 @@ def gb(x):
     return "-" if x is None else f"{x:.1f} GB"
 
 
+def budget_name(eff):
+    """What to call the active budget: the preset, plus a marker when `budget set` changed numbers on top of it."""
+    return eff["preset"] + (" + custom numbers" if eff["custom"] else "")
+
+
+def slot_text(n):
+    """Slots with correct English: '1 slot', '2 slots'."""
+    return f"{n} slot" if n == 1 else f"{n} slots"
+
+
 def table(config, got=None, measured=None):
     """Lines: configured budget | estimated need | measured now, per resource, and which limits are enforced."""
     eff, hw = effective(config), hw_of(config)
@@ -326,7 +337,7 @@ def table(config, got=None, measured=None):
     if gpu:
         gpu_text = (gb(gpu["processGB"]) + " by llama-server; " if gpu["processGB"] is not None else "") \
             + f"{gb(gpu['usedGB'])} used on the GPU by all programs"
-    head = eff["preset"] + (" + custom numbers" if eff["custom"] else "")
+    head = budget_name(eff)
     lines = [f"budget: {GREEN}{head}{RESET}" + (f"  ({PRESETS[eff['preset']]['text']})" if not eff["custom"] else ""),
              f"  {'':<8}{'configured budget':<28}{'estimated need':<20}measured now"]
     if total_vram(hw):
@@ -481,7 +492,7 @@ def main(argv):
         return 1
     new = result["new"]
     print(f"Budget: {new['preset']}" + (" + custom numbers" if new["custom"] else "")
-          + f": VRAM headroom {new['fitTargetMiB']} MiB, {new['slots']} slot(s), threads {new['threads'] or 'default'}, "
+          + f": VRAM headroom {new['fitTargetMiB']} MiB, {slot_text(new['slots'])}, threads {new['threads'] or 'default'}, "
             f"idle unload {str(new['idleMinutes']) + ' min' if new['idleMinutes'] else 'off'}.")
     if got and model and got.get("ready") and not got.get("adopted"):
         before = len(budget_pending(config, got))

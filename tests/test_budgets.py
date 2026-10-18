@@ -117,5 +117,37 @@ class Estimates(unittest.TestCase):
             self.assertIn(word, text)
 
 
+class BudgetTexts(unittest.TestCase):
+    """The texts a user reads when a start is refused and when a budget is set."""
+
+    def details(self):
+        return {"weightsGB": 20.5, "kvGB": 1.4, "perToken": 11264}
+
+    def test_refusal_names_the_custom_budget(self):
+        c = cfg(vramGB=8.0)
+        e = budgets.set_preset(c, "balanced", {"vramGB": 8.0, "ramGB": 12.0})
+        need = budgets.estimate(20.5, 1.4, c["hardware"], e)
+        problems = budgets.check(c, need, 131072, self.details(), eff=e)
+        self.assertTrue(problems)
+        first = budgets.explain(c, Path("m.gguf"), problems, need, 131072, self.details(), e)[0]
+        self.assertIn("with the 'balanced + custom numbers' budget", first)
+        self.assertNotIn("with the 'balanced' budget", first)
+        self.assertIn("balanced + custom numbers", budgets.table(c, None, {"ramGB": None, "gpu": None})[0])
+
+    def test_refusal_names_the_plain_preset(self):
+        c = cfg(vramGB=8.0)
+        e = budgets.set_preset(c, "work")
+        need = budgets.estimate(20.5, 1.4, c["hardware"], e)
+        problems = budgets.check(c, need, 131072, self.details(), eff=e)
+        first = budgets.explain(c, Path("m.gguf"), problems, need, 131072, self.details(), e)[0]
+        self.assertIn("with the 'work' budget", first)
+
+    def test_slot_text_pluralizes(self):
+        self.assertEqual(budgets.slot_text(1), "1 slot")
+        self.assertEqual(budgets.slot_text(2), "2 slots")
+        self.assertEqual(budgets.slot_text(0), "0 slots")
+        self.assertEqual(budgets.slot_text(12), "12 slots")
+
+
 if __name__ == "__main__":
     unittest.main()

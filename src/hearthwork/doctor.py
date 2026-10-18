@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -691,7 +692,7 @@ def run_doctor(config, agents, quick=False, keep=False, endpoint_override=None):
                     fronted = host.ensure(config)
                 if not fronted:
                     raise RuntimeError("the Hearthwork host is not running; start it with `hearthwork start`")
-                endpoint = Endpoint("127.0.0.1", host.port(config))
+                endpoint = Endpoint("127.0.0.1", host.port(config), key=f"local-doctor-{uuid.uuid4().hex[:4]}")
             for api in sorted({HARNESSES[a]["api"] for a in selected}):
                 found = protocol_error_hint(protocol_stages(api, endpoint, model))
                 report["protocol"][api] = found

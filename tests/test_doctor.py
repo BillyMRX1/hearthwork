@@ -253,6 +253,27 @@ class ReviewFixTests(unittest.TestCase):
             item, context = doctor.server_stage(config, config["remote"])
         self.assertEqual((item["status"], context), (OK, 131072))
 
+    def test_local_protocol_probe_carries_a_doctor_token(self):
+        import re
+        from unittest import mock
+        config = {"server": {"port": 1}}
+        keys = []
+
+        def stages(api, endpoint, model):
+            keys.append(endpoint.key)
+            return []
+
+        with mock.patch.object(doctor, "server_stage", return_value=(doctor.stage("server", OK), None)), \
+                mock.patch.object(doctor, "environment", return_value={}), \
+                mock.patch("hearthwork.host.ensure", return_value=True), \
+                mock.patch("hearthwork.host.port", return_value=1), \
+                mock.patch.object(doctor, "protocol_stages", side_effect=stages), \
+                mock.patch.object(doctor, "agent_stages", return_value=[]):
+            doctor.run_doctor(config, ["claude"], quick=True)
+        self.assertTrue(keys)
+        for key in keys:
+            self.assertTrue(re.fullmatch(r"local-doctor-[0-9a-f]{4}", key), key)  # the host shows it as "doctor (xxxx)"
+
     def test_environment_failure_is_recorded_and_run_continues(self):
         from unittest import mock
         config = {"server": {"port": 1}}

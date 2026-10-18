@@ -119,7 +119,9 @@ def client_id(headers):
 
 
 def display_name(cid):
-    """local-claude-ab12 -> claude (ab12)."""
+    """local-claude-ab12 -> claude (ab12). The unlabeled fallback ("unknown") shows as "other"."""
+    if cid == "unknown":
+        return "other"
     if cid.startswith("local-"):
         agent, _, short = cid[6:].rpartition("-")
         return f"{agent} ({short})" if agent else cid

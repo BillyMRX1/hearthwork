@@ -78,6 +78,10 @@ def model_args(argv, name):
     parser = argparse.ArgumentParser(prog=f"hearthwork {name}")
     parser.add_argument("--model", help="part of a model file name; skips the model menu")
     parser.add_argument("--context", type=ctx.parse_k, help="context for this start, e.g. 98304 or 96K (default: auto, see `hearthwork context`)")
+    parser.add_argument("--force", action="store_true",
+                        help="interrupt running requests")
+    parser.add_argument("--over-budget", action="store_true",
+                        help="start even if the memory estimate exceeds the budget")
     return parser.parse_args(argv)
 
 
@@ -213,9 +217,8 @@ def main(argv=None):
         elif command in ("start", "serve"):
             from . import host
             from .server import choose_and_remember
-            force = "--force" in rest
-            over_budget = "--over-budget" in rest
-            args = model_args([a for a in rest if a not in ("--force", "--over-budget")], command)
+            args = model_args(rest, command)
+            force, over_budget = args.force, args.over_budget
             config = configured()
             if command == "serve" and host.running():
                 print("The Hearthwork host is already running. `hearthwork status` shows it; `hearthwork stop` stops it first.")
@@ -257,9 +260,11 @@ def main(argv=None):
             if "--json" not in rest:
                 print(f"hearthwork {__version__}   data: {HOME}")
             if config.get("remote") and "--json" not in rest:
-                from .remote import require
-                from .remote import status_lines
-                got = require(config)
+                from .remote import RemoteError, session, status_lines
+                try:  # the block below says what was tried and that it is not reachable; no second red error
+                    got = session(config)
+                except RemoteError:
+                    got = None
                 for line in status_lines(config, got):
                     print(line)
                 sys.exit(0 if got else 1)

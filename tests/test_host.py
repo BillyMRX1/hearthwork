@@ -249,6 +249,15 @@ class AccountingTests(Base):
     def test_client_header_wins(self):
         self.assertEqual(host.client_id({"x-hearthwork-client": "share:laptop", "authorization": "Bearer local-x-1"}), "share:laptop")
 
+    def test_unlabeled_shows_as_other(self):
+        self.assertEqual(host.client_id({}), "unknown")  # the fallback stays; only its display is renamed
+        self.assertEqual(host.display_name("unknown"), "other")
+        self.assertEqual(host.display_name("other"), "other")  # anything else displays as itself
+
+    def test_doctor_probe_token_shows_as_doctor(self):
+        self.assertEqual(host.client_id({"authorization": "Bearer local-doctor-ab12"}), "local-doctor-ab12")
+        self.assertEqual(host.display_name("local-doctor-ab12"), "doctor (ab12)")
+
 
 class ControlTests(Base):
     def make(self):

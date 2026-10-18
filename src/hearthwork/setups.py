@@ -764,8 +764,18 @@ def main(argv):
             from . import host
             agents = list(profile.get("agents") or {})
             validator = None if args.no_validate or not agents else (lambda c: bool(default_doctor(c, agents).get("ok")))
-            ok = apply(config, profile, save_config, lambda c, m, x: host.ensure(c, m, x), validator, restore=not args.keep_failed)
-            print("Applied." if ok else "Not applied.")
+            heard = []
+
+            def say(line):  # "Applied." only when something actually changed; "already active" says it itself
+                heard.append(line)
+                print(line)
+
+            ok = apply(config, profile, save_config, lambda c, m, x: host.ensure(c, m, x), validator,
+                       restore=not args.keep_failed, say=say)
+            if not ok:
+                print("Not applied.")
+            elif not any(str(line).startswith("already active") for line in heard):
+                print("Applied.")
             return 0 if ok else 1
     except (ValueError, OSError) as error:
         print(f"profile: {error}")

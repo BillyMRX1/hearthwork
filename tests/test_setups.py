@@ -170,6 +170,41 @@ class SetupsTest(unittest.TestCase):
         self.assertEqual(ensured, [1])
         self.assertIn("changed: batch", chr(10).join(msgs))
 
+    def test_profile_apply_cli_already_active_omits_applied(self):
+        # `hearthwork profile apply` prints "Applied." only when something actually changed
+        import contextlib
+        import io
+        f = self.models / "m.gguf"
+        f.write_bytes(b"x" * 10)
+        config = {"modelsDir": str(self.models), "lastModel": str(f),
+                  "server": {"context": "auto", "slots": 2, "batch": 4096, "kvCacheType": "q8_0", "fitTargetMiB": 1536, "port": 1}}
+        data = profile(agents={}, runtime={"name": None, "llamaCppBuild": None})
+        data["model"]["fingerprint"] = setups.fingerprint(f)
+        live = {"model": "m", "context": 4096, "slots": 2}
+        patches = (mock.patch("hearthwork.onboard.load_config", lambda: dict(config)),
+                   mock.patch("hearthwork.onboard.save_config", lambda c: None),
+                   mock.patch("hearthwork.procs.setup_stdio", lambda: None),
+                   mock.patch.object(setups, "capture", return_value={"name": "previous", "settings": {}}),
+                   mock.patch.object(setups, "agent_versions", return_value={}),
+                   mock.patch.object(setups, "running_state", lambda c: live),
+                   mock.patch("hearthwork.context.choose", return_value=(4096, "x", None)),
+                   mock.patch("hearthwork.host.ensure", return_value=True))
+        out = io.StringIO()
+        setups.store(data)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(setups.main(["apply", "t"]), 0)
+        text = out.getvalue()
+        self.assertIn("already active", text)
+        self.assertNotIn("Applied.", text)
+        data["settings"]["batch"] = 512  # a real change still ends with "Applied."
+        setups.store(data)
+        out2 = io.StringIO()
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], \
+                contextlib.redirect_stdout(out2):
+            self.assertEqual(setups.main(["apply", "t"]), 0)
+        self.assertIn("Applied.", out2.getvalue())
+
     def test_unknown_template_is_not_a_change(self):
         p = profile()
         now = {"model": dict(p["model"], chatTemplate=None), "runtime": dict(p["runtime"]), "agents": {"claude": "1.0"}}

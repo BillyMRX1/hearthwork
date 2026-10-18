@@ -43,6 +43,24 @@ class HelpTests(unittest.TestCase):
                 self.assertFalse(code, f"exit code {code!r}")
                 self.assertTrue(out.getvalue().strip(), "no help printed")
 
+    def test_start_help_documents_force_and_over_budget(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                cli.main(["start", "--help"])
+        self.assertEqual(caught.exception.code, 0)
+        text = out.getvalue()
+        self.assertIn("--force", text)
+        self.assertIn("--over-budget", text)
+        self.assertIn("interrupt running requests", text)
+        self.assertIn("start even if the memory estimate exceeds the budget", text)
+
+    def test_model_args_parses_the_flags(self):
+        args = cli.model_args(["--model", "m", "--force", "--over-budget"], "start")
+        self.assertEqual((args.model, args.force, args.over_budget), ("m", True, True))
+        args = cli.model_args([], "start")
+        self.assertEqual((args.force, args.over_budget), (False, False))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -38,7 +38,29 @@ class StatusBlock(unittest.TestCase):
     def test_unreachable(self):
         lines = remote.status_lines({"remote": dict(REMOTE)}, None)
         self.assertIn("not reachable", lines[1])
+        self.assertIn("run `hearthwork connect` to find it again, or `hearthwork disconnect`", lines[2])
         self.assertEqual(lines[-1], "model: unavailable")
+
+    def test_status_command_prints_the_block_only_once(self):
+        # `hearthwork status` on an unreachable host: the block is the message, no second red "Cannot reach" error
+        import contextlib
+        import io
+        from unittest import mock
+        from hearthwork import cli
+        error = remote.RemoteError(remote.unreachable(dict(REMOTE), OSError("no route")))
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(cli, "load_config", return_value={"remote": dict(REMOTE)}), \
+                mock.patch.object(remote, "session", side_effect=error), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as caught:
+                cli.main(["status"])
+        self.assertEqual(caught.exception.code, 1)
+        text = out.getvalue()
+        self.assertNotIn("Cannot reach", text)
+        self.assertIn("(not reachable)", text)
+        self.assertIn("model: unavailable", text)
+        self.assertIn("run `hearthwork connect` to find it again, or `hearthwork disconnect`", text)
+        self.assertEqual(text.count("not reachable"), 1)
 
 
 class Slots(unittest.TestCase):

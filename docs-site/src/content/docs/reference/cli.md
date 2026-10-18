@@ -53,13 +53,15 @@ usage: hearthwork mcp [install claude|codex|print]
 ## start
 
 ```text
-usage: hearthwork start [-h] [--model MODEL] [--context CONTEXT]
+usage: hearthwork start [-h] [--model MODEL] [--context CONTEXT] [--force] [--over-budget]
 
 options:
   -h, --help         show this help message and exit
   --model MODEL      part of a model file name; skips the model menu
   --context CONTEXT  context for this start, e.g. 98304 or 96K (default: auto, see `hearthwork
                      context`)
+  --force            interrupt running requests
+  --over-budget      start even if the memory estimate exceeds the budget
 ```
 
 ## idle
@@ -83,13 +85,15 @@ hearthwork stop [--force]     stop the model and the host (saves the prompt cach
 ## serve
 
 ```text
-usage: hearthwork serve [-h] [--model MODEL] [--context CONTEXT]
+usage: hearthwork serve [-h] [--model MODEL] [--context CONTEXT] [--force] [--over-budget]
 
 options:
   -h, --help         show this help message and exit
   --model MODEL      part of a model file name; skips the model menu
   --context CONTEXT  context for this start, e.g. 98304 or 96K (default: auto, see `hearthwork
                      context`)
+  --force            interrupt running requests
+  --over-budget      start even if the memory estimate exceeds the budget
 ```
 
 ## logs

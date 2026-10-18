@@ -216,8 +216,9 @@ def status_lines(config, got):
         others = [a for a in ordered_addresses(remote) if a != remote["host"]]
         if others:
             lines.append(f"other addresses: {', '.join(others)}")
-    else:  # nothing answered: show what was tried
+    else:  # nothing answered: show what was tried and the short way out (the full block is the error message here)
         lines.append(f"address: {', '.join(ordered_addresses(remote))}:{remote['port']} (not reachable)")
+        lines.append(f"{YELLOW}run `hearthwork connect` to find it again, or `hearthwork disconnect`{RESET}")
     if got:
         slots = remote_slots(config, None)
         lines.append(f"model: {GREEN}{got[0]}{RESET}  (shared, context {got[1]:,} = {got[1] // 1024}K"

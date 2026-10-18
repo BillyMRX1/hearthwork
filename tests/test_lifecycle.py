@@ -448,6 +448,18 @@ class HelperTests(unittest.TestCase):
         switching = dict(base, state="ready", transition={"kind": "switch", "target": "X", "phase": "draining", "draining": 2})
         self.assertIn("switching to X (draining 2)", "\n".join(host.status_lines(switching)))
 
+    def test_status_lines_pluralize_slots(self):
+        ready = {"pid": 1, "port": 2, "uptime": 5, "active": 0, "queued": 0, "clients": {}, "serverPort": 3,
+                 "model": "m", "context": 4096, "idleMinutes": 0, "state": "ready", "ready": True}
+        one = "\n".join(host.status_lines(dict(ready, slots=1, limit=1)))
+        self.assertIn("1 slot)", one)
+        self.assertIn("0 active / 1 slot,", one)
+        self.assertNotIn("1 slots", one)
+        many = "\n".join(host.status_lines(dict(ready, slots=3, limit=3)))
+        self.assertIn("3 slots)", many)
+        self.assertIn("0 active / 3 slots,", many)
+        self.assertEqual((host.slots_text(1), host.slots_text(0), host.slots_text(4)), ("1 slot", "0 slots", "4 slots"))
+
 
 if __name__ == "__main__":
     unittest.main()

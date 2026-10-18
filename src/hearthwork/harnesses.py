@@ -964,31 +964,39 @@ def installed(key):
 
 
 def prepare(key, port, name, context, max_output=4096, args=(), extra_env=None, remote=None, clean=False):
-    """(command, env) to run harness `key` against the server on `port` (the Hearthwork host; `port` is llama-server's, unused), or None when the
-    agent is not installed. With `remote` (config["remote"]: a model shared by another computer) the agent talks to that
-    computer directly: no local relay (the host normalizes). With `clean`, the environment of a parent Claude Code /
-    Codex session is dropped (see clean_env)."""
+    """(command, env, session) to run harness `key` against the server on `port` (the Hearthwork host; `port` is
+    llama-server's, unused), or None when the agent is not installed. `session` is the registered local agent session
+    (host.Session) the caller closes when the run ends; it is None for a shared model. With `remote` (config["remote"]:
+    a model shared by another computer) the agent talks to that computer directly: no local relay (the host normalizes)
+    and no registration (that host gates its own clients). With `clean`, the environment of a parent Claude Code / Codex
+    session is dropped (see clean_env)."""
     harness = HARNESSES[key]
     binary = installed(key)
     if not binary:
         print(f"{harness['title']} is not installed. Install: {harness['install']}", file=sys.stderr if clean else sys.stdout)
         return None
     if remote:
-        base_url, token = f"http://{url_host(remote['host'])}:{remote['port']}", remote["key"]
+        base_url, token, registered = f"http://{url_host(remote['host'])}:{remote['port']}", remote["key"], None
     else:
         from . import host  # one host per computer owns the relay; the token tells it which session asks
         base_url, token = f"http://127.0.0.1:{host.port()}", f"local-{key}-{uuid.uuid4().hex[:4]}"
+        # register before the agent starts: a switch must wait for this session even before its first request
+        registered = host.session(token, key)
     global _remote
     _remote = remote
     try:
         command, env = harness["command"](binary, base_url, token, name, context, max_output, list(args))
+    except BaseException:
+        if registered:
+            registered.close()
+        raise
     finally:
         _remote = None
     if extra_env:
         env = {**(os.environ if env is None else env), **extra_env}
     if clean:
         env = clean_env(os.environ if env is None else env)
-    return command, env
+    return command, env, registered
 
 
 # ---------- dry run ----------
@@ -1099,7 +1107,7 @@ def launch(key, port, name, context, max_output=4096, args=(), capture=False, cw
     prepared = prepare(key, port, name, context, max_output, args, extra_env, remote)
     if not prepared:
         return 1
-    command, env = prepared
+    command, env, agent_session = prepared
     try:
         if capture:
             return subprocess.run(command, env=env, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
@@ -1109,4 +1117,5 @@ def launch(key, port, name, context, max_output=4096, args=(), capture=False, cw
     except KeyboardInterrupt:
         return 130
     finally:
-        pass  # the prompt cache is saved by the host when it stops
+        if agent_session:
+            agent_session.close()  # the run ended: a switch no longer waits for this session (the prompt cache is saved by the host when it stops)

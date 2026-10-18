@@ -202,6 +202,7 @@ def run_task(config, task, agent="claude", allow=(), cwd=None, timeout=900):
         temporary.append(path)
     last_message, prompt_file = temporary
     text = task.rstrip() + HARNESSES[agent].get("suffix", SUFFIX)
+    agent_session = None
     try:
         arguments, extra = HARNESSES[agent]["task"](allow, last_message, prompt_file, cwd=folder)
         stdin_text = text
@@ -212,7 +213,7 @@ def run_task(config, task, agent="claude", allow=(), cwd=None, timeout=900):
         prepared = prepare(agent, port, model, context, args=arguments, extra_env=extra, remote=remote, clean=True)
         if not prepared:
             sys.exit(1)
-        command, env = prepared
+        command, env, agent_session = prepared
         log(f"hearthwork task: {HARNESSES[agent]['title']} with {model} ({host}) in {folder}")
         # snapshots cannot tell apart changes of other tasks in the same folder, so note when others were seen there
         task_started = time.time()
@@ -226,6 +227,8 @@ def run_task(config, task, agent="claude", allow=(), cwd=None, timeout=900):
         shared = shared or other_tasks_in(folder) or (marked is not None and marked >= task_started)
         message, error = parse_result(agent, out, err, returncode, last_message)
     finally:
+        if agent_session:  # the agent run ended (also on Ctrl+C or a timeout kill): the host no longer waits for it
+            agent_session.close()
         for path in temporary:
             with contextlib.suppress(OSError):
                 os.unlink(path)

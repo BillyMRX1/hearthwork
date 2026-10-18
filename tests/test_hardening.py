@@ -201,7 +201,7 @@ class ResultTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, \
                 mock.patch.object(task, "installed", return_value=True), \
                 mock.patch.object(task, "model_for_task", return_value=(1, "m", 1000, None)), \
-                mock.patch.object(task, "prepare", return_value=(["x"], {})), \
+                mock.patch.object(task, "prepare", return_value=(["x"], {}, None)), \
                 mock.patch.object(task, "run_process", return_value=(0, '{"result": ""}', "", False)):
             report = task.run_task(config, "t", "claude", cwd=folder)
         self.assertEqual(report["status"], "no_result")
@@ -271,7 +271,7 @@ class SharedFolderTests(unittest.TestCase):
                 mock.patch.object(task, "time", fake_clock), mock.patch.object(procs, "time", fake_clock), \
                 mock.patch.object(task, "installed", return_value=True), \
                 mock.patch.object(task, "model_for_task", return_value=(8080, "m", None, None)), \
-                mock.patch.object(task, "prepare", return_value=(["x"], {})), \
+                mock.patch.object(task, "prepare", return_value=(["x"], {}, None)), \
                 mock.patch.object(task, "run_process", side_effect=run_process), \
                 mock.patch.object(task, "parse_result", return_value=("done", None)), \
                 mock.patch.object(task, "running_tasks", side_effect=lambda folder=None: list(live)):
@@ -318,7 +318,7 @@ class SharedFolderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, \
                 mock.patch.object(task, "installed", return_value=True), \
                 mock.patch.object(task, "model_for_task", return_value=(8080, "m", None, None)), \
-                mock.patch.object(task, "prepare", return_value=(["x"], {})), \
+                mock.patch.object(task, "prepare", return_value=(["x"], {}, None)), \
                 mock.patch.object(task, "run_process", return_value=(0, "", "", False)), \
                 mock.patch.object(task, "parse_result", return_value=("done", None)), \
                 mock.patch.object(task, "running_tasks", return_value=[4242]):
@@ -327,7 +327,7 @@ class SharedFolderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, \
                 mock.patch.object(task, "installed", return_value=True), \
                 mock.patch.object(task, "model_for_task", return_value=(8080, "m", None, None)), \
-                mock.patch.object(task, "prepare", return_value=(["x"], {})), \
+                mock.patch.object(task, "prepare", return_value=(["x"], {}, None)), \
                 mock.patch.object(task, "run_process", return_value=(0, "", "", False)), \
                 mock.patch.object(task, "parse_result", return_value=("done", None)), \
                 mock.patch.object(task, "running_tasks", return_value=[os.getpid()]):

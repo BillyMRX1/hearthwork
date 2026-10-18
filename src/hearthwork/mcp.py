@@ -68,6 +68,7 @@ class Tasks:
         self.lock = threading.RLock()
         self.job = KillOnClose()  # Windows: children die with this process, even if it is killed hard
         self.closed = False
+        self.session = None  # this MCP server registered as an agent session with the host (a switch waits for it)
 
     def command(self, args):
         task = args.get("task")
@@ -88,9 +89,21 @@ class Tasks:
             command += ["--allow", pattern]
         return command + ["-"], task
 
+    def open_session(self):
+        """Register this MCP server as an agent session with the local host, so a switch waits for it; the tasks it
+        starts register themselves too (they are separate processes). No-op until a local host answers."""
+        if self.session is not None and self.session.registered:
+            return
+        try:
+            from . import host
+            self.session = host.session(f"local-mcp-{uuid.uuid4().hex[:4]}", "mcp")
+        except Exception:
+            self.session = None
+
     def start(self, args):
         """Queue a task (it starts at once when a slot is free). Returns its id."""
         command, task = self.command(args)
+        self.open_session()
         with self.lock:
             if self.closed:
                 raise ValueError("the server is shutting down")
@@ -163,7 +176,8 @@ class Tasks:
             return {"id": task_id, "status": "cancelled", "was": was}
 
     def shutdown(self):
-        """Refuse new tasks, drop the queue, kill every running task and its process tree."""
+        """Refuse new tasks, drop the queue, kill every running task and its process tree (the orphan cleanup), and
+        deregister this server's agent session so a switch is no longer held up by it."""
         with self.lock:
             self.closed = True
             self.queue.clear()
@@ -173,6 +187,9 @@ class Tasks:
                     if item["process"] is not None:
                         kill_tree(item["process"])
                     item["done"].set()
+        if self.session is not None:
+            self.session.close()
+            self.session = None
 
     def result(self, task_id, wait):
         item = self.items.get(task_id)

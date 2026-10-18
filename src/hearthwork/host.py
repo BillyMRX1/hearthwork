@@ -7,6 +7,7 @@ Any command that needs the model calls ensure(), which starts the host detached 
 as `hearthwork host` (hidden; `hearthwork serve` runs it in the foreground). Its control API, /hearthwork/control/status
 and /stop on the listener, needs the random token in host.json. Logs: HOME/logs/host.log and server.log.
 """
+import atexit
 import collections
 import hashlib
 import hmac
@@ -30,6 +31,7 @@ from . import budgets, context as ctx, diagnostics
 from .harnesses import ClientGone, Overloaded, Unavailable, client_gone, make_relay
 from .onboard import GREEN, RED, RESET, WINDOWS, YELLOW
 from .paths import HOME, HOST_FILE, HOST_LOCK, HOST_LOG, LOG, STATE
+from .procs import pid_alive
 
 DEFAULT_PORT = 8470
 MAX_QUEUE = 16          # requests allowed to wait
@@ -39,6 +41,8 @@ DIM = "\033[2m"
 LOAD_TIMEOUT = 1800     # seconds `ensure` waits for a model to load
 DRAIN_SECONDS = 30      # a stop waits this long for running requests
 GENERATION = ("/messages", "/chat/completions", "/responses", "/completions", "/completion")
+SESSION_LIMIT = 200                 # the registry keeps at most this many sessions
+SESSION_MAX_AGE = 7 * 24 * 3600     # a session this old is dropped even if its pid is still alive (pid reuse)
 
 
 def port(config=None):
@@ -289,6 +293,84 @@ class Gate:
                     "clients": {k: dict(v) for k, v in self.clients.items() if v["active"] or v["queued"] or v["total"]}}
 
 
+class Sessions:
+    """Local agent sessions that are using this host: client id -> {client, kind, pid, since}. A client registers when
+    it starts (control API) and drops out when it deregisters, when its process is gone, or when it is too old for its
+    pid to mean anything. Only local clients register; a client of a remote host is on another computer and is gated
+    there through the share."""
+
+    def __init__(self, alive=None):
+        self.lock = threading.Lock()
+        self.items = {}
+        self.alive = alive
+
+    def _gone(self, pid):
+        # pid_alive (OpenProcess) is a fast call: status() must stay quick even while the model is loading, or a client
+        # reads the host as silent. tasklist (host._alive) is far too slow to run on every status request.
+        try:
+            return not (self.alive or pid_alive)(int(pid))
+        except (TypeError, ValueError):
+            return True
+
+    def _drop_stale(self):
+        now = time.time()
+        for client in [c for c, s in self.items.items() if self._gone(s["pid"]) or now - s["since"] > SESSION_MAX_AGE]:
+            del self.items[client]
+
+    def register(self, client, kind=None, pid=None):
+        """Record `client` as an open session. Returns the record, or None when the client id is empty."""
+        client = (client or "").strip()[:60]
+        if not client:
+            return None
+        with self.lock:
+            self._drop_stale()
+            if client not in self.items and len(self.items) >= SESSION_LIMIT:  # forget the oldest to stay small
+                del self.items[min(self.items, key=lambda k: self.items[k]["since"])]
+            kind = (kind or "agent").strip()[:40]
+            self.items[client] = {"client": client, "kind": kind or "agent",
+                                  "pid": int(pid or os.getpid()), "since": time.time()}
+            return dict(self.items[client])
+
+    def unregister(self, client):
+        with self.lock:
+            self._drop_stale()
+            return self.items.pop((client or "").strip()[:60], None) is not None
+
+    def clear(self):
+        with self.lock:
+            self.items.clear()
+
+    def open(self):
+        """The open sessions, oldest first; stale ones (dead pid) are dropped here too."""
+        with self.lock:
+            self._drop_stale()
+            return [dict(s) for s in sorted(self.items.values(), key=lambda s: s["since"])]
+
+
+def slots_text(count):
+    """'1 slot' / 'N slots'."""
+    try:
+        count = int(count)
+    except (TypeError, ValueError):
+        count = 0
+    return f"{count} slot" + ("" if count == 1 else "s")
+
+
+def session_line(session):
+    """One open session, as "claude session since 14:32:10 (pid 1234)"."""
+    return (f"{session['kind']} session since "
+            f"{time.strftime('%H:%M:%S', time.localtime(session['since']))} (pid {session['pid']})")
+
+
+def sessions_message(sessions):
+    """Why a switch is refused while agent sessions are open, listing each one."""
+    listed = "; ".join(session_line(s) for s in sessions)
+    count = len(sessions)
+    # no trailing period: the callers (ensure, apply_pending) add their own sentence after it
+    return (f"{count} agent session{'' if count == 1 else 's'} {'is' if count == 1 else 'are'} still using the model: "
+            f"{listed}. Wait for {'it' if count == 1 else 'them'} to finish, or use --force to interrupt")
+
+
 # ---------- the host process ----------
 
 _LOCK = None
@@ -349,6 +431,9 @@ RESTART_WINDOW = 900
 BACKOFF = (2, 10, 30)   # seconds before the first, second, third restart
 LOAD_DEADLINE = LOAD_TIMEOUT  # seconds before a model that never gets ready is killed and counted as a failed start
 LOAD_POLL = 1           # seconds between checks while llama-server loads
+MEMORY_WAIT = 60        # a restart waits at most this long for the stopped model's RAM to come back before loading
+MEMORY_POLL = 2         # seconds between free-RAM checks while waiting
+MEMORY_RECOVER = 0.9    # share of the stopped server's RAM that should return before the next one loads into free RAM
 
 
 def tail_lines(n=20, path=None):
@@ -414,6 +499,7 @@ class Host:
         self.process = None
         self.stop_event = threading.Event()
         self.gate = Gate(lambda: self.slots, log)
+        self.sessions = Sessions()
         diagnostics.RECORDER.context = lambda: (self.context, self.slots, self.model)
         self.listener = None
         self.state = "starting"       # starting, loading, ready, switching, unloaded, recovering, failed
@@ -462,7 +548,7 @@ class Host:
                 "ready": self.ready, "error": self.error, "adopted": self.adopted, "restored": self.restored,
                 "serverPort": self.llama_port, "started": self.started, "uptime": time.time() - self.started,
                 "slots": self.slots, "state": self.state, "transition": transition, "switchError": self.switch_error,
-                "idleMinutes": self.idle_minutes, "idleFor": idle_for,
+                "idleMinutes": self.idle_minutes, "idleFor": idle_for, "sessions": self.sessions.open(),
                 "recovery": {"restarts": len([t for t in self.restarts if now - t < RESTART_WINDOW]), "limit": RESTART_LIMIT,
                              "windowMinutes": RESTART_WINDOW // 60, "recovered": self.recovered, "lastFailure": self.failure,
                              "healthFails": self.health_fails, "lastHealth": self.last_health},
@@ -490,6 +576,21 @@ class Host:
         elif path == "/hearthwork/control/stop" and handler.command == "POST":
             handler._send_json(200, {"stopping": True})
             self.stop_event.set()
+        elif path == "/hearthwork/control/session" and handler.command == "POST":
+            try:
+                body = json.loads(handler.read_body() or b"{}")
+            except ValueError:
+                body = {}
+            action = body.get("action")
+            if action == "register":
+                record = self.sessions.register(body.get("client"), body.get("kind"), body.get("pid"))
+            elif action == "unregister":
+                self.sessions.unregister(body.get("client"))
+                record = None
+            else:
+                handler._send_json(400, {"error": {"message": "action must be register or unregister"}})
+                return True
+            handler._send_json(200, {"session": record, "sessions": self.sessions.open()})
         elif handler.command == "POST" and name in ("switch", "idle", "load"):
             try:
                 body = json.loads(handler.read_body() or b"{}")
@@ -533,10 +634,47 @@ class Host:
                 pass
         STATE.unlink(missing_ok=True)
 
+    def release_server(self):
+        """Stop the llama-server this host owns and wait (bounded) for its RAM to come back before the next one loads.
+        Killing a 12+ GB server and starting the replacement at once makes Windows page the whole load (minutes
+        instead of a minute), so measure what it held and how much RAM was free, stop it, then wait for the recovery."""
+        from . import server
+        from .onboard import memory_gb
+        # only the server this host owns: a stale server.json can point at an unrelated (reused) pid
+        pid = self.process.pid if self.process is not None else None
+        previous = budgets.process_rss_gb(pid)
+        free_before = memory_gb()[1]
+        server.stop(self.config, quiet=True)  # saves the prompt cache first
+        self.wait_memory_released(previous, free_before)
+
+    def wait_memory_released(self, previous_gb, free_before, timeout=MEMORY_WAIT):
+        """Wait for a stopped model's RAM to return, so the next server loads into free memory instead of paging.
+        Bounded, and it stops early once the numbers settle (nothing left to reclaim) or the target is reached."""
+        if not previous_gb or previous_gb < 2.0 or free_before is None:
+            return  # no previous model of ours, or too small to matter
+        from .onboard import memory_gb
+        target = free_before + previous_gb * MEMORY_RECOVER
+        self.log(f"waiting for the previous model's memory to be released ({previous_gb:.0f} GB)")
+        end, best, steady = time.monotonic() + timeout, free_before, 0
+        while time.monotonic() < end:
+            time.sleep(MEMORY_POLL)
+            free = memory_gb()[1]
+            if free >= target:
+                self.log(f"the previous model's memory is back ({free:.1f} GB free)")
+                return
+            if free > best + 0.5:  # still coming back
+                best, steady = free, 0
+            else:                  # the numbers stopped moving: waiting longer will not bring more back
+                steady += 1
+                if steady >= 2:
+                    self.log(f"memory looks settled at {free:.1f} GB free")
+                    return
+        self.log(f"continuing with {memory_gb()[1]:.1f} GB free (waited {timeout:.0f} s for {previous_gb:.0f} GB)")
+
     def load(self, model, context):
         """Start llama-server on `model` and wait until it answers. Raises RuntimeError when it cannot."""
         from . import server
-        server.stop(self.config, quiet=True)  # a stale record or leftover process of an older start
+        self.release_server()  # a stale record or leftover process of an older start; wait for its memory first
         requested = context  # None = auto: recomputed at the next load, for the model and settings of that time
         context, source, rng = ctx.choose(self.config, model, context)
         self.log(ctx.describe(context, source, rng))
@@ -626,6 +764,11 @@ class Host:
         if self.state not in ("ready", "failed", "unloaded"):
             self.end()
             return 409, {"error": {"message": "the model is still starting; try again in a moment"}}
+        sessions = self.sessions.open()
+        if sessions and not force:  # a session that has not sent its first request yet still counts: it is using the model
+            self.end()
+            self.log(f"Switch refused: {sessions_message(sessions)}")
+            return 409, {"error": {"message": sessions_message(sessions)}}
         self.switch_error = None
         self.transition["phase"] = "draining"
         threading.Thread(target=self._switch, args=(path, context, force), daemon=True).start()
@@ -650,10 +793,15 @@ class Host:
                 n = self.gate.cancel_all(f"The model is being switched to {name}; this request was cancelled.")
                 self.log(f"Switching to {name}: cancelled {n} running request(s)")
                 self.gate.wait_idle(10)
+            if force:
+                closed = self.sessions.open()
+                if closed:  # a forced switch closes the registrations it interrupts, so the next one is not refused
+                    self.log("Switching to " + name + ": closing " + "; ".join(session_line(s) for s in closed))
+                    self.sessions.clear()
             self.transition["phase"] = "loading"
             self.ready, self.state = False, "switching"
             self.gate.set_hold(f"loading {name}")
-            server.stop(self.config, quiet=True)  # saves the prompt cache first
+            self.release_server()  # saves the prompt cache, then waits for the old server's RAM to come back
             self.process = None
             try:
                 self.load(path, context)
@@ -696,7 +844,7 @@ class Host:
             self.log(f"No requests for {self.idle_minutes} min: unloading the model")
             self.ready, self.state = False, "unloading"
             try:
-                server.stop(self.config, quiet=True)
+                self.release_server()  # stop it and wait for its memory to come back before the next load
             except Exception:
                 self.log(traceback.format_exc())
             self.kill_server()  # whatever stop left running
@@ -968,6 +1116,121 @@ def call(info, path, method="GET", timeout=5, payload=None, errors=False):
             return None
     except (OSError, ValueError):
         return None
+
+
+def register_session(client, kind=None, pid=None):
+    """Tell the local host that `client` (a local agent session id) has started using it, so a switch waits for it.
+    No-op when no host answers. True when the host registered it."""
+    if not client:
+        return False
+    info = read_info()
+    if not info:
+        return False
+    answer = call(info, "session", "POST", payload={"action": "register", "client": client, "kind": kind,
+                                                    "pid": pid or os.getpid()})
+    return bool(answer) and answer.get("session") is not None
+
+
+def unregister_session(client):
+    """Tell the local host that `client` is done (best effort: a dead pid is dropped by the host anyway)."""
+    if not client:
+        return False
+    info = read_info()
+    if not info:
+        return False
+    return bool(call(info, "session", "POST", payload={"action": "unregister", "client": client}))
+
+
+_session_lock = threading.Lock()
+_open_sessions = {}          # client -> pid, for the process-exit safety net
+_session_previous = {}       # signal -> handler that was installed before ours
+_session_net_installed = False
+
+
+def _track_session(client):
+    """Remember a registered session so the safety net can drop it (process exit, Ctrl+C, kill via a signal)."""
+    global _session_net_installed
+    with _session_lock:
+        _open_sessions[client] = os.getpid()
+        install = not _session_net_installed
+        _session_net_installed = True
+    if not install:
+        return
+    atexit.register(_close_open_sessions)
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for name in ("SIGTERM", "SIGINT", "SIGBREAK", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is None:
+            continue
+        try:
+            _session_previous[number] = signal.getsignal(number)
+            signal.signal(number, _session_signal)
+        except (ValueError, OSError):
+            pass
+
+
+def _forget_session(client):
+    with _session_lock:
+        _open_sessions.pop(client, None)
+
+
+def _close_open_sessions():
+    """Deregister every session this process registered (idempotent: used by atexit and the signal safety net)."""
+    with _session_lock:
+        clients = list(_open_sessions)
+        _open_sessions.clear()
+    for client in clients:
+        try:
+            unregister_session(client)
+        except Exception:
+            pass
+
+
+def _session_signal(number, frame):
+    """A signal arrived: drop this process's sessions, then hand the signal on to whoever had it before us."""
+    _close_open_sessions()
+    previous = _session_previous.get(number, signal.SIG_DFL)
+    if previous == signal.SIG_IGN:
+        return
+    if callable(previous):
+        previous(number, frame)
+        return
+    try:
+        signal.signal(number, signal.SIG_DFL)
+        os.kill(os.getpid(), number)
+    except (ValueError, OSError):
+        pass
+
+
+class Session:
+    """A local agent session registered with the host. `close()` deregisters it; process exit, Ctrl+C and a signal
+    do too (the safety net above), and a session whose process dies hard is dropped by the host as stale."""
+
+    def __init__(self, client, kind=None):
+        self.client, self.kind, self.closed = client, kind, False
+        self.registered = bool(client) and register_session(client, kind, os.getpid())
+        if self.registered:
+            _track_session(client)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.client:
+            _forget_session(self.client)
+            unregister_session(self.client)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def session(client, kind=None):
+    """Register `client` as a local agent session with the host; returns a Session (inert when no host answers)."""
+    return Session(client, kind)
 
 
 def status():
@@ -1283,7 +1546,7 @@ def status_lines(got):
     elif got.get("ready"):
         n_ctx = got.get("context")
         lines.append(f"model: {GREEN}{got['model']}{RESET}  (port {got['serverPort']}"
-                     + (f", context {n_ctx:,} = {ctx.format_k(n_ctx)}" if n_ctx else "") + f", {got['slots']} slots)")
+                     + (f", context {n_ctx:,} = {ctx.format_k(n_ctx)}" if n_ctx else "") + f", {slots_text(got['slots'])})")
     else:
         lines.append(f"model: {YELLOW}loading{RESET}")
     if got.get("switchError"):
@@ -1296,7 +1559,12 @@ def status_lines(got):
                      f"{recovery.get('recovered', 0)} recovered; last failure: {last['reason']}")
     elif recovery.get("lastHealth"):
         lines.append(f"health: last check failed ({recovery['lastHealth']}); a busy server is not restarted")
-    lines.append(f"requests: {got['active']} active / {got['limit']} slots, {got['queued']} queued"
+    sessions = got.get("sessions") or []
+    if sessions:
+        lines.append(f"sessions: {len(sessions)} open  (a switch waits for them; `hearthwork start --force` interrupts)")
+        for session in sessions:
+            lines.append(f"  {session_line(session)}")
+    lines.append(f"requests: {got['active']} active / {slots_text(got['limit'])}, {got['queued']} queued"
                  + (f", {got['rejected']} refused" if got.get("rejected") else ""))
     for cid, c in sorted(got["clients"].items()):
         lines.append(f"  {display_name(cid):<28} active {c['active']}  queued {c['queued']}  total {c['total']}")

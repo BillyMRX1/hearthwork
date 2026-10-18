@@ -15,6 +15,7 @@ from .paths import HOME, LOG, SLOTS, STATE, TEMPLATES
 DIM = "\033[2m"
 
 MIN_SAVE_TOKENS = 2048  # smaller prompts (e.g. an agent's title request) must not overwrite a saved big one
+PROCESS_GONE_WAIT = 20  # seconds stop() waits for a killed llama-server to be truly gone (not just its port closed)
 
 
 def pick_model(config, models, folder, last):
@@ -221,6 +222,13 @@ def stop(config, quiet=False):
                 os.killpg(pid, signal.SIGTERM)
             except OSError:
                 pass
+        # wait for the process to be truly gone, then for its port to stop answering: the port closes before the
+        # pages are back, and starting the next server over the old one's memory is what made restarts slow
+        from .procs import pid_alive
+        for _ in range(PROCESS_GONE_WAIT * 5):
+            if not pid_alive(pid):
+                break
+            time.sleep(0.2)
         for _ in range(30):
             if not served_model(state["port"], timeout=1):
                 break

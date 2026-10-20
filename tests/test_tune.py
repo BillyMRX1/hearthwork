@@ -162,6 +162,46 @@ class RunLoop(unittest.TestCase):
                 "score_fraction": score / 3, "seconds": seconds, "load_seconds": load, "ttfb_ms": ttfb,
                 "gen_tps": 20.0, "peak_ramGB": 5.0, "peak_gpuGB": None}
 
+    def test_two_candidates_bench_in_distinct_folders(self):
+        """The live failure: one shared root meant the second bench hit an existing <root>/<agent> folder."""
+        candidates = [self.candidate("a", "/models/Alpha-35B-A3B-Q4_K_M.gguf"),
+                      self.candidate("b", "/models/Bravo-30B-A3B-Q4_K_M.gguf")]
+        folders = []
+
+        def fake_run_agent(agent, config, model, root, tasks=None):
+            folder = Path(root) / agent
+            folder.mkdir(parents=True, exist_ok=True)  # the real bench makes this folder
+            folders.append(str(folder))
+            return {"score": 3, "seconds": 10 if "Alpha" in model else 30, "steps": [{}] * 3, "agent": "Claude Code"}
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(tune.bench, "BENCH", Path(tmp.name)), \
+                mock.patch.object(tune.host, "status", return_value=self.status()), \
+                mock.patch.object(tune, "build_candidates", return_value=(candidates, [])), \
+                mock.patch.object(tune, "switch_to", return_value=True), \
+                mock.patch.object(tune, "fits", return_value=({"totalGB": 8.0}, None)), \
+                mock.patch.object(tune.bench, "warmup"), \
+                mock.patch.object(tune.bench, "run_agent", side_effect=fake_run_agent), \
+                mock.patch.object(tune, "measure", return_value={}), \
+                mock.patch.object(tune, "diagnostics_metrics", return_value={"ttfb_ms": 50, "gen_tps": 20.0}), \
+                mock.patch.object(tune, "winner_profile", return_value={"name": "tune-x"}):
+            said = []
+            code = tune.run(self.config(), "claude", 3, 1800, None, say=lambda s, **kw: said.append(s))
+        self.assertEqual(code, 0, "\n".join(said))
+        self.assertEqual(len(folders), 2)
+        self.assertEqual(len(set(folders)), 2)  # two candidates, two distinct folders
+        self.assertTrue(all(Path(f).parent.parent.name.endswith("-tune") for f in folders))  # under this tuning run
+        self.assertEqual([Path(f).parent.name[:2] for f in folders], ["01", "02"])
+
+    def test_candidate_folder_is_short_sanitized_and_unique(self):
+        root = Path("runs/20260101-000000-tune")
+        one = tune.candidate_folder(root, 1, "/m/Alpha-35B-A3B-Q4_K_M.gguf")
+        two = tune.candidate_folder(root, 2, "/m/Alpha-35B-A3B-Q4_K_M.gguf")
+        self.assertNotEqual(one, two)
+        self.assertEqual(one.name, "01-Alpha-35B-A3B-Q4_K_M")
+        self.assertEqual(tune.candidate_folder(root, 3, "/m/weird name!.gguf").name, "03-weird-name")
+
     def test_stops_before_a_candidate_that_would_overrun(self):
         clock = {"t": 0.0}
         candidates = [self.candidate("a", "/m/a.gguf"), self.candidate("b", "/m/b.gguf"), self.candidate("c", "/m/c.gguf")]

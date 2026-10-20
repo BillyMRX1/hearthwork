@@ -339,6 +339,12 @@ def diagnostics_metrics(config, seconds):
     return {"ttfb_ms": ttfb.get("p50"), "gen_tps": payload.get("gen_tps_median")}
 
 
+def candidate_folder(root, seq, path):
+    """A short, unique bench folder per candidate, so two candidates in one tuning run never collide."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(path).stem)[:40].strip("-") or "model"
+    return Path(root) / f"{seq:02d}-{safe}"
+
+
 def run_candidate(config, candidate, agent, tasks, root, say=print):
     """Switch to `candidate`, warm it up, run the short bench, and return a result, or None when it is skipped."""
     need, problem = fits(config, candidate["model"], candidate["context"])
@@ -486,7 +492,7 @@ def run(config, agent, tasks, seconds_limit, min_context, say=print, as_json=Fal
     deadline = time.monotonic() + seconds_limit
     say(f"{BOLD}Auto-tuning{RESET}: {len(candidates)} candidate(s), {tasks} task(s) each, "
         f"{seconds_limit / 60:.0f} min limit  {DIM}(best among the configurations tested){RESET}\n")
-    results, per_task, load_est = [], None, LOAD_ESTIMATE
+    results, per_task, load_est, seq = [], None, LOAD_ESTIMATE, 0
     try:
         for candidate in candidates:
             remaining = deadline - time.monotonic()
@@ -495,8 +501,9 @@ def run(config, agent, tasks, seconds_limit, min_context, say=print, as_json=Fal
                 say(f"{DIM}Stopping: {remaining / 60:.0f} min left would not cover another candidate "
                     f"(~{cost / 60:.0f} min).{RESET}")
                 break
-            try:
-                result = run_candidate(config, candidate, agent, tasks, root, say)
+            seq += 1
+            try:  # each candidate benches in its own folder: the bench must never reuse another candidate's
+                result = run_candidate(config, candidate, agent, tasks, candidate_folder(root, seq, candidate["model"]), say)
             except Exception as error:  # a broken candidate never ends the run; the original is still restored below
                 say(f"{YELLOW}  {candidate['label']} failed ({type(error).__name__}: {error}); skipping it{RESET}")
                 result = None
@@ -513,8 +520,9 @@ def run(config, agent, tasks, seconds_limit, min_context, say=print, as_json=Fal
                     say(f"{DIM}The top two are within {CLOSE_TOLERANCE:.0%} on score-seconds: re-running the best "
                         f"once.{RESET}")
                     best = next(c for c in candidates if c["label"] == ranked[0]["label"])
+                    seq += 1
                     try:
-                        repeat = run_candidate(config, best, agent, tasks, root, say)
+                        repeat = run_candidate(config, best, agent, tasks, candidate_folder(root, seq, best["model"]), say)
                     except Exception as error:
                         say(f"{YELLOW}  repeat failed ({type(error).__name__}: {error}){RESET}")
                         repeat = None

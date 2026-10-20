@@ -267,7 +267,7 @@ def run_once(agent, config, model, root, attempt, tasks=None):
     title = HARNESSES[agent]["title"]
     name = agent if attempt == 1 else f"{agent}-retry"
     folder = root / name
-    folder.mkdir(parents=True)
+    folder.mkdir(parents=True, exist_ok=True)  # a caller may reuse a root; never fail on an existing folder
     (folder / "demo.txt").write_text(DEMO, encoding="utf-8")
     (folder / "buggy.py").write_text(BUGGY, encoding="utf-8")
     env = isolated_env(agent, root / f"{name}-config")

@@ -65,20 +65,45 @@ class Candidates(unittest.TestCase):
         self.dir = Path(tmp.name)
         self.rng = {"min": 65536, "recommended": 65536, "max": 262144, "modelMax": 262144, "kvGB": 3.0, "reason": "x"}
 
-    def build(self, paths, current=None, fits=None, choose=None, rng=None, min_context=None, limit=tune.MAX_CANDIDATES):
+    def build(self, paths, current=None, fits=None, choose=None, rng=None, min_context=None, limit=tune.MAX_CANDIDATES,
+              ranked=None):
         choose = choose or (lambda config, path: (65536, "auto", None))
         rng = rng or (lambda config, path: self.rng)
         fits = fits or (lambda config, path, context: ({"totalGB": 10.0, "gpuGB": 8.0, "ramGB": 2.0}, None))
+        ranked = ranked if ranked is not None else [(p, i + 1, f"rank {i + 1} for this computer") for i, p in enumerate(paths)]
         with mock.patch.object(tune.ctx, "choose", side_effect=choose), \
                 mock.patch.object(tune.ctx, "range_for", side_effect=rng), \
                 mock.patch.object(tune, "fits", side_effect=fits):
-            return tune.build_candidates({}, min_context, current=current, models=paths, limit=limit)
+            return tune.build_candidates({}, min_context, current=current, models=paths, limit=limit, ranked=ranked)
 
     def test_installed_models_capped(self):
         paths = [touch(self.dir, f"Model-{i}-Q4_K_M.gguf", 100 + i) for i in range(8)]
         candidates, _ = self.build(paths)
         self.assertEqual(len(candidates), tune.MAX_CANDIDATES)
         self.assertTrue(all(c["kind"] == "model" for c in candidates))
+
+    def test_ranked_order_and_current_first(self):
+        a = touch(self.dir, "Alpha-8B-Q4_K_M.gguf", 100)
+        b = touch(self.dir, "Bravo-8B-Q4_K_M.gguf", 200)
+        c = touch(self.dir, "Charlie-8B-Q4_K_M.gguf", 300)
+        ranked = [(c, 1, "rank 1"), (b, 2, "rank 2"), (a, 3, "rank 3")]
+        candidates, _ = self.build([a, b, c], current=b, ranked=ranked)
+        self.assertEqual([x["model"].name for x in candidates],
+                         ["Bravo-8B-Q4_K_M.gguf", "Charlie-8B-Q4_K_M.gguf", "Alpha-8B-Q4_K_M.gguf"])
+        self.assertTrue(candidates[0]["current"])
+        self.assertEqual(candidates[0]["reason"], "the model that is running now")
+        self.assertEqual(candidates[1]["reason"], "rank 1")
+
+    def test_extras_are_always_kept_within_the_cap(self):
+        paths = [touch(self.dir, f"Model-{i}-Q4_K_M.gguf", 100 + i) for i in range(8)]
+        cur = touch(self.dir, "Current-14B-Q4_K_M.gguf", 500)
+        smaller = touch(self.dir, "Current-14B-Q3_K_M.gguf", 300)
+        candidates, _ = self.build(paths + [cur, smaller], current=cur, choose=lambda c, p: (131072, "auto", None))
+        kinds = [c["kind"] for c in candidates]
+        self.assertEqual(len(candidates), tune.MAX_CANDIDATES)
+        self.assertEqual(candidates[0]["model"].name, cur.name)  # current first, over the cap
+        self.assertIn("context", kinds)  # the two extras survive the cap
+        self.assertIn("quant", kinds)
 
     def test_over_budget_model_is_skipped_with_a_note(self):
         good = touch(self.dir, "Good-8B-Q4_K_M.gguf", 100)
@@ -92,14 +117,15 @@ class Candidates(unittest.TestCase):
         self.assertEqual([c["model"].name for c in candidates], ["Good-8B-Q4_K_M.gguf"])
         self.assertTrue(any("Huge" in n and "RAM budget" in n for n in notes))
 
-    def test_extras_context_step_and_smaller_quant_come_first(self):
+    def test_extras_context_step_and_smaller_quant(self):
         cur = touch(self.dir, "Qwen3-14B-Q4_K_M.gguf", 500)
         smaller = touch(self.dir, "Qwen3-14B-Q3_K_M.gguf", 300)
         other = touch(self.dir, "Llama-8B-Q4_K_M.gguf", 100)
-        candidates, _ = self.build([cur, smaller, other], current=cur, choose=lambda c, p: (131072, "auto", None))
+        candidates, _ = self.build([cur, smaller, other], current=cur,
+                                   choose=lambda c, p: (131072 if Path(p).name == cur.name else 65536, "auto", None))
         labels = [c["label"] for c in candidates]
-        self.assertTrue(candidates[0]["kind"] == "context")
-        self.assertEqual(candidates[0]["context"], 131072 - tune.ctx.STEP)
+        step = next(c for c in candidates if c["kind"] == "context")
+        self.assertEqual(step["context"], 131072 - tune.ctx.STEP)
         self.assertTrue(any(c["kind"] == "quant" and c["model"].name == smaller.name for c in candidates))
         self.assertEqual(len(labels), len(set(labels)))
 

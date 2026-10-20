@@ -26,10 +26,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import bench, budgets, host
+from . import bench, budgets, host, models
 from . import context as ctx
 from .harnesses import HARNESSES, installed
-from .onboard import CYAN, GREEN, RED, RESET, YELLOW, find_models, load_config
+from .onboard import CYAN, GREEN, RED, RESET, YELLOW, detect, find_models, load_config, memory_gb, settings_for
 from .paths import HOME
 
 LOG = HOME / "tune.jsonl"
@@ -116,6 +116,63 @@ def fits(config, path, context):
     return need, None
 
 
+def _norm(text):
+    return re.sub(r"[^a-z0-9.]+", "-", (text or "").lower()).strip("-")
+
+
+def _curated(stem):
+    """The curated MODELS entry an installed file belongs to (by family name), or None."""
+    fam = family(stem)
+    for model in models.MODELS:
+        name = _norm(model["name"])
+        if fam and name and (fam.startswith(name) or name.startswith(fam)):
+            return model
+    return None
+
+
+def _active_params(stem):
+    """Active parameters from an MoE marker like A3B (3.0), or None for a dense model."""
+    found = re.search(r"(?i)(?<![a-z0-9])a(\d+(?:\.\d+)?)b(?![a-z0-9])", stem)
+    return float(found.group(1)) if found else None
+
+
+def _rank_entry(config, path):
+    """A models.rank() candidate for an installed file: its curated metadata when known, else inferred from the name,
+    with the local file size and the model's own header as its one quantization."""
+    quant = next((q for q in models.QUANTS if q.lower() in path.stem.lower()), "Q4_K_M")
+    info = ctx.model_info(path, (config.get("server") or {}).get("kvCacheType", "q8_0"))
+    base = _curated(path.stem)
+    if base is None:
+        sizes = [float(n) for n in re.findall(r"(\d+(?:\.\d+)?)\s*b(?![a-z0-9])", path.stem, re.I)]
+        active = _active_params(path.stem)
+        base = {"repo": None, "name": path.stem, "moe": active is not None, "params": max(sizes) if sizes else 0,
+                "active": active, "tier": None, "note": ""}
+    size_gb = ctx.model_bytes(path) / 2**30
+    return {**base, "files": {quant: {"gb": size_gb}}, "info": info, "path": path}
+
+
+def ranked_paths(config, paths):
+    """The installed files ordered the way `hearthwork check` ranks models for this computer: [(path, rank, reason)].
+    Pure (no network): local file sizes and each file's own header feed models.rank()."""
+    if not paths:
+        return []
+    try:
+        hw = config.get("hardware") or detect()
+        settings = settings_for(hw)
+        ram_free = memory_gb()[1]
+        picks = models.rank([_rank_entry(config, path) for path in paths], hw, ram_free, settings)
+    except Exception:  # hardware detection or a header read failed: keep the installed order rather than fail
+        return [(path, i + 1, "installed model") for i, path in enumerate(paths)]
+    out = []
+    for i, pick in enumerate(picks):
+        path = pick.get("path")
+        if path is None:
+            continue
+        label = models.describe(pick)[0] if pick.get("quant") else "too big for this computer"
+        out.append((path, i + 1, f"rank {i + 1} for this computer: {label}"))
+    return out
+
+
 def _context_for(config, path, min_context):
     """(context, None) for a model, raised to `min_context` when it can reach it, else (None, a note)."""
     context = ctx.choose(config, path)[0]
@@ -127,25 +184,36 @@ def _context_for(config, path, min_context):
     return context, None
 
 
-def _primary_candidates(config, paths, current, min_context, notes):
-    out = []
-    seen = set()
-    for path in paths:
+def _primary_candidates(config, paths, current, min_context, notes, order, max_items):
+    """Installed models, best-ranked first, with the model that is running now always first."""
+    out, seen = [], set()
+
+    def add(path, rank, reason, force=False):
         key = str(path.resolve()).lower()
-        if key in seen:
-            continue
-        seen.add(key)
+        if key in seen or len(out) >= max_items:
+            return
         context, note = _context_for(config, path, min_context)
-        if note:
-            notes.append(note)
-            continue
+        if context is None:
+            if not force:
+                notes.append(note)
+                return
+            context = ctx.choose(config, path)[0]
         need, problem = fits(config, path, context)
-        if problem:
+        if problem and not force:
             notes.append(f"{path.name}: skipped ({problem})")
-            continue
-        out.append({"model": path, "context": context, "need": need,
-                    "label": f"{path.name} @ {ctx.format_k(context)}", "kind": "model",
-                    "current": bool(current and path.name == current.name)})
+            return
+        seen.add(key)
+        item = {"model": path, "context": context, "need": need, "rank": rank, "reason": reason,
+                "label": f"{path.name} @ {ctx.format_k(context)}", "kind": "model",
+                "current": bool(current and path.name == current.name)}
+        if problem:
+            item["over"] = problem
+        out.append(item)
+
+    if current:
+        add(current, None, "the model that is running now", force=True)
+    for path, rank, reason in order:
+        add(path, rank, reason)
     return out
 
 
@@ -181,10 +249,7 @@ def _extras(config, current, chosen, min_context, notes):
         except OSError:
             continue
     for _, path in sorted(same)[:1]:  # the closest smaller file, i.e. the next quantization down
-        context, note = _context_for(config, path, min_context)
-        if note:
-            notes.append(note)
-            continue
+        context = max(auto, min_context or 0)  # same context as the current model: only the quantization differs
         need, problem = fits(config, path, context)
         if problem:
             notes.append(f"{path.name}: skipped ({problem})")
@@ -195,14 +260,22 @@ def _extras(config, current, chosen, min_context, notes):
     return out
 
 
-def build_candidates(config, min_context=None, current=None, models=None, limit=MAX_CANDIDATES):
-    """(candidates, notes): a bounded list of configurations to try, and why others were left out."""
-    paths = models if models is not None else find_models(config.get("modelsDir") or ".")
+def build_candidates(config, min_context=None, current=None, models=None, limit=MAX_CANDIDATES, ranked=None,
+                     paths=None):
+    """(candidates, notes): a bounded list of configurations to try, and why others were left out.
+
+    Order: the model that is running now first, then the other installed models by models.rank() for this computer,
+    then the two extras (a smaller context step and a smaller quantization of the current model). `models`/`paths`
+    take the installed files so tests can pass them; `ranked` takes ranked_paths() output so tests stay pure."""
+    installed = paths if paths is not None else (models if models is not None else find_models(config.get("modelsDir") or "."))
     if current is None:
         current = budgets.current_model(config)
     notes = []
-    extras = _extras(config, current, paths, min_context, notes)  # variations of what is running go first
-    candidates = extras + _primary_candidates(config, paths, current, min_context, notes)
+    order = ranked if ranked is not None else ranked_paths(config, installed)
+    extras = _extras(config, current, installed, min_context, notes)  # always kept: they are why tune exists
+    primaries = _primary_candidates(config, installed, current, min_context, notes, order,
+                                    max(1, limit - len(extras)))
+    candidates = primaries + extras
     seen, unique = set(), []
     for c in candidates:  # at most one candidate per (model file, context)
         key = str(c["model"].resolve()).lower() + ":" + str(c["context"])
@@ -334,8 +407,9 @@ def candidates_text(config, candidates, notes, tasks, min_context=None):
         need = c.get("need") or {}
         est = (f"weights+KV {need.get('totalGB', 0):.1f} GB total "
                f"({need.get('gpuGB', 0):.1f} GB GPU, {need.get('ramGB', 0):.1f} GB RAM)") if need else "estimate unavailable"
-        lines.append(f"  {c['label']:<46} {ctx.format_k(c['context']):>6}  {est}"
-                     + ("  (current)" if c.get("current") else ""))
+        lines.append(f"  {c['label']:<46} {ctx.format_k(c['context']):>6}  {est}")
+        lines.append(f"  {DIM}  {c.get('reason') or 'candidate'}"
+                     + (f"  (current: {c['over']})" if c.get("over") else "") + f"{RESET}")
     for note in notes:
         lines.append(f"  {DIM}- {note}{RESET}")
     lines.append(f"\nEach candidate is switched to, warmed up and measured with the first {tasks} bench tasks; "
@@ -513,7 +587,9 @@ def main(argv=None):
         if args.json:
             print(json.dumps({"tasks": tasks, "minContext": args.min_context,
                               "candidates": [{"label": c["label"], "model": c["model"].name, "context": c["context"],
-                                              "kind": c["kind"], "need": c.get("need")} for c in candidates],
+                                              "kind": c["kind"], "reason": c.get("reason"), "rank": c.get("rank"),
+                                              "current": bool(c.get("current")), "need": c.get("need")}
+                                             for c in candidates],
                               "skipped": notes}, indent=2))
         else:
             print(candidates_text(config, candidates, notes, tasks, args.min_context))

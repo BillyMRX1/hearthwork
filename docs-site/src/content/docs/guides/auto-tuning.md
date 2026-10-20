@@ -13,13 +13,14 @@ hearthwork tune --min-context 64K --agent claude --quick-tasks 3
 
 ## What it tries
 
-The candidates are bounded (at most 5) and built from what is installed:
+The candidates are bounded (at most 5) and built from what is installed, in this order:
 
-- every distinct model that fits your [budget](/guides/budgets/) at its automatic context,
+- the model that is running now, always first,
+- the other installed models that fit your [budget](/guides/budgets/) at their automatic context, **ranked for this computer by the same `models.rank()` that [`hearthwork check`](/reference/commands/) uses**,
 - the current model at the next smaller context step, and
 - a smaller quantization of the same model family, when one is already on disk.
 
-`--dry-run` lists them with their estimated memory and switches nothing (it does not touch the running host). `--min-context` drops any candidate whose model cannot reach that context here.
+`--dry-run` lists them in that order, each with a one-line reason ("rank 1 for this computer: …"), its estimated memory, and switches nothing (it does not touch the running host). `--min-context` drops any candidate whose model cannot reach that context here.
 
 ## What it measures
 

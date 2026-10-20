@@ -239,6 +239,17 @@ def memory_gb():
     return kb("MemTotal") / 2**20, kb("MemAvailable") / 2**20
 
 
+def nvidia_gpu_rows(rows):
+    """(name, GB) for each real nvidia-smi CSV row; warning text can also contain commas, so a row counts
+    only when the part after the last comma is MiB digits."""
+    gpus = []
+    for row in rows:
+        name, _, mib = row.rpartition(",")
+        if "," in row and mib.strip().isdigit():
+            gpus.append((name.strip(), int(mib) / 1024))
+    return gpus
+
+
 def detect():
     """What this computer has, as far as running models is concerned."""
     arch = {"amd64": "x64", "x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}.get(platform.machine().lower(), platform.machine())
@@ -253,7 +264,7 @@ def detect():
         return hw
     if shutil.which("nvidia-smi"):
         rows = run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]).strip().splitlines()
-        gpus = [(name.strip(), int(mib) / 1024) for name, mib in (r.rsplit(",", 1) for r in rows if "," in r)]
+        gpus = nvidia_gpu_rows(rows)  # empty on AMD boxes with a stray nvidia-smi: fall through to Vulkan
         if gpus:
             hw["gpus"] = [f"{name} ({gb:.0f} GB)" for name, gb in gpus]
             hw["vramGB"] = round(sum(gb for _, gb in gpus), 1)
@@ -263,7 +274,8 @@ def detect():
             if version:
                 hw["cudaDriver"] = f"{version.group(1)}.{version.group(2)}"
             else:  # drivers 580+ support CUDA 13
-                driver = run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]).strip().split(".")[0]
+                raw = run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"]).strip()
+                driver = raw.splitlines()[0].split(".")[0] if raw else ""  # a warning line can come back here too
                 hw["cudaDriver"] = "13.0" if driver.isdigit() and int(driver) >= 580 else "12.0"
             return hw
     # AMD / Intel: Vulkan works across vendors. VRAM is measured by llama.cpp itself at start (--fit).

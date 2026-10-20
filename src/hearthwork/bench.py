@@ -261,8 +261,9 @@ def warmup(port, model, remote=None):
             print(f"{YELLOW}skipped ({str(error)[:80]}){RESET}")
 
 
-def run_once(agent, config, model, root, attempt):
-    """One full 8-prompt run of `agent`. Returns the result record; raises AgentError if the agent itself fails."""
+def run_once(agent, config, model, root, attempt, tasks=None):
+    """One run of `agent` through the first `tasks` prompts (all 8 by default). Returns the result record;
+    raises AgentError if the agent itself fails."""
     title = HARNESSES[agent]["title"]
     name = agent if attempt == 1 else f"{agent}-retry"
     folder = root / name
@@ -270,10 +271,11 @@ def run_once(agent, config, model, root, attempt):
     (folder / "demo.txt").write_text(DEMO, encoding="utf-8")
     (folder / "buggy.py").write_text(BUGGY, encoding="utf-8")
     env = isolated_env(agent, root / f"{name}-config")
+    prompts = PROMPTS[:tasks] if tasks else PROMPTS
     print(f"\n{BOLD}Benchmark{RESET}: {model} via {title}{'' if attempt == 1 else ' (retry)'}  "
-          f"{DIM}(8 prompts, one conversation; folder {folder}){RESET}\n")
+          f"{DIM}({len(prompts)} prompts, one conversation; folder {folder}){RESET}\n")
     steps, session, started = [], None, time.time()
-    for i, (step, prompt) in enumerate(PROMPTS):
+    for i, (step, prompt) in enumerate(prompts):
         print(f"  {i + 1}. {step:<12}", end=" ", flush=True)
         t0 = time.time()
         try:
@@ -299,13 +301,15 @@ def save(record):
         f.write(json.dumps(record) + "\n")
 
 
-def run_agent(agent, config, model, root):
-    """Run `agent`, retrying once if the agent itself fails. Every attempt is recorded: a score for a finished run,
-    an error entry (no score, so never on the scoreboard) for a failed one. Returns the record, or None."""
+def run_agent(agent, config, model, root, tasks=None):
+    """Run `agent` through the first `tasks` prompts (all 8 by default), retrying once if the agent itself fails.
+    Every attempt is recorded: a score for a finished run, an error entry (no score, so never on the scoreboard)
+    for a failed one. Returns the record, or None."""
     title = HARNESSES[agent]["title"]
     for attempt in (1, 2):
         try:
-            record = run_once(agent, config, model, root, attempt)
+            # keep the 5-argument call when no task count is given, so callers that inject run_once stay unchanged
+            record = run_once(agent, config, model, root, attempt, **({"tasks": tasks} if tasks else {}))
         except AgentError as error:
             print(f"\n  {RED}{error}{RESET}\n  Not scored: this is an agent problem, not a model score."
                   + ("  Retrying once." if attempt == 1 else ""))
@@ -313,7 +317,7 @@ def run_agent(agent, config, model, root):
                   "attempt": attempt, "error": str(error)[:400]})
             continue
         save(record)
-        print(f"\n  {BOLD}Score {record['score']:.1f}/8{RESET} in {record['seconds'] / 60:.1f} min")
+        print(f"\n  {BOLD}Score {record['score']:.1f}/{tasks or len(PROMPTS)}{RESET} in {record['seconds'] / 60:.1f} min")
         return record
     return None
 

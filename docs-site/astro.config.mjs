@@ -65,6 +65,7 @@ export default defineConfig({
 						{ slug: 'guides/subagents' },
 						{ slug: 'guides/budgets' },
 						{ slug: 'guides/setup-profiles' },
+						{ slug: 'guides/auto-tuning' },
 						{ slug: 'guides/model-switching' },
 						{ slug: 'guides/recovery' },
 						{ slug: 'guides/benchmark' },

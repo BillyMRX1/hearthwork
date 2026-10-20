@@ -240,6 +240,27 @@ options:
   --show                only print the scoreboard
 ```
 
+## tune
+
+```text
+usage: hearthwork tune [-h] [--time TIME] [--min-context N]
+                       [--agent {aider,claude,codex,opencode,qwen}] [--quick-tasks N] [--dry-run]
+                       [--json]
+
+Try a few installed configurations and save the best tested one as a profile (nothing is
+downloaded; the original model is restored).
+
+options:
+  -h, --help            show this help message and exit
+  --time TIME           time limit for the whole run, e.g. 30m, 90s or 1h (default 30m)
+  --min-context N       minimum context a candidate must offer, e.g. 65536 or 64K
+  --agent {aider,claude,codex,opencode,qwen}
+                        agent to drive the tasks
+  --quick-tasks N       how many of the graded tasks to run per candidate (default 3)
+  --dry-run             list the candidates and their estimated needs, then exit
+  --json                print the result as JSON
+```
+
 ## doctor
 
 ```text

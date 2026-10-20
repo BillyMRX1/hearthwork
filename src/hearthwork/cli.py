@@ -26,6 +26,7 @@
   hearthwork model <link>       download a GGUF model from Hugging Face
   hearthwork bench [--agent X]  8 graded coding tasks through an agent, with a scoreboard
   hearthwork bench --all        release check: every installed agent in turn, after a warmup, with a summary table
+  hearthwork tune [--time 30m] [--min-context N] [--agent X] [--quick-tasks N] [--dry-run] [--json]   try a few installed configurations, save the best tested one as a profile (nothing downloaded; the original model is restored)
   hearthwork doctor [--agent X] [--quick] [--json]   server, API protocol and agent checks; says which layer is at fault
   hearthwork check              is this computer suited, and which models fit
   hearthwork profile save|list|show|check|apply|export|import   verified setup profiles (model, runtime, settings + Doctor proof)
@@ -45,7 +46,7 @@ from .paths import HOME
 REPO = "git+https://github.com/BillyMRX1/hearthwork"
 USAGE = __doc__.split("\n", 2)[2]
 # commands whose `--help` must not load the config or touch the model, the network or running processes
-HELP_FIRST = ("start", "serve", "bench", "model", "setup", "context", "menu", "update", "status", "stop", "disconnect", "agents")
+HELP_FIRST = ("start", "serve", "bench", "tune", "model", "setup", "context", "menu", "update", "status", "stop", "disconnect", "agents")
 
 
 def configured(interactive=True, remote_ok=False):
@@ -165,6 +166,9 @@ def help_first(command):
     elif command == "bench":
         from . import bench
         bench.main(["--help"])
+    elif command == "tune":
+        from . import tune
+        tune.main(["--help"])
     elif command == "model":
         from . import model
         model.main(["--help"])
@@ -315,6 +319,9 @@ def main(argv=None):
                 if not ensure_server(configured()):
                     sys.exit(1)
             bench.main(rest)
+        elif command == "tune":
+            from . import tune
+            sys.exit(tune.main(rest))
         elif command == "share":
             from . import share
             sys.exit(share.share_main(rest))

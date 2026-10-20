@@ -37,6 +37,7 @@ The first run sets things up for you (hardware check, llama.cpp, models folder).
 - **Model switching, idle unload and automatic recovery** ([Model switching and idle unload](#model-switching-and-idle-unload), [Recovery](#recovery)).
 - **Diagnostics** that tell you which layer is at fault ([Diagnostics](#diagnostics)).
 - **A benchmark** of your own setup ([Benchmark](#benchmark)).
+- **Auto-tuning** that tries a few installed configurations and saves the best tested one ([Auto-tuning](#auto-tuning)).
 
 ## Install and update
 
@@ -173,6 +174,7 @@ A launcher (`ccl.cmd` on Windows, a shell script elsewhere) is created next to t
 | `hearthwork api [--port N] [--show]` | OpenAI + Anthropic compatible endpoint on this computer. |
 | `hearthwork alias add\|list\|remove` | Short commands for agents. |
 | `hearthwork bench [--agent X] [--all] [--warmup] [--show]` | Graded coding tasks through an agent, with a scoreboard. |
+| `hearthwork tune [--time 30m] [--min-context N] [--dry-run] [--json]` | Try a few installed configurations, save the best tested one as a profile. |
 | `hearthwork runtime [install <name>\|use <name>\|update\|rollback]` | llama.cpp engines (CUDA, ROCm, Vulkan, SYCL, Metal, CPU) side by side. |
 | `hearthwork setup [--update-llama] [--reset] [--import FOLDER]` | Hardware check, llama.cpp download/update, models folder. |
 | `hearthwork update` | Update Hearthwork itself. |
@@ -389,6 +391,17 @@ Set `HEARTHWORK_HOME` to use another folder. Inside it:
 - **Each run's folder** stays in `bench/runs/<date-time>/<agent>/` so you can inspect what the agent wrote.
 - **Isolated history.** Each run gives Codex and Claude Code an empty config folder (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`), so benchmark sessions never fill your real `~/.codex` or `~/.claude`; the run refuses to start if that folder would be your real one. No login is needed.
 - **Release check: `hearthwork bench --all`** runs every installed agent one after another (never in parallel) and prints and saves a summary table (`summary.md` in the run's folder; `bench --show` prints the latest). A warmup (~30K-token prompts through the Anthropic and OpenAI endpoints) runs first and is not timed; `--warmup` does the same before a single-agent run. If the agent itself fails (crash, does not start, reaches another provider) the run is repeated once in a fresh folder; a failed attempt has an `error` and no score. A wrong answer is a score, not a failure, and is not retried.
+
+## Auto-tuning
+
+`hearthwork tune` tries a small set of the configurations already on your computer and saves the best tested one as a setup profile. Nothing is downloaded and your working setup is put back at the end.
+
+```sh
+hearthwork tune --dry-run                    # list the candidates and their estimated needs, switch nothing
+hearthwork tune --time 30m                   # try them (default 30 min); --agent claude --quick-tasks 3
+```
+
+The candidates (at most 5) are every installed model that fits the [budget](#resource-budgets-and-presets) at its automatic context, plus the current model at the next smaller context step and a smaller quantization of its family when one is on disk. Each candidate is switched to through the host (close agent sessions first), warmed up, and measured with the first few benchmark tasks: **task score, total seconds, first-token latency, generation speed and peak memory**. They are ranked by score, then time, then latency; if the best two are within 10% on score-seconds the best is re-run once. The report says the winner is the **best among the configurations tested** — not a universal optimum. The winner is saved as the profile `tune-<date>` with the run as its evidence (`hearthwork profile apply tune-<date>` applies it; the next step is printed but never run for you), and every run is appended to `tune.jsonl` (rotated at 5 MB). The original model and context are restored when the run ends, even on Ctrl+C or a failed candidate.
 
 ## Roadmap
 

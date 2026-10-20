@@ -32,6 +32,7 @@ For every flag and its exact help text, see the generated [command reference](/r
 | `hearthwork api [--port N] [--show]` | OpenAI + Anthropic compatible endpoint on this computer. |
 | `hearthwork alias add\|list\|remove` | Short commands for agents. |
 | `hearthwork bench [--agent X] [--all] [--warmup] [--show]` | Graded coding tasks through an agent, with a scoreboard. |
+| `hearthwork tune [--time 30m] [--min-context N] [--dry-run] [--json]` | Try a few installed configurations, save the best tested one as a profile. |
 | `hearthwork runtime [install <name>\|use <name>\|update\|rollback]` | llama.cpp engines (CUDA, ROCm, Vulkan, SYCL, Metal, CPU) side by side. |
 | `hearthwork setup [--update-llama] [--reset] [--import FOLDER]` | Hardware check, llama.cpp download or update, models folder. |
 | `hearthwork update` | Update Hearthwork itself. |
